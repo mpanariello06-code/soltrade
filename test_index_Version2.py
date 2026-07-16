@@ -76,3 +76,18 @@ class TradingBotTelegramTests(unittest.TestCase):
         bot._send_telegram_notification_sync("hello")
 
         mock_post.assert_not_called()
+
+    @patch("index_Version2.requests.post")
+    def test_send_telegram_notification_async_wrapper(self, mock_post):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"ok": True}
+        mock_post.return_value = response
+
+        bot = self.build_bot()
+
+        import asyncio
+
+        asyncio.run(bot.send_telegram_notification("hello from async"))
+
+        mock_post.assert_called_once()
