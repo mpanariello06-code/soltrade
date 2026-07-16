@@ -166,7 +166,7 @@ class TradingBot:
         self.display_config()
         self.logger.info("✅ Initialization complete")
         await self.send_telegram_notification(
-            "🚀 Soltrade bot started\n"
+            "🚀 SolTrade bot started\n"
             f"Amount: {self.config.amount} SOL\n"
             f"Markets: {', '.join(self.config.markets)}\n"
             f"Max Positions: {self.config.max_positions}\n"
@@ -460,7 +460,7 @@ class TradingBot:
             self.shutdown_requested = True
         self.logger.info("🛑 Shutting down...")
         await self.send_telegram_notification(
-            "🛑 Soltrade bot shutting down\n"
+            "🛑 SolTrade bot shutting down\n"
             f"Open Positions: {len(self.positions)}\n"
             f"Realized PnL: {format_usd(self.stats['total_pnl'])}"
         )

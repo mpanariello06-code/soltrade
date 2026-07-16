@@ -36,7 +36,8 @@ cp env_Version2.example .env
    2. Press **Start** or send any message to the bot.
    3. In a browser, open this URL after replacing `{YOUR_BOT_TOKEN}` with your real token:
       `https://api.telegram.org/bot{YOUR_BOT_TOKEN}/getUpdates`
-   4. Find the `chat` object in the response and copy the `id` value.
+   4. If the response is empty, send a fresh message to the bot and refresh the page.
+   5. Find the `chat` object in the response and copy the `id` value.
 
    ### Add Telegram settings to `.env`
    ```env
