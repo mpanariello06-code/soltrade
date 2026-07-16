@@ -87,6 +87,7 @@ class TradingBot:
         }
 
         self.shutdown_requested = False
+        self.shutdown_lock = asyncio.Lock()
         self.setup_logger()
 
     def setup_logger(self):
@@ -151,7 +152,12 @@ class TradingBot:
         if self.config.max_positive_pnl < 0:
             raise ValueError("MAX_POSITIVE_PNL must be >= 0")
         if bool(self.config.telegram_bot_token) != bool(self.config.telegram_chat_id):
-            raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must either both be set or both be empty")
+            token_state = "set" if self.config.telegram_bot_token else "empty"
+            chat_state = "set" if self.config.telegram_chat_id else "empty"
+            raise ValueError(
+                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must either both be set or both be empty "
+                f"(TELEGRAM_BOT_TOKEN is {token_state}, TELEGRAM_CHAT_ID is {chat_state})"
+            )
 
     async def initialize(self):
         self.logger.info("🚀 Initializing HTTP Trading Bot...")
@@ -443,9 +449,10 @@ class TradingBot:
             self.logger.error(f"Error saving sold positions: {e}")
 
     async def shutdown(self):
-        if self.shutdown_requested:
-            return
-        self.shutdown_requested = True
+        async with self.shutdown_lock:
+            if self.shutdown_requested:
+                return
+            self.shutdown_requested = True
         self.logger.info("🛑 Shutting down...")
         await self.send_telegram_notification(
             "🛑 Soltrade bot shutting down\n"
