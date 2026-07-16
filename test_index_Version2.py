@@ -37,7 +37,11 @@ class TradingBotTelegramTests(unittest.TestCase):
 
     def test_validate_config_rejects_partial_telegram_config(self):
         with patch.dict(os.environ, {"TELEGRAM_CHAT_ID": ""}, clear=False):
-            with self.assertRaisesRegex(ValueError, "TELEGRAM_BOT_TOKEN is set, TELEGRAM_CHAT_ID is empty"):
+            with self.assertRaisesRegex(
+                ValueError,
+                r"TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must either both be set or both be empty "
+                r"\(TELEGRAM_BOT_TOKEN is set, TELEGRAM_CHAT_ID is empty\)",
+            ):
                 self.build_bot()
 
     @patch("index_Version2.requests.post")
