@@ -477,11 +477,16 @@ async def main():
     bot = TradingBot()
 
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.shutdown()))
+    if hasattr(loop, "add_signal_handler"):
+        # Unix only — add_signal_handler is not available on Windows
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.shutdown()))
 
     try:
         await bot.run()
+    except KeyboardInterrupt:
+        # Windows raises KeyboardInterrupt on Ctrl+C instead of using signal handlers
+        await bot.shutdown()
     except Exception as e:
         bot.logger.error(f"Fatal error: {e}")
         await bot.shutdown()
