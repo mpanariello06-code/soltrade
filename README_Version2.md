@@ -4,23 +4,51 @@ Python version of the Solana trading bot using HTTP polling only (no WebSocket m
 
 ## Setup
 
-1. Create venv and install dependencies:
+1. Create a virtual environment and install dependencies:
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # macOS/Linux
 # .venv\Scripts\activate   # Windows
-pip install -r requirements.txt
+pip install -r requirements_Version2.txt
 ```
 
-2. Configure environment:
+2. Create your environment file:
 ```bash
-cp .env.example .env
-# then edit .env
+cp env_Version2.example .env
 ```
 
-3. Run:
+3. Add your required Solana settings to `.env`:
+   - `PRIVATE_KEY`
+   - `SOLANA_TRACKER_API_KEY`
+   - `RPC_URL`
+
+4. Optional: enable Telegram notifications.
+
+   ### Create the bot
+   1. Open Telegram and start a chat with `@BotFather`.
+   2. Send `/newbot`.
+   3. Choose a bot name.
+   4. Choose a unique bot username ending in `bot`.
+   5. Copy the bot token BotFather gives you.
+
+   ### Get your chat ID
+   1. Open your new bot in Telegram.
+   2. Press **Start** or send any message to the bot.
+   3. In a browser, open:
+      `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates`
+   4. Find the `chat` object in the response and copy the `id` value.
+
+   ### Add Telegram settings to `.env`
+   ```env
+   TELEGRAM_BOT_TOKEN=your-bot-token
+   TELEGRAM_CHAT_ID=your-chat-id
+   ```
+
+   The bot will send notifications for startup, buys, sells, and shutdown.
+
+5. Review the rest of the trading settings in `.env`, then run:
 ```bash
-python index.py
+python index_Version2.py
 ```
 
 ## Notes

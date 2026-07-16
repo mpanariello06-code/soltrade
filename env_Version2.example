@@ -21,3 +21,5 @@ MAX_POSITIONS=10
 MAX_RETRIES=3
 MARKETS=raydium,orca,pumpfun,moonshot,raydium-cpmm,raydium-launchpad,meteora-dlmm,meteora-curve,meteora-dyn,meteora-dyn-v2
 DEBUG=false
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
