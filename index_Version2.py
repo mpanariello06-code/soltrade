@@ -4,6 +4,7 @@ import time
 import signal
 import asyncio
 import logging
+from threading import Lock
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional, Set
 
@@ -87,7 +88,7 @@ class TradingBot:
         }
 
         self.shutdown_requested = False
-        self.shutdown_lock: Optional[asyncio.Lock] = None
+        self.shutdown_lock = Lock()
         self.setup_logger()
 
     def setup_logger(self):
@@ -160,8 +161,6 @@ class TradingBot:
             )
 
     async def initialize(self):
-        if self.shutdown_lock is None:
-            self.shutdown_lock = asyncio.Lock()
         self.logger.info("🚀 Initializing HTTP Trading Bot...")
         await self.load_positions()
         await self.load_sold_positions()
@@ -451,9 +450,7 @@ class TradingBot:
             self.logger.error(f"Error saving sold positions: {e}")
 
     async def shutdown(self):
-        if self.shutdown_lock is None:
-            self.shutdown_lock = asyncio.Lock()
-        async with self.shutdown_lock:
+        with self.shutdown_lock:
             if self.shutdown_requested:
                 return
             self.shutdown_requested = True
