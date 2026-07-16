@@ -87,7 +87,6 @@ class TradingBot:
         }
         self.shutdown_requested = False
         self.shutdown_lock: Optional[asyncio.Lock] = None
-        self.shutdown_lock: Optional[asyncio.Lock] = None
         self.setup_logger()
 
     def setup_logger(self):
