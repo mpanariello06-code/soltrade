@@ -151,7 +151,7 @@ class TradingBot:
         if self.config.max_positive_pnl < 0:
             raise ValueError("MAX_POSITIVE_PNL must be >= 0")
         if bool(self.config.telegram_bot_token) != bool(self.config.telegram_chat_id):
-            raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must both be set together")
+            raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must either both be set or both be empty")
 
     async def initialize(self):
         self.logger.info("🚀 Initializing HTTP Trading Bot...")
@@ -159,11 +159,13 @@ class TradingBot:
         await self.load_sold_positions()
         self.display_config()
         self.logger.info("✅ Initialization complete")
-        self.send_telegram_notification(
+        await self.send_telegram_notification(
             "🚀 Soltrade bot started\n"
             f"Amount: {self.config.amount} SOL\n"
             f"Markets: {', '.join(self.config.markets)}\n"
-            f"Max Positions: {self.config.max_positions}"
+            f"Max Positions: {self.config.max_positions}\n"
+            f"Stop Loss: {self.config.max_negative_pnl}%\n"
+            f"Take Profit: {self.config.max_positive_pnl}%"
         )
 
     def display_config(self):
@@ -184,7 +186,7 @@ class TradingBot:
     def telegram_enabled(self) -> bool:
         return bool(self.config.telegram_bot_token and self.config.telegram_chat_id)
 
-    def send_telegram_notification(self, message: str):
+    def _send_telegram_notification_sync(self, message: str):
         if not self.telegram_enabled():
             return
 
@@ -203,6 +205,9 @@ class TradingBot:
                 self.logger.warning("Telegram notification was rejected by the Telegram API")
         except Exception as e:
             self.logger.error(f"Telegram notification failed: {e}")
+
+    async def send_telegram_notification(self, message: str):
+        await asyncio.to_thread(self._send_telegram_notification_sync, message)
 
     def fetch_latest_tokens(self) -> List[Dict[str, Any]]:
         url = "https://data.solanatracker.io/tokens/latest"
@@ -299,7 +304,7 @@ class TradingBot:
         self.buying_tokens.discard(mint)
         self.stats["successful_buys"] += 1
         await self.save_positions()
-        self.send_telegram_notification(
+        await self.send_telegram_notification(
             "🟢 Buy executed\n"
             f"Token: {symbol}\n"
             f"Mint: {mint}\n"
@@ -340,7 +345,7 @@ class TradingBot:
 
         await self.save_positions()
         await self.save_sold_positions()
-        self.send_telegram_notification(
+        await self.send_telegram_notification(
             "🔴 Sell executed\n"
             f"Token: {symbol}\n"
             f"Mint: {mint}\n"
@@ -442,7 +447,7 @@ class TradingBot:
             return
         self.shutdown_requested = True
         self.logger.info("🛑 Shutting down...")
-        self.send_telegram_notification(
+        await self.send_telegram_notification(
             "🛑 Soltrade bot shutting down\n"
             f"Open Positions: {len(self.positions)}\n"
             f"Realized PnL: {format_usd(self.stats['total_pnl'])}"
