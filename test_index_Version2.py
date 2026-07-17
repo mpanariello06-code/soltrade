@@ -4,6 +4,7 @@ import logging
 import unittest
 from unittest.mock import Mock, call, patch
 
+import requests
 from index_Version2 import TradingBot, register_shutdown_handlers, SafeStreamHandler
 
 
@@ -69,7 +70,7 @@ class TradingBotTelegramTests(unittest.TestCase):
     @patch("index_Version2.requests.post")
     def test_send_telegram_notification_retries_with_form_payload(self, mock_post):
         failed_response = Mock()
-        failed_response.raise_for_status.side_effect = Exception("bad request")
+        failed_response.raise_for_status.side_effect = requests.HTTPError("bad request")
 
         successful_response = Mock()
         successful_response.raise_for_status.return_value = None

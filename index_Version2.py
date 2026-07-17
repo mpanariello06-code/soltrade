@@ -238,13 +238,12 @@ class TradingBot:
             "disable_web_page_preview": True,
         }
 
-        for request_args in ({"json": payload}, {"data": payload}):
-            request_mode = "json" if "json" in request_args else "form"
+        for request_mode, request_args in (("json", {"json": payload}), ("form", {"data": payload})):
             try:
                 response = requests.post(url, timeout=10, **request_args)
                 response.raise_for_status()
                 data = response.json()
-            except Exception as e:
+            except (requests.RequestException, ValueError) as e:
                 self.logger.warning(f"Telegram notification failed using {request_mode} payload: {e}")
                 continue
 
