@@ -249,8 +249,11 @@ class TradingBot:
                 response = requests.post(url, timeout=10, **request_kwargs)
                 response.raise_for_status()
                 data = response.json()
-            except (requests.RequestException, ValueError) as e:
+            except requests.RequestException as e:
                 self.logger.warning(f"Telegram notification failed using {payload_type} payload: {e}")
+                continue
+            except ValueError as e:
+                self.logger.warning(f"Telegram API returned invalid JSON using {payload_type} payload: {e}")
                 continue
 
             if data.get("ok", False):
