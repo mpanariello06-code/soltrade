@@ -108,3 +108,19 @@ class TradingBotTelegramTests(unittest.TestCase):
         loop.add_signal_handler.side_effect = NotImplementedError
 
         self.assertFalse(register_shutdown_handlers(loop, Mock()))
+
+    def test_register_shutdown_handlers_keeps_supported_signals(self):
+        loop = Mock()
+        callback = Mock()
+
+        def add_signal_handler(sig, cb):
+            if sig == signal.SIGTERM:
+                raise NotImplementedError
+
+        loop.add_signal_handler.side_effect = add_signal_handler
+
+        self.assertTrue(register_shutdown_handlers(loop, callback))
+        self.assertEqual(
+            loop.add_signal_handler.call_args_list,
+            [call(signal.SIGINT, callback), call(signal.SIGTERM, callback)],
+        )

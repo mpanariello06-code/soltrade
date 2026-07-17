@@ -30,12 +30,14 @@ def format_pct(value: float) -> str:
 
 
 def register_shutdown_handlers(loop: asyncio.AbstractEventLoop, shutdown_callback) -> bool:
+    registered = False
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, shutdown_callback)
+            registered = True
         except NotImplementedError:
-            return False
-    return True
+            continue
+    return registered
 
 
 @dataclass
