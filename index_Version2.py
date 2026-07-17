@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import base64
 import signal
 import asyncio
 import logging
@@ -84,6 +85,7 @@ class Config:
     max_positions: int
     max_retries: int
     debug: bool
+    dry_run: bool
     telegram_bot_token: str
     telegram_chat_id: str
 
@@ -97,6 +99,7 @@ class TradingBot:
 
         self.private_key = os.getenv("PRIVATE_KEY", "")
         self.api_key = os.getenv("SOLANA_TRACKER_API_KEY", "")
+        self._keypair = None
 
         self.positions_file = "positions.json"
         self.sold_positions_file = "sold_positions.json"
@@ -166,6 +169,7 @@ class TradingBot:
             max_positions=int(os.getenv("MAX_POSITIONS", "10")),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
             debug=os.getenv("DEBUG", "false").lower() == "true",
+            dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         )
@@ -207,6 +211,7 @@ class TradingBot:
 
     def display_config(self):
         self.logger.info("📋 Configuration")
+        self.logger.info(f"  - Mode: {'DRY RUN (simulated)' if self.config.dry_run else 'LIVE (real trades)'}")
         self.logger.info(f"  - Trade Amount: {self.config.amount} SOL")
         self.logger.info(f"  - Markets: {', '.join(self.config.markets)}")
         self.logger.info(f"  - Liquidity: {format_usd(self.config.min_liquidity)} - {format_usd(self.config.max_liquidity)}")
@@ -268,6 +273,150 @@ class TradingBot:
 
     async def send_telegram_notification(self, message: str):
         await asyncio.to_thread(self._send_telegram_notification_sync, message)
+
+    # ------------------------------------------------------------------
+    # Solana swap helpers
+    # ------------------------------------------------------------------
+
+    def _load_keypair(self):
+        """Load and cache the Solana keypair from PRIVATE_KEY. Returns None on error."""
+        if self._keypair is not None:
+            return self._keypair
+        if not self.private_key:
+            self.logger.error("PRIVATE_KEY not set — cannot execute swap")
+            return None
+        try:
+            from solders.keypair import Keypair  # type: ignore[import]
+            self._keypair = Keypair.from_base58_string(self.private_key)
+            return self._keypair
+        except ImportError:
+            self.logger.error("solders package not installed — pip install solders>=0.18.0")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to load keypair from PRIVATE_KEY: {e}")
+            return None
+
+    def execute_swap(self, from_mint: str, to_mint: str, from_amount: int) -> Optional[str]:
+        """Execute a real on-chain swap via Solana Tracker. Returns tx signature or None."""
+        try:
+            from solders.transaction import VersionedTransaction  # type: ignore[import]
+        except ImportError:
+            self.logger.error("solders not installed — pip install solders>=0.18.0")
+            return None
+
+        keypair = self._load_keypair()
+        if keypair is None:
+            return None
+
+        swap_url = "https://swap-v2.solanatracker.io/swap"
+        params = {
+            "from": from_mint,
+            "to": to_mint,
+            "fromAmount": str(from_amount),
+            "slippage": str(self.config.slippage),
+            "payer": str(keypair.pubkey()),
+            "priorityFee": str(int(self.config.priority_fee * 1e9)),
+            "jito": str(self.config.use_jito).lower(),
+        }
+
+        for attempt in range(1, self.config.max_retries + 1):
+            try:
+                resp = requests.get(swap_url, params=params, headers=self._headers(), timeout=20)
+                resp.raise_for_status()
+                tx_data = resp.json()
+
+                if "txn" not in tx_data:
+                    raise RuntimeError(f"Swap API did not return a transaction: {tx_data}")
+
+                tx_bytes = base64.b64decode(tx_data["txn"])
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                sig = keypair.sign_message(bytes(tx.message))
+                signed_tx = VersionedTransaction([sig], tx.message)
+
+                encoded = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+                rpc_resp = requests.post(
+                    self.config.rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "sendTransaction",
+                        "params": [encoded, {"encoding": "base64", "maxRetries": 3}],
+                    },
+                    timeout=30,
+                )
+                rpc_data = rpc_resp.json()
+                if "error" in rpc_data:
+                    raise RuntimeError(f"RPC error: {rpc_data['error']}")
+                return rpc_data.get("result")
+            except Exception as e:
+                self.logger.warning(f"Swap attempt {attempt}/{self.config.max_retries} failed: {e}")
+                if attempt < self.config.max_retries:
+                    time.sleep(2)
+        return None
+
+    def get_token_balance(self, mint: str) -> Optional[int]:
+        """Return the raw (smallest-unit) token balance for our wallet, or None on error."""
+        keypair = self._load_keypair()
+        if keypair is None:
+            return None
+        owner = str(keypair.pubkey())
+        try:
+            resp = requests.post(
+                self.config.rpc_url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenAccountsByOwner",
+                    "params": [owner, {"mint": mint}, {"encoding": "jsonParsed"}],
+                },
+                timeout=15,
+            )
+            data = resp.json()
+            accounts = ((data.get("result") or {}).get("value")) or []
+            total = 0
+            for acc in accounts:
+                raw = int(
+                    (((acc.get("account") or {}).get("data") or {})
+                     .get("parsed", {})
+                     .get("info", {})
+                     .get("tokenAmount", {})
+                     .get("amount", 0))
+                )
+                total += raw
+            return total if total > 0 else None
+        except Exception as e:
+            self.logger.error(f"Error getting token balance for {mint}: {e}")
+            return None
+
+    def confirm_transaction(self, signature: str, max_wait_sec: int = 60) -> bool:
+        """Poll RPC until the transaction is confirmed/finalized or times out."""
+        deadline = time.time() + max_wait_sec
+        while time.time() < deadline:
+            try:
+                resp = requests.post(
+                    self.config.rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getSignatureStatuses",
+                        "params": [[signature]],
+                    },
+                    timeout=10,
+                )
+                data = resp.json()
+                statuses = ((data.get("result") or {}).get("value")) or [None]
+                status = statuses[0] if statuses else None
+                if status is not None:
+                    if status.get("err") is None and status.get("confirmationStatus") in ("confirmed", "finalized"):
+                        return True
+                    if status.get("err") is not None:
+                        self.logger.error(f"Transaction {signature} failed on-chain: {status['err']}")
+                        return False
+            except Exception as e:
+                self.logger.warning(f"Error checking transaction status: {e}")
+            time.sleep(2)
+        self.logger.warning(f"Transaction {signature} not confirmed within {max_wait_sec}s")
+        return False
 
     def fetch_latest_tokens(self) -> List[Dict[str, Any]]:
         url = "https://data.solanatracker.io/tokens/latest"
@@ -342,36 +491,75 @@ class TradingBot:
     async def perform_buy(self, token: Dict[str, Any]):
         mint = token["token"]["mint"]
         symbol = token["token"].get("symbol", "UNKNOWN")
+        decimals = int((token.get("token") or {}).get("decimals") or 9)
         self.stats["total_buys"] += 1
 
-        # Placeholder for actual swap execution
-        self.logger.info(f"🟢 [BUY] Simulated buy for {symbol} ({mint})")
-
         price = float(((token["pools"][0].get("price") or {}).get("usd")) or 0)
+        dex_link = f"https://dexscreener.com/solana/{mint}"
+        signature: Optional[str] = None
+
+        if not self.config.dry_run:
+            from_amount_raw = int(self.config.amount * 1e9)  # SOL → lamports
+            self.logger.info(f"🟢 [BUY] Executing real buy for {symbol} ({mint})")
+            signature = await asyncio.to_thread(
+                self.execute_swap, self.SOL_ADDRESS, mint, from_amount_raw
+            )
+            if signature is None:
+                self.logger.error(f"Buy failed for {symbol} — swap did not complete")
+                self.stats["total_buys"] -= 1
+                self.buying_tokens.discard(mint)
+                return
+            self.logger.info(f"🟢 [BUY] Transaction sent: {signature}")
+            confirmed = await asyncio.to_thread(self.confirm_transaction, signature)
+            if not confirmed:
+                self.logger.error(f"Buy transaction {signature} not confirmed for {symbol}")
+                self.buying_tokens.discard(mint)
+                return
+            raw_balance = await asyncio.to_thread(self.get_token_balance, mint)
+            if raw_balance:
+                token_amount = raw_balance / (10 ** decimals)
+                raw_amount = raw_balance
+            else:
+                token_amount = (self.config.amount / price) if price > 0 else 0.0
+                raw_amount = int(token_amount * (10 ** decimals))
+        else:
+            self.logger.info(f"🟢 [BUY] Simulated buy for {symbol} ({mint})")
+            token_amount = 1.0
+            raw_amount = int(token_amount * (10 ** decimals))
+
         position = {
             "symbol": symbol,
             "name": token["token"].get("name", symbol),
             "entryPrice": price,
-            "amount": 1.0,
+            "amount": token_amount,
+            "raw_amount": raw_amount,
+            "decimals": decimals,
             "investment": self.config.amount,
             "openTime": int(time.time() * 1000),
             "market": token["pools"][0].get("market"),
             "riskScore": ((token.get("risk") or {}).get("score") or 0),
         }
+        if signature:
+            position["buyTxSignature"] = signature
 
         self.positions[mint] = position
         self.seen_tokens.add(mint)
         self.buying_tokens.discard(mint)
         self.stats["successful_buys"] += 1
         await self.save_positions()
-        await self.send_telegram_notification(
+
+        buy_msg = (
             "🟢 Buy executed\n"
             f"Token: {symbol}\n"
             f"Mint: {mint}\n"
             f"Entry Price: {format_usd(price)}\n"
             f"Investment: {self.config.amount} SOL\n"
-            f"Market: {position.get('market', 'unknown')}"
+            f"Market: {position.get('market', 'unknown')}\n"
+            f"Chart: {dex_link}"
         )
+        if signature:
+            buy_msg += f"\nTx: https://solscan.io/tx/{signature}"
+        await self.send_telegram_notification(buy_msg)
 
     async def perform_sell(self, mint: str, token_data: Dict[str, Any]):
         position = self.positions.get(mint)
@@ -382,10 +570,36 @@ class TradingBot:
 
         current_price = float((((token_data.get("pools") or [{}])[0].get("price") or {}).get("usd") or 0))
         entry_price = float(position.get("entryPrice", 0))
-        amount = float(position.get("amount", 0))
+        token_amount = float(position.get("amount", 0))
+        decimals = int(position.get("decimals", 9))
+        raw_amount = int(position.get("raw_amount", 0))
 
-        pnl = (current_price - entry_price) * amount
+        pnl = (current_price - entry_price) * token_amount
         pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0.0
+        dex_link = f"https://dexscreener.com/solana/{mint}"
+        signature: Optional[str] = None
+
+        if not self.config.dry_run:
+            on_chain_raw = await asyncio.to_thread(self.get_token_balance, mint)
+            sell_raw = on_chain_raw if on_chain_raw else raw_amount
+            if sell_raw == 0:
+                self.logger.error(f"Cannot sell {symbol} — zero token balance found on-chain")
+                self.selling_positions.discard(mint)
+                self.stats["total_sells"] -= 1
+                return
+            self.logger.info(f"🔴 [SELL] Executing real sell for {symbol} ({mint})")
+            signature = await asyncio.to_thread(
+                self.execute_swap, mint, self.SOL_ADDRESS, sell_raw
+            )
+            if signature is None:
+                self.logger.error(f"Sell failed for {symbol} — swap did not complete")
+                self.stats["total_sells"] -= 1
+                self.selling_positions.discard(mint)
+                return
+            self.logger.info(f"🔴 [SELL] Transaction sent: {signature}")
+            await asyncio.to_thread(self.confirm_transaction, signature)
+        else:
+            self.logger.info(f"🔴 [SELL] Simulated sell for {symbol} ({mint})")
 
         sold = {
             **position,
@@ -394,6 +608,9 @@ class TradingBot:
             "pnlPercentage": pnl_pct,
             "closeTime": int(time.time() * 1000),
         }
+        if signature:
+            sold["sellTxSignature"] = signature
+
         self.sold_positions.append(sold)
         self.stats["total_pnl"] += pnl
         self.stats["successful_sells"] += 1
@@ -405,13 +622,18 @@ class TradingBot:
 
         await self.save_positions()
         await self.save_sold_positions()
-        await self.send_telegram_notification(
+
+        sell_msg = (
             "🔴 Sell executed\n"
             f"Token: {symbol}\n"
             f"Mint: {mint}\n"
             f"Exit Price: {format_usd(current_price)}\n"
-            f"PnL: {format_usd(pnl)} ({format_pct(pnl_pct)})"
+            f"PnL: {format_usd(pnl)} ({format_pct(pnl_pct)})\n"
+            f"Chart: {dex_link}"
         )
+        if signature:
+            sell_msg += f"\nTx: https://solscan.io/tx/{signature}"
+        await self.send_telegram_notification(sell_msg)
 
     async def buy_loop(self):
         self.logger.info("👀 HTTP buy loop started")
