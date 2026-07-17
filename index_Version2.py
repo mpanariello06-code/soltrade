@@ -40,6 +40,24 @@ def register_shutdown_handlers(loop: asyncio.AbstractEventLoop, shutdown_callbac
     return registered
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            try:
+                stream.write(msg + self.terminator)
+            except UnicodeEncodeError:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                safe_output = (msg + self.terminator).encode(encoding, errors="replace").decode(encoding, errors="replace")
+                stream.write(safe_output)
+            self.flush()
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+
+
 @dataclass
 class Config:
     amount: float
@@ -109,7 +127,7 @@ class TradingBot:
 
         formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
 
-        ch = logging.StreamHandler()
+        ch = SafeStreamHandler()
         ch.setLevel(logging.DEBUG if self.config.debug else logging.INFO)
         ch.setFormatter(formatter)
 

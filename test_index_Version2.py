@@ -1,9 +1,10 @@
 import os
 import signal
+import logging
 import unittest
 from unittest.mock import Mock, call, patch
 
-from index_Version2 import TradingBot, register_shutdown_handlers
+from index_Version2 import TradingBot, register_shutdown_handlers, SafeStreamHandler
 
 
 class TradingBotTelegramTests(unittest.TestCase):
@@ -124,3 +125,35 @@ class TradingBotTelegramTests(unittest.TestCase):
             loop.add_signal_handler.call_args_list,
             [call(signal.SIGINT, callback), call(signal.SIGTERM, callback)],
         )
+
+    def test_safe_stream_handler_replaces_unencodable_characters(self):
+        class Cp1252LikeStream:
+            encoding = "cp1252"
+
+            def __init__(self):
+                self.writes = []
+
+            def write(self, text):
+                if "🚀" in text:
+                    raise UnicodeEncodeError("charmap", text, 0, 1, "character maps to <undefined>")
+                self.writes.append(text)
+                return len(text)
+
+            def flush(self):
+                return None
+
+        stream = Cp1252LikeStream()
+        handler = SafeStreamHandler(stream=stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+
+        logger = logging.getLogger("safe-stream-handler-test")
+        logger.setLevel(logging.INFO)
+        logger.handlers.clear()
+        logger.propagate = False
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        self.addCleanup(handler.close)
+
+        logger.info("🚀 Initializing HTTP Trading Bot...")
+
+        self.assertTrue(any("?" in item for item in stream.writes))
