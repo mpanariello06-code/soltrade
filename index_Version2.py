@@ -48,8 +48,8 @@ class SafeStreamHandler(logging.StreamHandler):
             try:
                 stream.write(msg + self.terminator)
             except UnicodeEncodeError:
-                encoding = getattr(stream, "encoding", None) or "utf-8"
-                safe_output = (msg + self.terminator).encode(encoding, errors="replace").decode(encoding, errors="replace")
+                encoding = getattr(stream, "encoding", None) or "ascii"
+                safe_output = (msg + self.terminator).encode(encoding, errors="replace").decode(encoding)
                 stream.write(safe_output)
             self.flush()
         except RecursionError:

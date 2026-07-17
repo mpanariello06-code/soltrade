@@ -135,7 +135,8 @@ class TradingBotTelegramTests(unittest.TestCase):
 
             def write(self, text):
                 if "🚀" in text:
-                    raise UnicodeEncodeError("charmap", text, 0, 1, "character maps to <undefined>")
+                    emoji_index = text.index("🚀")
+                    raise UnicodeEncodeError("charmap", text, emoji_index, emoji_index + 1, "character maps to <undefined>")
                 self.writes.append(text)
                 return len(text)
 
