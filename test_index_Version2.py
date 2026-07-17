@@ -1,8 +1,9 @@
 import os
+import signal
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
-from index_Version2 import TradingBot
+from index_Version2 import TradingBot, register_shutdown_handlers
 
 
 class TradingBotTelegramTests(unittest.TestCase):
@@ -91,3 +92,19 @@ class TradingBotTelegramTests(unittest.TestCase):
         asyncio.run(bot.send_telegram_notification("hello from async"))
 
         mock_post.assert_called_once()
+
+    def test_register_shutdown_handlers_registers_supported_signals(self):
+        loop = Mock()
+        callback = Mock()
+
+        self.assertTrue(register_shutdown_handlers(loop, callback))
+        self.assertEqual(
+            loop.add_signal_handler.call_args_list,
+            [call(signal.SIGINT, callback), call(signal.SIGTERM, callback)],
+        )
+
+    def test_register_shutdown_handlers_ignores_unsupported_loops(self):
+        loop = Mock()
+        loop.add_signal_handler.side_effect = NotImplementedError
+
+        self.assertFalse(register_shutdown_handlers(loop, Mock()))

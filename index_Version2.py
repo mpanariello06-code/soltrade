@@ -5,13 +5,15 @@ import signal
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 
 import requests
 from dotenv import load_dotenv
 
 
-load_dotenv("config.env")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / "config.env")
 
 
 def sleep_ms(ms: int):
@@ -25,6 +27,15 @@ def format_usd(value: float) -> str:
 def format_pct(value: float) -> str:
     sign = "+" if value >= 0 else ""
     return f"{sign}{value:.2f}%"
+
+
+def register_shutdown_handlers(loop: asyncio.AbstractEventLoop, shutdown_callback) -> bool:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown_callback)
+        except NotImplementedError:
+            return False
+    return True
 
 
 @dataclass
@@ -477,10 +488,7 @@ async def main():
     bot = TradingBot()
 
     loop = asyncio.get_running_loop()
-    if hasattr(loop, "add_signal_handler"):
-        # Unix only — add_signal_handler is not available on Windows
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.shutdown()))
+    register_shutdown_handlers(loop, lambda: asyncio.create_task(bot.shutdown()))
 
     try:
         await bot.run()
