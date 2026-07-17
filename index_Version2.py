@@ -13,6 +13,8 @@ import requests
 from dotenv import load_dotenv
 
 
+LAMPORTS_PER_SOL = 1_000_000_000
+
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / "config.env")
 
@@ -315,7 +317,7 @@ class TradingBot:
             "fromAmount": str(from_amount),
             "slippage": str(self.config.slippage),
             "payer": str(keypair.pubkey()),
-            "priorityFee": str(int(self.config.priority_fee * 1e9)),
+            "priorityFee": str(int(self.config.priority_fee * LAMPORTS_PER_SOL)),
             "jito": str(self.config.use_jito).lower(),
         }
 
@@ -375,14 +377,14 @@ class TradingBot:
             accounts = ((data.get("result") or {}).get("value")) or []
             total = 0
             for acc in accounts:
-                raw = int(
-                    (((acc.get("account") or {}).get("data") or {})
-                     .get("parsed", {})
-                     .get("info", {})
-                     .get("tokenAmount", {})
-                     .get("amount", 0))
+                token_amount_info = (
+                    (acc.get("account") or {})
+                    .get("data", {})
+                    .get("parsed", {})
+                    .get("info", {})
+                    .get("tokenAmount", {})
                 )
-                total += raw
+                total += int(token_amount_info.get("amount", 0))
             return total if total > 0 else None
         except Exception as e:
             self.logger.error(f"Error getting token balance for {mint}: {e}")
@@ -499,7 +501,7 @@ class TradingBot:
         signature: Optional[str] = None
 
         if not self.config.dry_run:
-            from_amount_raw = int(self.config.amount * 1e9)  # SOL → lamports
+            from_amount_raw = int(self.config.amount * LAMPORTS_PER_SOL)  # SOL → lamports
             self.logger.info(f"🟢 [BUY] Executing real buy for {symbol} ({mint})")
             signature = await asyncio.to_thread(
                 self.execute_swap, self.SOL_ADDRESS, mint, from_amount_raw
@@ -516,7 +518,7 @@ class TradingBot:
                 self.buying_tokens.discard(mint)
                 return
             raw_balance = await asyncio.to_thread(self.get_token_balance, mint)
-            if raw_balance:
+            if raw_balance is not None:
                 token_amount = raw_balance / (10 ** decimals)
                 raw_amount = raw_balance
             else:
@@ -581,7 +583,7 @@ class TradingBot:
 
         if not self.config.dry_run:
             on_chain_raw = await asyncio.to_thread(self.get_token_balance, mint)
-            sell_raw = on_chain_raw if on_chain_raw else raw_amount
+            sell_raw = on_chain_raw if on_chain_raw is not None else raw_amount
             if sell_raw == 0:
                 self.logger.error(f"Cannot sell {symbol} — zero token balance found on-chain")
                 self.selling_positions.discard(mint)
