@@ -14,10 +14,10 @@ pip install -r requirements_Version2.txt
 
 2. Create your environment file:
 ```bash
-cp env_Version2.example .env
+cp config.env.example config.env
 ```
 
-3. Add your required Solana settings to `.env`:
+3. Add your required Solana settings to `config.env`:
    - `PRIVATE_KEY`
    - `SOLANA_TRACKER_API_KEY`
    - `RPC_URL`
@@ -39,7 +39,7 @@ cp env_Version2.example .env
    4. If the response is empty, send a fresh message to the bot and refresh the page.
    5. Find the `chat` object in the response and copy the `id` value.
 
-   ### Add Telegram settings to `.env`
+   ### Add Telegram settings to `config.env`
    ```env
    TELEGRAM_BOT_TOKEN=your-bot-token
    TELEGRAM_CHAT_ID=your-chat-id
@@ -47,7 +47,7 @@ cp env_Version2.example .env
 
    The bot will send notifications for startup, buys, sells, and shutdown.
 
-5. Review the rest of the trading settings in `.env`, then run:
+5. Review the rest of the trading settings in `config.env`, then run:
 ```bash
 python index_Version2.py
 ```

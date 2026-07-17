@@ -1,0 +1,16 @@
+# Environment / secrets
+config.env
+.env
+
+# Bot state files
+positions.json
+sold_positions.json
+
+# Logs
+trading-bot.log
+trading-bot-error.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/

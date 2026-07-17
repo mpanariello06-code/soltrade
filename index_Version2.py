@@ -11,7 +11,7 @@ import requests
 from dotenv import load_dotenv
 
 
-load_dotenv()
+load_dotenv("config.env")
 
 
 def sleep_ms(ms: int):
