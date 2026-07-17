@@ -238,13 +238,19 @@ class TradingBot:
             "disable_web_page_preview": True,
         }
 
-        for request_mode, request_args in (("json", {"json": payload}), ("form", {"data": payload})):
+        payload_attempts = [
+            {"payload_type": "json", "request_kwargs": {"json": payload}},
+            {"payload_type": "form", "request_kwargs": {"data": payload}},
+        ]
+        for attempt in payload_attempts:
+            payload_type = attempt["payload_type"]
+            request_kwargs = attempt["request_kwargs"]
             try:
-                response = requests.post(url, timeout=10, **request_args)
+                response = requests.post(url, timeout=10, **request_kwargs)
                 response.raise_for_status()
                 data = response.json()
             except (requests.RequestException, ValueError) as e:
-                self.logger.warning(f"Telegram notification failed using {request_mode} payload: {e}")
+                self.logger.warning(f"Telegram notification failed using {payload_type} payload: {e}")
                 continue
 
             if data.get("ok", False):
@@ -252,7 +258,7 @@ class TradingBot:
 
             self.logger.warning(
                 "Telegram notification was rejected by the Telegram API using "
-                f"{request_mode} payload: {data}"
+                f"{payload_type} payload: {data}"
             )
 
         self.logger.error("Telegram notification failed after trying JSON and form payloads")
