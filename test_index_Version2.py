@@ -156,4 +156,4 @@ class TradingBotTelegramTests(unittest.TestCase):
 
         logger.info("🚀 Initializing HTTP Trading Bot...")
 
-        self.assertTrue(any("?" in item for item in stream.writes))
+        self.assertEqual("".join(stream.writes), "? Initializing HTTP Trading Bot...\n")
