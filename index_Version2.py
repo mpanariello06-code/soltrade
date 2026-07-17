@@ -238,14 +238,25 @@ class TradingBot:
             "disable_web_page_preview": True,
         }
 
-        try:
-            response = requests.post(url, json=payload, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("ok", False):
-                self.logger.warning(f"Telegram notification was rejected by the Telegram API: {data}")
-        except Exception as e:
-            self.logger.error(f"Telegram notification failed: {e}")
+        for request_args in ({"json": payload}, {"data": payload}):
+            request_mode = "json" if "json" in request_args else "form"
+            try:
+                response = requests.post(url, timeout=10, **request_args)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                self.logger.warning(f"Telegram notification failed using {request_mode} payload: {e}")
+                continue
+
+            if data.get("ok", False):
+                return
+
+            self.logger.warning(
+                "Telegram notification was rejected by the Telegram API using "
+                f"{request_mode} payload: {data}"
+            )
+
+        self.logger.error("Telegram notification failed after trying JSON and form payloads")
 
     async def send_telegram_notification(self, message: str):
         await asyncio.to_thread(self._send_telegram_notification_sync, message)

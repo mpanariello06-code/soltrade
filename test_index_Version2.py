@@ -67,6 +67,44 @@ class TradingBotTelegramTests(unittest.TestCase):
         )
 
     @patch("index_Version2.requests.post")
+    def test_send_telegram_notification_retries_with_form_payload(self, mock_post):
+        failed_response = Mock()
+        failed_response.raise_for_status.side_effect = Exception("bad request")
+
+        successful_response = Mock()
+        successful_response.raise_for_status.return_value = None
+        successful_response.json.return_value = {"ok": True}
+
+        mock_post.side_effect = [failed_response, successful_response]
+
+        bot = self.build_bot()
+        bot._send_telegram_notification_sync("hello")
+
+        self.assertEqual(mock_post.call_count, 2)
+        mock_post.assert_has_calls(
+            [
+                call(
+                    "https://api.telegram.org/bottelegram-token/sendMessage",
+                    json={
+                        "chat_id": "123456",
+                        "text": "hello",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                ),
+                call(
+                    "https://api.telegram.org/bottelegram-token/sendMessage",
+                    data={
+                        "chat_id": "123456",
+                        "text": "hello",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                ),
+            ]
+        )
+
+    @patch("index_Version2.requests.post")
     def test_send_telegram_notification_skips_when_disabled(self, mock_post):
         with patch.dict(
             os.environ,
