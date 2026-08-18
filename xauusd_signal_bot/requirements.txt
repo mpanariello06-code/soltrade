@@ -1,0 +1,14 @@
+# XAUUSD signal engine - runtime dependencies
+#
+# MetaTrader5 is Windows-only and is required for LIVE mode only.  On other
+# platforms the package simply will not install; indicators, the backtester,
+# performance.py and the test-suite all run without it.
+MetaTrader5>=5.0.45 ; platform_system == "Windows"
+
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+python-dotenv>=1.0
+
+# testing
+pytest>=7.4

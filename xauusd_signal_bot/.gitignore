@@ -1,0 +1,19 @@
+# secrets - never commit
+.env
+
+# generated data
+data/*.csv
+data/*.csv.bak-*
+data/*.txt
+data/*.json
+!data/.gitkeep
+
+# downloaded / exported price history
+history/*.csv
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

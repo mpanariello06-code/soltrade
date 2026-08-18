@@ -1,0 +1,438 @@
+"""MetaTrader 5 market-data access.
+
+READ-ONLY BY DESIGN.  This module never imports, references or wraps any MT5
+order-execution function (``order_send``, ``order_check``, ...).  MT5 is used
+purely as a candle/quote feed.
+
+The ``MetaTrader5`` package is Windows-only.  It is imported lazily and
+defensively so that the rest of the project (indicators, engines, backtester,
+tests) remains importable and runnable on any platform.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from .utils import (
+    BoundedCache,
+    as_utc,
+    broker_time_to_utc,
+    frame_fingerprint,
+    is_finite_number,
+    now_utc,
+    safe_div,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+try:  # pragma: no cover - depends on the host OS
+    import MetaTrader5 as mt5  # type: ignore
+
+    MT5_AVAILABLE = True
+except Exception:  # noqa: BLE001 - any import problem must be non-fatal
+    mt5 = None  # type: ignore[assignment]
+    MT5_AVAILABLE = False
+
+
+#: Timeframe label -> duration in minutes.  Used for staleness and resampling.
+TIMEFRAME_MINUTES: Dict[str, int] = {
+    "M1": 1, "M5": 5, "M15": 15, "M30": 30,
+    "H1": 60, "H4": 240, "D1": 1440,
+}
+
+REQUIRED_COLUMNS = ("time", "open", "high", "low", "close", "tick_volume")
+
+
+def timeframe_minutes(timeframe: str) -> int:
+    """Duration of one candle of ``timeframe`` in minutes."""
+    try:
+        return TIMEFRAME_MINUTES[str(timeframe).upper()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'") from exc
+
+
+def _mt5_timeframe(timeframe: str):
+    """Map a timeframe label to the MT5 enum constant."""
+    if not MT5_AVAILABLE:
+        raise RuntimeError("MetaTrader5 package is not available on this machine")
+    label = str(timeframe).upper()
+    constant = getattr(mt5, f"TIMEFRAME_{label}", None)
+    if constant is None:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'")
+    return constant
+
+
+# --------------------------------------------------------------------------- #
+# candle hygiene
+# --------------------------------------------------------------------------- #
+def clean_candles(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort by time, drop duplicate timestamps and rows with impossible OHLC.
+
+    Keeps the *last* occurrence of a duplicated timestamp: when MT5 re-sends a
+    bar it is the fresher copy.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+    out = df.copy()
+    for column in REQUIRED_COLUMNS:
+        if column not in out.columns:
+            raise ValueError(f"candle frame is missing required column '{column}'")
+
+    out = out.dropna(subset=["time", "open", "high", "low", "close"])
+    out = out.sort_values("time")
+    out = out.drop_duplicates(subset=["time"], keep="last")
+
+    valid = (
+        (out["high"] >= out["low"])
+        & (out["high"] >= out["open"])
+        & (out["high"] >= out["close"])
+        & (out["low"] <= out["open"])
+        & (out["low"] <= out["close"])
+        & (out[["open", "high", "low", "close"]] > 0).all(axis=1)
+        & np.isfinite(out[["open", "high", "low", "close"]]).all(axis=1)
+    )
+    out = out[valid]
+
+    if "tick_volume" not in out.columns:
+        out["tick_volume"] = 0.0
+    out["tick_volume"] = pd.to_numeric(out["tick_volume"], errors="coerce").fillna(0.0)
+    if "spread" not in out.columns:
+        out["spread"] = np.nan
+    return out.reset_index(drop=True)
+
+
+_STRUCTURE_CACHE = BoundedCache(maxsize=32)
+
+
+def validate_candles(
+    df: pd.DataFrame,
+    timeframe: str,
+    min_required: int,
+    max_staleness_seconds: Optional[int] = None,
+    reference_time: Optional[datetime] = None,
+) -> Tuple[bool, str]:
+    """Validate a closed-candle frame.  Returns ``(ok, reason)``.
+
+    ``reason`` is an empty string when the frame is usable.  The structural
+    checks (ordering, duplicates, OHLC sanity) are memoised on the frame's
+    contents; the staleness check depends on wall-clock time and is always
+    re-evaluated.
+    """
+    if df is None or df.empty:
+        return False, "no candle data"
+    if len(df) < min_required:
+        return False, f"insufficient history ({len(df)} < {min_required})"
+
+    cache_key = frame_fingerprint(df, ("open", "high", "low", "close", "time"))
+    structural = _STRUCTURE_CACHE.get(cache_key)
+    if structural is None:
+        structural = ""
+        if df["time"].duplicated().any():
+            structural = "duplicate candle timestamps"
+        elif not df["time"].is_monotonic_increasing:
+            structural = "candle timestamps are not ordered"
+        elif df[["open", "high", "low", "close"]].isna().any().any():
+            structural = "NaN OHLC values"
+        elif (df[["open", "high", "low", "close"]] <= 0).any().any():
+            structural = "non-positive OHLC values"
+        elif (df["high"] < df["low"]).any():
+            structural = "high < low in candle data"
+        _STRUCTURE_CACHE.put(cache_key, structural)
+    if structural:
+        return False, structural
+
+    if max_staleness_seconds is not None:
+        reference_time = reference_time or now_utc()
+        last_open = as_utc(pd.Timestamp(df["time"].iloc[-1]).to_pydatetime())
+        expected_close = last_open + timedelta(minutes=timeframe_minutes(timeframe))
+        age = (as_utc(reference_time) - expected_close).total_seconds()
+        if age > max_staleness_seconds:
+            return False, f"stale data (last candle closed {int(age)}s ago)"
+    return True, ""
+
+
+def resample_candles(df: pd.DataFrame, source_tf: str, target_tf: str) -> pd.DataFrame:
+    """Aggregate lower-timeframe candles into a higher timeframe.
+
+    Only *complete* target buckets are returned, so the result never contains a
+    partially-formed candle.  Used by the backtester to derive M15/H1 from an
+    M5 history file.
+    """
+    source_minutes = timeframe_minutes(source_tf)
+    target_minutes = timeframe_minutes(target_tf)
+    if target_minutes % source_minutes != 0:
+        raise ValueError(f"{target_tf} is not a whole multiple of {source_tf}")
+    if target_minutes == source_minutes:
+        return df.copy()
+
+    work = df.copy()
+    work["time"] = pd.to_datetime(work["time"], utc=True)
+    work = work.set_index("time")
+    aggregated = work.resample(f"{target_minutes}min", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "tick_volume": "sum"}
+    ).dropna(subset=["open", "high", "low", "close"])
+
+    bars_per_bucket = target_minutes // source_minutes
+    counts = work.resample(f"{target_minutes}min", label="left", closed="left").size()
+    # A bucket is complete when it holds a full set of source bars.  Gold has
+    # gaps (rollover/weekend), so partial buckets in the middle of history are
+    # tolerated - only the final bucket must be complete, since that is the one
+    # that could still be forming.
+    if len(aggregated) and counts.reindex(aggregated.index).iloc[-1] < bars_per_bucket:
+        aggregated = aggregated.iloc[:-1]
+
+    aggregated = aggregated.reset_index()
+    aggregated["spread"] = np.nan
+    return aggregated
+
+
+# --------------------------------------------------------------------------- #
+# snapshot passed to the signal engine
+# --------------------------------------------------------------------------- #
+@dataclass
+class MarketSnapshot:
+    """Everything the signal engine is allowed to see for one evaluation.
+
+    Every frame holds **closed candles only**; the last row of ``m5`` is the
+    signal candle.  There is deliberately no field carrying the forming candle.
+    """
+
+    symbol: str
+    m5: pd.DataFrame
+    m15: pd.DataFrame
+    h1: pd.DataFrame
+    m1: Optional[pd.DataFrame] = None
+    spread_points: float = float("nan")
+    evaluated_at: datetime = field(default_factory=now_utc)
+
+    @property
+    def candle_time(self) -> datetime:
+        """UTC open time of the signal candle."""
+        return as_utc(pd.Timestamp(self.m5["time"].iloc[-1]).to_pydatetime())
+
+    @property
+    def close(self) -> float:
+        """Close price of the signal candle."""
+        return float(self.m5["close"].iloc[-1])
+
+
+# --------------------------------------------------------------------------- #
+# MT5 connector
+# --------------------------------------------------------------------------- #
+class MarketData:
+    """Thin, resilient, read-only wrapper around the MetaTrader 5 terminal."""
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self.connected = False
+        self._last_connect_attempt = 0.0
+        self._reconnect_backoff = 5.0
+
+    # -- connection ------------------------------------------------------- #
+    def connect(self) -> bool:
+        """Initialise the MT5 terminal and select the symbol.  Never raises."""
+        if not MT5_AVAILABLE:
+            LOGGER.error(
+                "MetaTrader5 package unavailable - live mode requires Windows with "
+                "MT5 installed (`pip install MetaTrader5`)."
+            )
+            return False
+
+        self._last_connect_attempt = time.time()
+        try:
+            kwargs = {}
+            if self.config.mt5_terminal_path:
+                kwargs["path"] = self.config.mt5_terminal_path
+            if self.config.mt5_login and self.config.mt5_password and self.config.mt5_server:
+                kwargs.update(
+                    login=int(self.config.mt5_login),
+                    password=self.config.mt5_password,
+                    server=self.config.mt5_server,
+                )
+            if not mt5.initialize(**kwargs):
+                LOGGER.error("MT5 initialize() failed: %s", mt5.last_error())
+                self.connected = False
+                return False
+
+            if not mt5.symbol_select(self.config.symbol, True):
+                LOGGER.error("Symbol '%s' is unavailable on this account", self.config.symbol)
+                mt5.shutdown()
+                self.connected = False
+                return False
+
+            info = mt5.terminal_info()
+            LOGGER.info(
+                "MT5 connected (terminal=%s, symbol=%s)",
+                getattr(info, "name", "unknown"),
+                self.config.symbol,
+            )
+            self.connected = True
+            self._reconnect_backoff = 5.0
+            return True
+        except Exception as exc:  # noqa: BLE001 - connection must never crash the loop
+            LOGGER.exception("MT5 connection error: %s", exc)
+            self.connected = False
+            return False
+
+    def ensure_connection(self) -> bool:
+        """Reconnect if needed, with exponential backoff between attempts."""
+        if self.connected and self._terminal_alive():
+            return True
+        elapsed = time.time() - self._last_connect_attempt
+        if elapsed < self._reconnect_backoff:
+            return False
+        LOGGER.warning("MT5 connection lost - attempting to reconnect")
+        self.shutdown(quiet=True)
+        if self.connect():
+            return True
+        self._reconnect_backoff = min(self._reconnect_backoff * 2.0, 300.0)
+        return False
+
+    def _terminal_alive(self) -> bool:
+        if not MT5_AVAILABLE:
+            return False
+        try:
+            return mt5.terminal_info() is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def shutdown(self, quiet: bool = False) -> None:
+        """Close the MT5 connection."""
+        if MT5_AVAILABLE:
+            try:
+                mt5.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+        self.connected = False
+        if not quiet:
+            LOGGER.info("MT5 connection closed")
+
+    # -- data ------------------------------------------------------------- #
+    def get_candles(
+        self, symbol: str, timeframe: str, count: int, closed_only: bool = True
+    ) -> pd.DataFrame:
+        """Fetch candles, newest last, timestamps converted to UTC.
+
+        With ``closed_only=True`` (the default and the only mode the signal
+        engine may use) the still-forming candle at position 0 is dropped.
+        Returns an empty frame on any failure - callers check emptiness.
+        """
+        if not self.ensure_connection():
+            return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+        try:
+            # +1 because the forming candle is discarded below.
+            rates = mt5.copy_rates_from_pos(
+                symbol, _mt5_timeframe(timeframe), 0, int(count) + 1
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("copy_rates_from_pos failed for %s %s: %s", symbol, timeframe, exc)
+            self.connected = False
+            return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+        if rates is None or len(rates) == 0:
+            LOGGER.warning("No candles returned for %s %s (%s)", symbol, timeframe, mt5.last_error())
+            return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+        df = pd.DataFrame(rates)
+        offset = self.config.mt5_server_utc_offset_hours
+        df["time"] = [
+            broker_time_to_utc(datetime.fromtimestamp(int(t), tz=timezone.utc).replace(tzinfo=None), offset)
+            for t in df["time"]
+        ]
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+
+        if closed_only and len(df):
+            df = df.iloc[:-1]  # position 0 of MT5 is the forming candle -> last here
+        return clean_candles(df)
+
+    def get_latest_candle(self, symbol: str, timeframe: str) -> Optional[pd.Series]:
+        """Most recently *closed* candle, or ``None``."""
+        df = self.get_candles(symbol, timeframe, 3, closed_only=True)
+        if df.empty:
+            return None
+        return df.iloc[-1]
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Current mid price from the tick feed, falling back to the last close."""
+        if not self.ensure_connection():
+            return None
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return None
+            bid, ask = float(tick.bid), float(tick.ask)
+            if is_finite_number(bid) and is_finite_number(ask) and bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+            return bid if bid > 0 else None
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("symbol_info_tick failed: %s", exc)
+            return None
+
+    def get_spread(self, symbol: str) -> float:
+        """Current spread in points.  ``nan`` when unavailable."""
+        if not self.ensure_connection():
+            return float("nan")
+        try:
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                return float("nan")
+            if getattr(info, "spread", 0):
+                return float(info.spread)
+            tick = mt5.symbol_info_tick(symbol)
+            point = float(getattr(info, "point", 0.0) or 0.0)
+            if tick is None or point <= 0:
+                return float("nan")
+            return safe_div(float(tick.ask) - float(tick.bid), point, float("nan"))
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("symbol_info failed: %s", exc)
+            return float("nan")
+
+    # -- composite --------------------------------------------------------- #
+    def build_snapshot(self) -> Tuple[Optional[MarketSnapshot], str]:
+        """Fetch every timeframe and assemble a :class:`MarketSnapshot`.
+
+        Returns ``(snapshot, reason)``; ``snapshot`` is ``None`` when data could
+        not be assembled and ``reason`` explains why.
+        """
+        cfg = self.config
+        m5 = self.get_candles(cfg.symbol, cfg.signal_timeframe, cfg.candles_signal)
+        ok, reason = validate_candles(
+            m5, cfg.signal_timeframe, cfg.min_candles_required, cfg.max_candle_staleness_seconds
+        )
+        if not ok:
+            return None, f"{cfg.signal_timeframe}: {reason}"
+
+        m15 = self.get_candles(cfg.symbol, cfg.intermediate_timeframe, cfg.candles_intermediate)
+        ok, reason = validate_candles(m15, cfg.intermediate_timeframe, cfg.min_htf_candles_required)
+        if not ok:
+            return None, f"{cfg.intermediate_timeframe}: {reason}"
+
+        h1 = self.get_candles(cfg.symbol, cfg.higher_timeframe, cfg.candles_higher)
+        ok, reason = validate_candles(h1, cfg.higher_timeframe, cfg.min_htf_candles_required)
+        if not ok:
+            return None, f"{cfg.higher_timeframe}: {reason}"
+
+        m1 = self.get_candles(cfg.symbol, cfg.micro_timeframe, cfg.candles_micro)
+        if m1.empty:
+            m1 = None
+
+        return (
+            MarketSnapshot(
+                symbol=cfg.symbol,
+                m5=m5,
+                m15=m15,
+                h1=h1,
+                m1=m1,
+                spread_points=self.get_spread(cfg.symbol),
+                evaluated_at=now_utc(),
+            ),
+            "",
+        )
