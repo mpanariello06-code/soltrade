@@ -48,8 +48,16 @@ from .utils import (
     now_utc,
 )
 from .volatility import analyze_volatility, classify_volatility
+from .timeframes import confirmation_label
 from .volume import analyze_volume
-from .filters import FilterInput, GateState, adaptive_threshold, run_post_target_filters, run_pre_target_filters
+from .filters import (
+    FilterInput,
+    GateState,
+    adaptive_threshold,
+    is_near_signal,
+    run_post_target_filters,
+    run_pre_target_filters,
+)
 
 LOGGER = get_logger("engine")
 
@@ -70,12 +78,17 @@ EVALUATION_COLUMNS: Tuple[str, ...] = (
     "trend_score", "htf_score", "momentum_score", "structure_score",
     "liquidity_score", "sr_score", "volume_score", "volatility_score",
     "price_action_score", "regime", "spread", "decision", "rejection_reason",
-    "session", "volatility_band", "threshold", "htf_alignment", "signal_id",
+    # operating context - what the engine was configured as at this moment
+    "mode", "signal_timeframe", "confirmation_timeframes", "threshold_used",
+    "near_signal", "session", "volatility_band", "htf_alignment", "signal_id",
 ) + tuple(f"f_{key}" for key in FEATURE_KEYS)
 
 DECISION_BUY = "BUY"
 DECISION_SELL = "SELL"
 DECISION_NONE = "NO_SIGNAL"
+#: Diagnostic only - a candidate that came close to the bar but did not qualify.
+#: It is never sent as a trading signal.
+DECISION_NEAR = "NEAR_SIGNAL"
 
 
 @dataclass
@@ -105,6 +118,16 @@ class Signal:
     rr3: float = 0.0
     sl_mode: str = ""
     confirmations: Dict[str, bool] = field(default_factory=dict)
+    #: operating context, preserved so research and standard signals can be
+    #: told apart when the CSVs are analysed later
+    mode: str = "STANDARD"
+    confirmation_timeframes: str = ""
+    threshold_used: float = 0.0
+
+    @property
+    def is_research(self) -> bool:
+        """True for a candidate collected under RESEARCH mode."""
+        return self.mode == "RESEARCH"
 
     def to_row(self) -> Dict[str, Any]:
         """Flat mapping for ``signals.csv``."""
@@ -124,6 +147,11 @@ class Signal:
             "bearish_score": self.bearish_score,
             "regime": self.regime,
             "status": "ACTIVE",
+            "mode": self.mode,
+            "signal_timeframe": self.timeframe,
+            "confirmation_timeframes": self.confirmation_timeframes,
+            "threshold_used": round(self.threshold_used, 2),
+            "score": self.confidence,
             "session": self.session,
             "risk_reward": self.risk_reward,
             "rr1": self.rr1,
@@ -153,10 +181,19 @@ class Evaluation:
     htf_alignment: str = ""
     signal: Optional[Signal] = None
     features: Dict[str, float] = field(default_factory=dict)
+    mode: str = "STANDARD"
+    confirmation_timeframes: str = ""
+    #: diagnostic flag - close to the threshold but rejected
+    near_signal: bool = False
 
     @property
     def has_signal(self) -> bool:
         return self.signal is not None
+
+    @property
+    def best_score(self) -> float:
+        """Score of the stronger direction, 0 when nothing was computed."""
+        return self.card.dominant_score() if self.card else 0.0
 
     def to_row(self) -> Dict[str, Any]:
         """Flat mapping for ``evaluations.csv``.
@@ -205,9 +242,13 @@ class Evaluation:
 
         row.update(
             {
+                "mode": self.mode,
+                "signal_timeframe": self.timeframe,
+                "confirmation_timeframes": self.confirmation_timeframes,
+                "threshold_used": round(self.threshold, 2),
+                "near_signal": int(bool(self.near_signal)),
                 "session": self.session,
                 "volatility_band": self.volatility_band,
-                "threshold": round(self.threshold, 2),
                 "htf_alignment": self.htf_alignment,
                 "signal_id": self.signal.signal_id if self.signal else "",
             }
@@ -279,14 +320,18 @@ class SignalEngine:
             ),
         }
 
-    def _validate(self, snapshot: MarketSnapshot) -> str:
+    def _validate(self, snapshot: MarketSnapshot, config=None) -> str:
         """Return an empty string when the snapshot is usable, else the reason."""
-        cfg = self.config
-        checks = (
-            (snapshot.m5, cfg.signal_timeframe, cfg.min_candles_required),
-            (snapshot.m15, cfg.intermediate_timeframe, cfg.min_htf_candles_required),
-            (snapshot.h1, cfg.higher_timeframe, cfg.min_htf_candles_required),
-        )
+        cfg = config or self.config
+        checks = [(snapshot.m5, cfg.signal_timeframe, cfg.min_candles_required)]
+        # A confirmation timeframe is optional (H1 has one, H4 has none), but
+        # whenever a frame *is* supplied it must be as sound as the signal one.
+        for frame, label in (
+            (snapshot.m15, cfg.intermediate_timeframe),
+            (snapshot.h1, cfg.higher_timeframe),
+        ):
+            if frame is not None and label:
+                checks.append((frame, label, cfg.min_htf_candles_required))
         for frame, label, minimum in checks:
             ok, reason = validate_candles(frame, label, minimum)
             if not ok:
@@ -295,29 +340,40 @@ class SignalEngine:
 
     # -- main entry point --------------------------------------------------- #
     def evaluate(
-        self, snapshot: MarketSnapshot, gate: Optional[GateState] = None
+        self,
+        snapshot: MarketSnapshot,
+        gate: Optional[GateState] = None,
+        config=None,
     ) -> Evaluation:
-        """Evaluate one closed candle and return the full :class:`Evaluation`."""
-        cfg = self.config
+        """Evaluate one closed candle and return the full :class:`Evaluation`.
+
+        ``config`` lets the caller pass a runtime-adjusted view of the
+        configuration (mode, signal timeframe, threshold) without rebuilding the
+        engine - see :func:`src.runtime_state.effective_config`.
+        """
+        cfg = config or self.config
         gate = gate or GateState()
         candle_time = snapshot.candle_time if not snapshot.m5.empty else now_utc()
+        confirmation = snapshot.confirmation or confirmation_label(cfg.signal_timeframe)
 
         evaluation = Evaluation(
             timestamp=candle_time,
             symbol=snapshot.symbol,
             timeframe=cfg.signal_timeframe,
             spread_points=snapshot.spread_points,
+            mode=str(getattr(cfg, "mode", "STANDARD")).upper(),
+            confirmation_timeframes=confirmation,
         )
 
-        reason = self._validate(snapshot)
+        reason = self._validate(snapshot, cfg)
         if reason:
             evaluation.rejection_reason = f"data validation failed - {reason}"
             return evaluation
 
         params = cfg.indicators
         m5 = self._ensure_indicators(snapshot.m5, params)
-        m15 = self._ensure_indicators(snapshot.m15, params)
-        h1 = self._ensure_indicators(snapshot.h1, params)
+        m15 = self._ensure_indicators(snapshot.m15, params) if snapshot.m15 is not None else None
+        h1 = self._ensure_indicators(snapshot.h1, params) if snapshot.h1 is not None else None
 
         # -- 3. analysis engines ------------------------------------------- #
         components: Dict[str, ComponentScore] = {
@@ -348,7 +404,7 @@ class SignalEngine:
         if direction == "NONE":
             evaluation.rejection_reason = "no directional edge"
             evaluation.threshold = adaptive_threshold(regime, volatility_band, "NEUTRAL", cfg) or 0.0
-            return evaluation
+            return self._finish_rejected(evaluation, cfg)
 
         alignment = htf_alignment(components["htf"], direction)
         evaluation.htf_alignment = alignment
@@ -363,7 +419,7 @@ class SignalEngine:
             spread_points=snapshot.spread_points,
             candle_time=candle_time,
             htf_alignment=alignment,
-            timeframe_minutes=self.timeframe_minutes,
+            timeframe_minutes=timeframe_minutes(cfg.signal_timeframe),
             gate=gate,
         )
 
@@ -372,19 +428,19 @@ class SignalEngine:
         evaluation.threshold = outcome.threshold
         if not outcome.passed:
             evaluation.rejection_reason = outcome.reason
-            return evaluation
+            return self._finish_rejected(evaluation, cfg)
 
         # -- 7. targets and R:R --------------------------------------------- #
         targets, target_reason = build_targets(m5, cfg, direction)
         if targets is None:
             evaluation.rejection_reason = target_reason or "could not build targets"
-            return evaluation
+            return self._finish_rejected(evaluation, cfg)
 
         filter_input.targets = targets
         outcome = run_post_target_filters(filter_input, cfg, outcome.threshold)
         if not outcome.passed:
             evaluation.rejection_reason = outcome.reason
-            return evaluation
+            return self._finish_rejected(evaluation, cfg)
 
         # -- 8. build the signal --------------------------------------------- #
         score = card.bullish_score if direction == DECISION_BUY else card.bearish_score
@@ -412,12 +468,16 @@ class SignalEngine:
             rr3=targets.rr3,
             sl_mode=targets.sl_mode,
             confirmations=card.confirmations(direction),
+            mode=evaluation.mode,
+            confirmation_timeframes=confirmation,
+            threshold_used=round(outcome.threshold, 2),
         )
 
         evaluation.decision = direction
         evaluation.signal = signal
         LOGGER.info(
-            "SIGNAL %s %s @ %.2f | conf %.1f | regime %s | RR2 %.2f | %s",
+            "%s %s %s @ %.2f | score %.1f | regime %s | RR2 %.2f | %s",
+            "RESEARCH SIGNAL" if signal.is_research else "SIGNAL",
             signal.direction,
             signal.symbol,
             signal.entry,
@@ -426,4 +486,20 @@ class SignalEngine:
             signal.rr2,
             signal.reason_summary,
         )
+        return evaluation
+
+    # -- rejection bookkeeping ---------------------------------------------- #
+    @staticmethod
+    def _finish_rejected(evaluation: "Evaluation", config) -> "Evaluation":
+        """Tag a rejected evaluation as NEAR_SIGNAL when it came close.
+
+        Diagnostic only: the decision is still "no trade", but the row in
+        ``evaluations.csv`` now says whether the threshold was the thing that
+        stopped it, and by how little.
+        """
+        if evaluation.card is None:
+            return evaluation
+        if is_near_signal(evaluation.best_score, evaluation.threshold, config):
+            evaluation.near_signal = True
+            evaluation.decision = DECISION_NEAR
         return evaluation

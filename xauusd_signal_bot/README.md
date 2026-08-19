@@ -33,23 +33,27 @@ automatic outcome tracking (TP/SL/expiry)
 
 1. [Quick start (Windows)](#quick-start-windows)
 2. [Project layout](#project-layout)
-3. [How the signal engine works](#how-the-signal-engine-works)
-4. [Scoring](#scoring)
-5. [Filtering](#filtering)
-6. [Entry, stop loss and take profits](#entry-stop-loss-and-take-profits)
-7. [Telegram](#telegram)
-8. [Where data is stored](#where-data-is-stored)
-9. [Outcome tracking and the R model](#outcome-tracking-and-the-r-model)
-10. [Backtesting](#backtesting)
-11. [Walk-forward testing](#walk-forward-testing)
-12. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
-13. [Calibration](#calibration)
-14. [Timezones](#timezones)
-15. [Anti-lookahead guarantees](#anti-lookahead-guarantees)
-16. [Tests](#tests)
-17. [Honest assessment](#honest-assessment)
-18. [Known limitations](#known-limitations)
-19. [Recommended V2 improvements](#recommended-v2-improvements)
+3. [Operating modes](#operating-modes)
+4. [Telegram control panel](#telegram-control-panel)
+5. [Timeframes](#timeframes)
+6. [How the signal engine works](#how-the-signal-engine-works)
+7. [Scoring](#scoring)
+8. [Filtering](#filtering)
+9. [Near-signal diagnostic](#near-signal-diagnostic)
+10. [Entry, stop loss and take profits](#entry-stop-loss-and-take-profits)
+11. [Telegram messages](#telegram-messages)
+12. [Where data is stored](#where-data-is-stored)
+13. [Outcome tracking and the R model](#outcome-tracking-and-the-r-model)
+14. [Backtesting](#backtesting)
+15. [Walk-forward testing](#walk-forward-testing)
+16. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
+17. [Calibration](#calibration)
+18. [Timezones](#timezones)
+19. [Anti-lookahead guarantees](#anti-lookahead-guarantees)
+20. [Tests](#tests)
+21. [Honest assessment](#honest-assessment)
+22. [Known limitations](#known-limitations)
+23. [Recommended V2 improvements](#recommended-v2-improvements)
 
 ---
 
@@ -178,6 +182,9 @@ xauusd_signal_bot/
 │   ├── volatility.py        ATR regime (0-5, direction-neutral)
 │   ├── price_action.py      candle confirmation (0-5)
 │   ├── regime.py            market-regime classifier
+│   ├── timeframes.py        signal timeframes + confirmation hierarchy
+│   ├── runtime_state.py     live-editable settings, persisted to state.json
+│   ├── telegram_control.py  inline-button control panel
 │   ├── scoring.py           weighted aggregation → 0-100
 │   ├── filters.py           thresholds and rejection rules
 │   ├── targets.py           entry / SL / TP1-3 / R:R
@@ -186,7 +193,7 @@ xauusd_signal_bot/
 │   ├── telegram_bot.py      notifications
 │   ├── logger.py            logging setup
 │   └── utils.py             helpers
-└── tests/                   150 unit tests
+└── tests/                   252 unit tests
 ```
 
 ### Two deliberate deviations from a plain dependency list
@@ -199,6 +206,136 @@ xauusd_signal_bot/
 * **No `python-telegram-bot`.** The only thing needed is "post a text message",
   and the main loop is synchronous. `src/telegram_bot.py` calls the Bot HTTP API
   with `requests`, avoiding an async framework and its event loop.
+
+---
+
+## Operating modes
+
+Three modes, all sharing **exactly the same scoring engine**.  They differ only
+in how much confirmation a candidate must show before it is reported.
+
+| Mode | Icon | Nominal threshold | Purpose |
+|---|---|---|---|
+| `RESEARCH` | 🔬 | 50 | Surface many candidates for observation, paper testing and future ML training |
+| `STANDARD` | 📊 | 72 | The default |
+| `CONSERVATIVE` | 🛡 | 80 | Demands more confirmation than STANDARD |
+
+> **RESEARCH mode is not a "more profitable" mode.** It lowers the bar so that
+> more candidate setups become visible and get recorded. Every research message
+> is labelled `🔬 RESEARCH SIGNAL` and carries an explicit disclaimer. Nothing
+> about a research candidate is validated.
+
+The scoring weights, the engines and the filters are **unchanged** between
+modes. Only the threshold moves. That is deliberate: if research candidates
+were scored differently they could not be compared with standard ones, which
+would defeat the purpose of collecting them.
+
+Thresholds are per mode **and** per timeframe (see below), configurable in
+`config.py` and adjustable live from Telegram.
+
+## Telegram control panel
+
+Send `/panel` (or `/start`) to your bot to summon the panel. Buttons are the
+interface; text commands only exist to bring it up.
+
+```
+━━━━━━━━━━━━━━━━━━
+🤖 XAUUSD SIGNAL ENGINE
+━━━━━━━━━━━━━━━━━━
+
+Status: 🟢 RUNNING
+Mode: 🔬 RESEARCH
+Signal TF: M5
+Confirmation: M15+H1
+
+Threshold: 50
+Cooldown: 10 candles
+Min R:R (TP2): 1.5
+
+Signals today: 4
+MT5: CONNECTED
+
+[▶️ START] [⏸ PAUSE] [⏹ STOP]
+[● 🔬 RESEARCH]
+[○ 📊 STANDARD]
+[○ 🛡 CONSERVATIVE]
+[ M1] [●M5] [ M15]
+[ M30] [ H1] [ H4]
+[🎯 THRESHOLD (50)]
+[📊 ANALYSIS]
+[📈 PERFORMANCE]
+[⚙️ SETTINGS] [🔄 REFRESH]
+```
+
+Every press takes effect in the running process - **nothing requires a
+restart** - and is persisted to `data/state.json`.
+
+| Control | Effect |
+|---|---|
+| START / PAUSE / STOP | PAUSE keeps MT5 connected and keeps tracking open signals, but generates no new ones. STOP shuts the engine down cleanly. |
+| Mode buttons | Switch RESEARCH / STANDARD / CONSERVATIVE; the threshold follows |
+| Timeframe buttons | Switch the signal timeframe; the confirmation hierarchy follows |
+| 🎯 THRESHOLD | `-5 / -1 / +1 / +5 / RESET`, clamped to 40-95 |
+| 📊 ANALYSIS | Latest evaluation on demand, from closed candles only. Read-only: it records nothing and cannot emit or suppress a signal |
+| 📈 PERFORMANCE | Summary from the CSVs, with BY TIMEFRAME / BY SCORE / BY REGIME / BY MODE views |
+| ⚙️ SETTINGS | Mode, timeframe, threshold, cooldown, minimum R:R, session filter, near-signal alerts |
+
+**Safety.** Updates from any chat other than `TELEGRAM_CHAT_ID` are ignored.
+Only the settings in `Config.telegram_editable_settings` are reachable -
+credentials, the bot token, the symbol and all file paths have no handler and
+are never rendered into a message. On startup the poller **discards updates
+queued while the engine was down**, so a restart never replays stale presses.
+
+## Timeframes
+
+Six signal timeframes are supported. Changing one moves the whole confirmation
+hierarchy - confirming an M1 setup against H1 is a very different statement
+from confirming an M5 setup against H1.
+
+| Signal TF | Intermediate confirmation | Higher confirmation | Default STANDARD threshold | RESEARCH |
+|---|---|---|---|---|
+| M1 | M5 | M15 | 80 | 55 |
+| M5 | M15 | H1 | 72 | 50 |
+| M15 | M30 | H1 | 70 | 50 |
+| M30 | H1 | H4 | 68 | 50 |
+| H1 | H4 | — | 65 | 50 |
+| H4 | — | — | 65 | 50 |
+
+Faster timeframes carry a higher bar because their signals are noisier. These
+are **starting points, not optimised values**.
+
+When only one confirmation timeframe exists (H1), the HTF component is computed
+from that timeframe alone. When none exists (H4), the HTF component is marked
+*not applicable* and its 15 points are redistributed across the other eight
+components, so the score stays on a true 0-100 scale instead of being silently
+capped at 85.
+
+Switching timeframe clears the candle cache, and each timeframe keeps its **own**
+last-processed-candle marker in `state.json`, so switching away and back can
+never re-evaluate a candle that was already done. Signals raised on a timeframe
+you have since left are still tracked to completion, using candles of their own
+timeframe.
+
+## Near-signal diagnostic
+
+A rejected candidate whose best score lands within `NEAR_SIGNAL_MARGIN` (default
+10) points **below** the active threshold is recorded as `NEAR_SIGNAL` in
+`evaluations.csv`.
+
+```
+Threshold: 72
+Bullish: 66
+-> NEAR SIGNAL
+```
+
+It is never sent as a trading signal. The point is to answer a question the
+score distribution alone cannot: *is the threshold slightly too strict for this
+market?* If most candles sit just under the bar, the threshold is the binding
+constraint; if they sit far below, it is not.
+
+Telegram alerts for near-signals are **off by default** and can be toggled in
+Settings.
+
 
 ---
 
@@ -346,7 +483,7 @@ Telegram message are the numbers that were validated.
 
 ---
 
-## Telegram
+## Telegram messages
 
 Two message types, both plain text (no Markdown, so gold prices and emoji cannot
 break the formatting).
@@ -406,11 +543,11 @@ them. No database.
 
 | File | Contents |
 |---|---|
-| `signals.csv` | One row per signal; `status` updated in place |
-| `evaluations.csv` | **Every** evaluated candle: all nine sub-scores, regime, spread, decision, rejection reason, plus 23 raw `f_*` feature columns |
-| `outcomes.csv` | One row per closed signal: result, exit level, R multiple, duration, MFE/MAE |
+| `signals.csv` | One row per signal; `status` updated in place. Carries `mode`, `signal_timeframe`, `confirmation_timeframes`, `threshold_used` and `score` so research and standard candidates can be separated later |
+| `evaluations.csv` | **Every** evaluated candle: all nine sub-scores, regime, spread, decision (`BUY`/`SELL`/`NO_SIGNAL`/`NEAR_SIGNAL`), rejection reason, mode, timeframe, threshold used, near-signal flag, plus 23 raw `f_*` feature columns |
+| `outcomes.csv` | One row per closed signal: result, exit level, R multiple, duration, MFE/MAE, plus `mode`, `timeframe`, `score` and `threshold_used` carried through from the signal |
 | `system_log.txt` | Rotating log (5 MB × 3) |
-| `state.json` | `last_processed_candle`, `last_signal_id`, `last_signal_time` |
+| `state.json` | `last_processed_candles` (per timeframe), `last_signal_id`, `last_signal_time`, and a `runtime` section holding the live Telegram-controlled settings |
 
 `signals.csv` is deliberately small (a handful of rows per day) so it can be held
 in memory and rewritten on status changes. `evaluations.csv` is the large one and
@@ -476,6 +613,8 @@ enough.
 python backtest.py --data history/XAUUSD_M5.csv
 python backtest.py --data history/XAUUSD_M5.csv --start 2024-01-01 --end 2024-06-30
 python backtest.py --data history/XAUUSD_M5.csv --spread 25   # simulate a fixed spread
+python backtest.py --data history/XAUUSD_M5.csv --mode RESEARCH
+python backtest.py --data history/XAUUSD_M5.csv --timeframe M15   # hierarchy follows
 ```
 
 Required columns: `time, open, high, low, close, tick_volume`
@@ -647,7 +786,7 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-150 tests covering indicator correctness (against reference implementations),
+252 tests covering indicator correctness (against reference implementations),
 causality and no-repaint, score aggregation and weight reconfiguration,
 confidence bands, adaptive thresholds, bull/bear separation, spread, session,
 cooldown and duplicate prevention, fakeout rules, SL modes and clamping, TP
@@ -656,7 +795,7 @@ outcome scoring, CSV creation/append/schema-change handling, `state.json`
 round-trip and corruption tolerance, Telegram formatting (no network), and the
 backtester's no-lookahead guarantees.
 
-Runtime is about 65 seconds — the end-to-end backtest tests dominate it.
+Runtime is about 90 seconds — the end-to-end backtest tests dominate it.
 
 ---
 

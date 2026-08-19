@@ -199,33 +199,69 @@ class Config:
     # running to 100 - the median bar scores around 47 and the 99th percentile
     # around 76.
     #
-    # The thresholds below therefore keep the *structure* of the nominal
-    # 90/82/75 confidence bands (very strong / strong / moderate, with a
-    # regime-adaptive requirement) but are set to the values the engine's actual
-    # distribution supports.  They were derived from the score distribution
-    # alone, never from backtest profitability.
+    # NONE OF THESE NUMBERS ARE CLAIMED TO BE OPTIMAL OR PROFITABLE.  They are
+    # starting points, derived from the score distribution alone and never from
+    # backtest profitability.  See the README "Calibration" section to re-derive
+    # them for your own broker's data.
     #
-    # To re-derive them for your own broker's data, run backtest.py with a low
-    # BASE_THRESHOLD, then look at the percentiles of `bullish_score` /
-    # `bearish_score` in backtest_evaluations.csv (see README, "Calibration").
+    # The effective threshold for one evaluation is:
     #
-    base_threshold: float = field(default_factory=lambda: _env_float("BASE_THRESHOLD", 72.0))
-    regime_thresholds: Dict[str, float] = field(
+    #     mode_timeframe_threshold  +  regime_offset  +  counter_trend_extra
+    #
+    # clamped to [min_threshold, max_threshold].
+    #
+    mode: str = field(default_factory=lambda: _env_str("MODE", "STANDARD").upper())
+
+    #: mode -> signal timeframe -> base threshold.
+    #: RESEARCH deliberately sits far lower: its purpose is to surface more
+    #: candidates for observation and data collection, NOT to assert that those
+    #: candidates are tradeable.
+    mode_timeframe_thresholds: Dict[str, Dict[str, float]] = field(
         default_factory=lambda: {
-            "STRONG_BULL_TREND": 68.0,
-            "STRONG_BEAR_TREND": 68.0,
-            "WEAK_TREND": 72.0,
-            "BREAKOUT": 72.0,
-            "RANGE": 77.0,
-            "HIGH_VOLATILITY": 77.0,
-            "LOW_VOLATILITY": 75.0,
+            "RESEARCH": {"M1": 55.0, "M5": 50.0, "M15": 50.0, "M30": 50.0, "H1": 50.0, "H4": 50.0},
+            "STANDARD": {"M1": 80.0, "M5": 72.0, "M15": 70.0, "M30": 68.0, "H1": 65.0, "H4": 65.0},
+            # CONSERVATIVE = STANDARD + 8, which puts M5 at the nominal 80.
+            "CONSERVATIVE": {"M1": 88.0, "M5": 80.0, "M15": 78.0, "M30": 76.0, "H1": 73.0, "H4": 73.0},
         }
     )
+
+    #: Fallback when a mode/timeframe pair is missing from the matrix above.
+    base_threshold: float = field(default_factory=lambda: _env_float("BASE_THRESHOLD", 72.0))
+
+    #: Regime adjustment applied *on top of* the base threshold, in points.
+    #: Ranges and volatile conditions demand more confirmation; established
+    #: trends demand slightly less.
+    regime_threshold_offsets: Dict[str, float] = field(
+        default_factory=lambda: {
+            "STRONG_BULL_TREND": -4.0,
+            "STRONG_BEAR_TREND": -4.0,
+            "WEAK_TREND": 0.0,
+            "BREAKOUT": 0.0,
+            "RANGE": 5.0,
+            "HIGH_VOLATILITY": 5.0,
+            "LOW_VOLATILITY": 3.0,
+        }
+    )
+
+    #: Hard limits on any threshold, including ones set from Telegram.
+    min_threshold: float = field(default_factory=lambda: _env_float("MIN_THRESHOLD", 40.0))
+    max_threshold: float = field(default_factory=lambda: _env_float("MAX_THRESHOLD", 95.0))
+
+    #: Increments offered by the Telegram threshold controls.
+    threshold_steps: Tuple[int, ...] = (-5, -1, 1, 5)
+
     confidence_bands: Tuple[Tuple[float, str], ...] = (
         (80.0, "VERY_STRONG"),
         (72.0, "STRONG"),
         (66.0, "MODERATE"),
     )
+
+    # ---- near-signal diagnostic --------------------------------------------- #
+    #: A candidate whose best score lands within this many points *below* the
+    #: active threshold is logged as NEAR_SIGNAL.  It is never sent as a trading
+    #: signal - the point is to reveal whether the threshold is slightly strict.
+    near_signal_margin: float = field(default_factory=lambda: _env_float("NEAR_SIGNAL_MARGIN", 10.0))
+    near_signal_alerts: bool = field(default_factory=lambda: _env_bool("NEAR_SIGNAL_ALERTS", False))
 
     # counter-trend penalty: extra score required when trading against the HTF
     counter_trend_extra_score: float = field(
@@ -302,6 +338,34 @@ class Config:
     partial_fractions: Tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3)
     invalidate_on_opposite_signal: bool = True
 
+    # ---- Telegram control panel --------------------------------------------- #
+    telegram_control_enabled: bool = field(
+        default_factory=lambda: _env_bool("TELEGRAM_CONTROL_ENABLED", True)
+    )
+    #: seconds to hold a long-poll open against getUpdates
+    telegram_poll_timeout: int = field(default_factory=lambda: _env_int("TELEGRAM_POLL_TIMEOUT", 25))
+
+    #: Only these settings may be changed from Telegram.  Anything not listed -
+    #: credentials, tokens, the symbol, file paths, indicator internals - is
+    #: deliberately unreachable from chat (spec section 16).
+    telegram_editable_settings: Tuple[str, ...] = (
+        "mode",
+        "signal_timeframe",
+        "threshold",
+        "cooldown_candles",
+        "min_tp2_rr",
+        "allowed_sessions",
+        "near_signal_alerts",
+        "status",
+    )
+
+    #: Values offered by the Settings menu for the two cycling options.
+    cooldown_choices: Tuple[int, ...] = (0, 3, 5, 10, 20, 30)
+    min_rr_choices: Tuple[float, ...] = (0.0, 1.0, 1.2, 1.5, 1.8, 2.0)
+    session_choices: Tuple[str, ...] = (
+        "ALL_SESSIONS", "LONDON", "NEW_YORK", "LONDON_NEW_YORK_OVERLAP", "ASIAN",
+    )
+
     # ---- storage ------------------------------------------------------------- #
     data_dir: Path = DATA_DIR
     signals_csv: Path = DATA_DIR / "signals.csv"
@@ -325,9 +389,30 @@ class Config:
             raise ValueError("sl_min_atr_multiplier must be < sl_max_atr_multiplier")
         if self.base_threshold <= 0 or self.base_threshold > 100:
             raise ValueError("base_threshold must be within (0, 100]")
+        if not 0 < self.min_threshold < self.max_threshold <= 100:
+            raise ValueError("require 0 < min_threshold < max_threshold <= 100")
+        if self.mode not in self.mode_timeframe_thresholds:
+            raise ValueError(
+                f"unknown MODE '{self.mode}' "
+                f"(expected one of {', '.join(self.mode_timeframe_thresholds)})"
+            )
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------ #
+    def clamp_threshold(self, value: float) -> float:
+        """Constrain a threshold to the configured safe band."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = self.base_threshold
+        return max(self.min_threshold, min(self.max_threshold, value))
+
+    def threshold_for(self, mode: str, timeframe: str) -> float:
+        """Base threshold for a mode/timeframe pair, before regime adjustment."""
+        table = self.mode_timeframe_thresholds.get(str(mode).upper(), {})
+        return self.clamp_threshold(table.get(str(timeframe).upper(), self.base_threshold))
 
 
 def load_config() -> Config:

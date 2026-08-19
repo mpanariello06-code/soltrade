@@ -34,7 +34,7 @@ from src.signal_tracker import (
 )
 from src.telegram_bot import TelegramNotifier
 from src.utils import atomic_write_json, iso, parse_iso, read_json
-from tests.conftest import make_candles
+from tests.conftest import FakeMarket, FakeNotifier, make_candles
 
 
 # --------------------------------------------------------------------------- #
@@ -435,7 +435,7 @@ def test_telegram_is_disabled_without_credentials(config):
     config.telegram_bot_token = ""
     notifier = TelegramNotifier(config)
     assert not notifier.enabled
-    assert notifier.send_message("hello") is False
+    assert notifier.send_message("hello") is None
 
 
 def test_signal_message_contains_the_key_numbers(config):
@@ -530,46 +530,13 @@ def test_backtest_respects_the_cooldown_between_signals(config, tmp_path):
 # --------------------------------------------------------------------------- #
 # live loop wiring (main.py) with a stubbed MT5 feed
 # --------------------------------------------------------------------------- #
-class _FakeMarket:
-    """Stands in for MarketData: replays a history one closed candle at a time."""
-
-    def __init__(self, config, candles: pd.DataFrame, start: int) -> None:
-        self.config = config
-        self.candles = candles
-        self.cursor = start
-        self.connected = True
-
-    def connect(self) -> bool:
-        return True
-
-    def shutdown(self, quiet: bool = False) -> None:
-        self.connected = False
-
-    def advance(self) -> None:
-        self.cursor += 1
-
-    def build_snapshot(self):
-        window = self.candles.iloc[: self.cursor + 1]
-        return (
-            MarketSnapshot(
-                symbol=self.config.symbol,
-                m5=window,
-                m15=resample_candles(window, "M5", "M15"),
-                h1=resample_candles(window, "M5", "H1"),
-                m1=None,
-                spread_points=20.0,
-            ),
-            "",
-        )
-
-
 def test_live_loop_processes_each_candle_exactly_once(tracker_config):
     """The whole main.py wiring: new candle -> evaluate -> log -> persist state."""
     from main import SignalRunner
 
     candles = make_candles(3200, seed=81, drift=0.05)
     runner = SignalRunner(tracker_config)
-    runner.market = _FakeMarket(tracker_config, candles, start=3100)
+    runner.market = FakeMarket(tracker_config, candles, start=3100)
     runner.notifier.config.telegram_enabled = False
     ensure_csv(tracker_config.evaluations_csv, EVALUATION_COLUMNS)
     runner.tracker.load()
@@ -583,8 +550,9 @@ def test_live_loop_processes_each_candle_exactly_once(tracker_config):
     timestamps = [row["timestamp"] for row in evaluations]
     assert len(timestamps) == len(set(timestamps)), "a candle was evaluated twice"
 
+    # the processed marker is now tracked per timeframe
     state = read_json(tracker_config.state_file)
-    assert state["last_processed_candle"] == timestamps[-1]
+    assert state["last_processed_candles"]["M5"] == timestamps[-1]
 
 
 def test_live_loop_skips_a_candle_it_has_already_processed(tracker_config):
@@ -592,7 +560,7 @@ def test_live_loop_skips_a_candle_it_has_already_processed(tracker_config):
 
     candles = make_candles(3200, seed=83)
     runner = SignalRunner(tracker_config)
-    runner.market = _FakeMarket(tracker_config, candles, start=3150)
+    runner.market = FakeMarket(tracker_config, candles, start=3150)
     runner.notifier.config.telegram_enabled = False
     ensure_csv(tracker_config.evaluations_csv, EVALUATION_COLUMNS)
     runner.tracker.load()
@@ -608,7 +576,7 @@ def test_live_loop_records_signals_and_never_duplicates_them(tracker_config):
 
     candles = make_candles(3400, seed=85, drift=0.06)
     runner = SignalRunner(tracker_config)
-    runner.market = _FakeMarket(tracker_config, candles, start=3000)
+    runner.market = FakeMarket(tracker_config, candles, start=3000)
     runner.notifier.config.telegram_enabled = False
     ensure_csv(tracker_config.evaluations_csv, EVALUATION_COLUMNS)
     runner.tracker.load()
@@ -626,3 +594,181 @@ def test_live_loop_records_signals_and_never_duplicates_them(tracker_config):
         assert row["status"] in (
             "ACTIVE", "TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT", "EXPIRED", "INVALIDATED"
         )
+
+
+# --------------------------------------------------------------------------- #
+# run state and timeframe switching through the live runner
+# --------------------------------------------------------------------------- #
+def _runner(config, candles, start):
+    """A SignalRunner wired to fake market data and a fake Telegram bot."""
+    from main import SignalRunner
+
+    runner = SignalRunner(config)
+    runner.market = FakeMarket(config, candles, start=start)
+    runner.notifier = FakeNotifier()
+    runner.tracker.notifier = runner.notifier
+    runner.control.notifier = runner.notifier
+    ensure_csv(config.evaluations_csv, EVALUATION_COLUMNS)
+    runner.tracker.load()
+    return runner
+
+
+def test_paused_runner_evaluates_nothing(tracker_config):
+    candles = make_candles(3400, seed=111)
+    runner = _runner(tracker_config, candles, start=3200)
+    runner.runtime.pause()
+
+    for _ in range(10):
+        runner._tick()
+        runner.market.advance()
+
+    assert read_csv_rows(tracker_config.evaluations_csv) == []
+    assert runner.runtime.last_processed_candle("M5") is None
+
+
+def test_resuming_restarts_evaluation(tracker_config):
+    candles = make_candles(3400, seed=113)
+    runner = _runner(tracker_config, candles, start=3200)
+
+    runner.runtime.pause()
+    for _ in range(3):
+        runner._tick()
+        runner.market.advance()
+    assert read_csv_rows(tracker_config.evaluations_csv) == []
+
+    runner.runtime.start()
+    for _ in range(4):
+        runner._tick()
+        runner.market.advance()
+    assert len(read_csv_rows(tracker_config.evaluations_csv)) == 4
+
+
+def test_stop_ends_the_loop(tracker_config):
+    candles = make_candles(3400, seed=115)
+    runner = _runner(tracker_config, candles, start=3200)
+    runner.running = True
+    runner.runtime.stop()
+    runner._tick()
+    assert runner.running is False
+
+
+def test_paused_runner_still_tracks_open_signals(tracker_config):
+    """PAUSE stops new signals; it must not orphan an already-open one."""
+    from datetime import timezone
+
+    candles = make_candles(3400, seed=117)
+    runner = _runner(tracker_config, candles, start=3200)
+    candle_time = pd.Timestamp(candles["time"].iloc[3200]).to_pydatetime().replace(tzinfo=timezone.utc)
+    price = float(candles["close"].iloc[3200])
+
+    signal = sample_signal("BUY", candle_time)
+    signal.entry = price
+    signal.stop_loss = price - 10.0
+    signal.tp1, signal.tp2, signal.tp3 = price + 0.01, price + 0.02, price + 0.03
+    runner.tracker.record_signal(signal)
+
+    runner.runtime.pause()
+    runner.market.advance()
+    runner._tick()
+
+    rows = read_csv_rows(tracker_config.signals_csv)
+    assert rows[0]["status"] != "ACTIVE", "an open signal stopped being tracked while paused"
+
+
+def test_research_mode_signals_are_labelled_through_the_runner(tracker_config):
+    candles = make_candles(3600, seed=119, drift=0.05)
+    runner = _runner(tracker_config, candles, start=3000)
+    runner.runtime.set_mode("RESEARCH")
+
+    for _ in range(120):
+        runner._tick()
+        runner.market.advance()
+
+    rows = read_csv_rows(tracker_config.signals_csv)
+    assert rows, "research mode produced no candidates on this fixture"
+    for row in rows:
+        assert row["mode"] == "RESEARCH"
+        assert row["signal_timeframe"] == "M5"
+        assert row["confirmation_timeframes"] == "M15+H1"
+        assert float(row["threshold_used"]) > 0
+    for signal in runner.notifier.signals:
+        assert signal.is_research
+
+
+def test_switching_timeframe_does_not_reprocess_the_old_one(tracker_config):
+    """Each timeframe keeps its own processed-candle marker."""
+    candles = make_candles(3600, seed=121)
+    runner = _runner(tracker_config, candles, start=3300)
+
+    runner._tick()
+    first_m5 = runner.runtime.last_processed_candle("M5")
+    assert first_m5 is not None
+    assert len(read_csv_rows(tracker_config.evaluations_csv)) == 1
+
+    runner.runtime.set_timeframe("M15")
+    runner._tick()
+    assert runner.runtime.last_processed_candle("M15") is not None
+    rows = read_csv_rows(tracker_config.evaluations_csv)
+    assert len(rows) == 2
+    assert rows[1]["signal_timeframe"] == "M15"
+
+    # back to M5 without advancing: the same candle must not be evaluated twice
+    runner.runtime.set_timeframe("M5")
+    runner._tick()
+    assert len(read_csv_rows(tracker_config.evaluations_csv)) == 2
+    assert runner.runtime.last_processed_candle("M5") == first_m5
+
+
+def test_near_signal_alerts_are_off_by_default(tracker_config):
+    candles = make_candles(3400, seed=123)
+    runner = _runner(tracker_config, candles, start=3200)
+    assert runner.runtime.near_signal_alerts is False
+
+    for _ in range(10):
+        runner._tick()
+        runner.market.advance()
+    assert runner.notifier.near_signals == [], "near-signal alerts fired while disabled"
+
+
+def test_near_signal_alerts_fire_only_when_enabled(tracker_config):
+    """The diagnostic is opt-in, and never sends a tradeable signal card."""
+    candles = make_candles(3600, seed=129, drift=0.04)
+    runner = _runner(tracker_config, candles, start=3200)
+    runner.runtime.set_near_signal_alerts(True)
+
+    for _ in range(60):
+        runner._tick()
+        runner.market.advance()
+
+    evaluations = read_csv_rows(tracker_config.evaluations_csv)
+    near_rows = [row for row in evaluations if row["near_signal"] == "1"]
+    assert near_rows, "expected at least one near-signal on this fixture"
+    assert len(runner.notifier.near_signals) == len(near_rows)
+    for row in near_rows:
+        assert row["decision"] == "NEAR_SIGNAL"
+        assert row["signal_id"] == "", "a near signal must not create a signal"
+    assert runner.notifier.signals == [] or all(
+        signal.confidence >= float(runner.runtime.active_threshold())
+        for signal in runner.notifier.signals
+    ), "a near signal leaked into the signal feed"
+
+
+def test_analyze_now_has_no_side_effects(tracker_config):
+    """The ANALYSIS button must not emit, suppress or record anything."""
+    candles = make_candles(3400, seed=125)
+    runner = _runner(tracker_config, candles, start=3200)
+
+    evaluation = runner.analyze_now()
+    assert evaluation is not None
+    assert evaluation.card is not None
+    assert read_csv_rows(tracker_config.evaluations_csv) == []
+    assert read_csv_rows(tracker_config.signals_csv) == []
+    assert runner.runtime.last_processed_candle("M5") is None
+    assert runner.notifier.signals == []
+
+
+def test_timeframe_change_clears_the_market_cache(tracker_config):
+    candles = make_candles(3400, seed=127)
+    runner = _runner(tracker_config, candles, start=3200)
+    runner.on_timeframe_changed("M5", "M15")
+    assert runner.market.cache_cleared == 1

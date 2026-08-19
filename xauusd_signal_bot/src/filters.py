@@ -64,18 +64,41 @@ def adaptive_threshold(
 ) -> Optional[float]:
     """Minimum score this candidate must reach.
 
-    Returns ``None`` when conditions forbid signalling outright (extreme
-    volatility with ``block_on_extreme_volatility`` enabled).
+    The effective threshold is built from three parts::
+
+        base (mode + signal timeframe)  +  regime offset  +  counter-trend extra
+
+    ``config.base_threshold`` is the mode/timeframe value folded in by
+    :func:`src.runtime_state.effective_config`, so switching mode or timeframe
+    from Telegram moves the whole curve without touching the regime logic.
+
+    The result is clamped to ``[min_threshold, max_threshold]``.  Returns
+    ``None`` when conditions forbid signalling outright (extreme volatility
+    with ``block_on_extreme_volatility`` enabled).
     """
+    base = float(config.base_threshold)
     if volatility_band == "EXTREME":
         if config.block_on_extreme_volatility:
             return None
-        return min(100.0, config.base_threshold + config.extreme_volatility_extra_score)
+        return config.clamp_threshold(base + config.extreme_volatility_extra_score)
 
-    threshold = float(config.regime_thresholds.get(regime, config.base_threshold))
+    threshold = base + float(config.regime_threshold_offsets.get(regime, 0.0))
     if htf_alignment == "COUNTER":
         threshold += config.counter_trend_extra_score
-    return min(threshold, 100.0)
+    return config.clamp_threshold(threshold)
+
+
+def is_near_signal(best_score: float, threshold: Optional[float], config) -> bool:
+    """True when a rejected candidate came within ``near_signal_margin`` of the bar.
+
+    Purely diagnostic: it never produces a trading signal.  The point is to
+    reveal whether the active threshold is slightly too strict for the current
+    market, which the score distribution alone does not show.
+    """
+    if threshold is None:
+        return False
+    margin = float(getattr(config, "near_signal_margin", 10.0))
+    return bool(threshold - margin <= float(best_score) < threshold)
 
 
 # --------------------------------------------------------------------------- #

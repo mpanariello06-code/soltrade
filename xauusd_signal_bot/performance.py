@@ -16,12 +16,25 @@ import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
 from config import load_config
 from src.utils import safe_div
+
+#: Fixed score bands (spec section 13).  The question these answer is whether a
+#: higher score actually corresponds to a better outcome - which must be
+#: measured, never assumed.
+SCORE_BANDS: Tuple[Tuple[float, float, str], ...] = (
+    (40.0, 50.0, "40-49"),
+    (50.0, 60.0, "50-59"),
+    (60.0, 70.0, "60-69"),
+    (70.0, 80.0, "70-79"),
+    (80.0, 90.0, "80-89"),
+    (90.0, 100.1, "90-100"),
+)
+
 
 def confidence_buckets(config=None) -> List[tuple]:
     """Build ``(low, high, label)`` buckets from the configured confidence bands.
@@ -95,6 +108,26 @@ class Report:
     by_session: List[Stats] = field(default_factory=list)
     by_regime: List[Stats] = field(default_factory=list)
     by_confidence: List[Stats] = field(default_factory=list)
+    by_mode: List[Stats] = field(default_factory=list)
+    by_timeframe: List[Stats] = field(default_factory=list)
+    by_score_band: List[Stats] = field(default_factory=list)
+
+    def best_regime(self) -> str:
+        """Regime with the highest average R (needs at least one closed signal)."""
+        ranked = [s for s in self.by_regime if s.closed > 0]
+        return max(ranked, key=lambda s: s.average_r).label if ranked else "-"
+
+    def worst_regime(self) -> str:
+        """Regime with the lowest average R."""
+        ranked = [s for s in self.by_regime if s.closed > 0]
+        return min(ranked, key=lambda s: s.average_r).label if ranked else "-"
+
+    def stats_for_mode(self, mode: str) -> Optional[Stats]:
+        """Stats for one operating mode, or ``None`` when it has no signals."""
+        for stats in self.by_mode:
+            if stats.label.upper() == str(mode).upper():
+                return stats
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -119,12 +152,15 @@ def merge_outcomes(signals: pd.DataFrame, outcomes: pd.DataFrame) -> pd.DataFram
     merged = outcomes.copy()
     if not signals.empty and "signal_id" in signals.columns:
         columns = [
-            c for c in ("signal_id", "session", "regime", "confidence", "direction", "timeframe")
+            c for c in (
+                "signal_id", "session", "regime", "confidence", "direction",
+                "timeframe", "mode", "score", "threshold_used",
+            )
             if c in signals.columns
         ]
         meta = signals[columns].drop_duplicates(subset=["signal_id"])
         merged = merged.merge(meta, on="signal_id", how="left", suffixes=("", "_signal"))
-        for column in ("session", "regime", "confidence", "direction"):
+        for column in ("session", "regime", "confidence", "direction", "mode", "timeframe", "score"):
             fallback = f"{column}_signal"
             if fallback in merged.columns:
                 merged[column] = merged[column].where(
@@ -136,6 +172,19 @@ def merge_outcomes(signals: pd.DataFrame, outcomes: pd.DataFrame) -> pd.DataFram
     merged["tp_hits"] = pd.to_numeric(merged.get("tp_hits"), errors="coerce").fillna(0).astype(int)
     merged["confidence"] = pd.to_numeric(merged.get("confidence"), errors="coerce")
     merged["duration"] = pd.to_numeric(merged.get("duration"), errors="coerce")
+
+    # `score` is the newer column; fall back to `confidence` for rows written by
+    # an earlier version so old data still groups into score bands.
+    if "score" in merged.columns:
+        merged["score"] = pd.to_numeric(merged["score"], errors="coerce")
+        merged["score"] = merged["score"].fillna(merged["confidence"])
+    else:
+        merged["score"] = merged["confidence"]
+    if "mode" not in merged.columns:
+        merged["mode"] = ""
+    merged["mode"] = merged["mode"].fillna("").replace("", "STANDARD")
+    if "timeframe" not in merged.columns:
+        merged["timeframe"] = ""
     return merged.dropna(subset=["R_multiple"])
 
 
@@ -211,6 +260,18 @@ def _confidence_stats(frame: pd.DataFrame, config=None) -> List[Stats]:
     return groups
 
 
+def _score_band_stats(frame: pd.DataFrame) -> List[Stats]:
+    """Statistics per fixed score band (spec section 13)."""
+    if frame.empty or "score" not in frame.columns:
+        return []
+    groups: List[Stats] = []
+    for low, high, label in SCORE_BANDS:
+        subset = frame[(frame["score"] >= low) & (frame["score"] < high)]
+        if not subset.empty:
+            groups.append(compute_stats(subset, label=label))
+    return groups
+
+
 def build_report(signals: pd.DataFrame, outcomes: pd.DataFrame, config=None) -> Report:
     """Assemble the full report from the two CSVs."""
     report = Report()
@@ -236,6 +297,9 @@ def build_report(signals: pd.DataFrame, outcomes: pd.DataFrame, config=None) -> 
     report.by_session = _group_stats(merged, "session")
     report.by_regime = _group_stats(merged, "regime")
     report.by_confidence = _confidence_stats(merged, config)
+    report.by_mode = _group_stats(merged, "mode")
+    report.by_timeframe = _group_stats(merged, "timeframe")
+    report.by_score_band = _score_band_stats(merged)
     return report
 
 
@@ -286,6 +350,16 @@ def render_report(report: Report) -> str:
         f"TP3 reached        : {overall.tp3_rate:.1f}%",
         f"Closed at SL       : {overall.sl_rate:.1f}%",
         f"Expired            : {overall.expired_rate:.1f}%",
+        "",
+        "--- BY MODE " + "-" * 60,
+        _table([s.as_row() for s in report.by_mode]),
+        "",
+        "--- BY TIMEFRAME " + "-" * 55,
+        _table([s.as_row() for s in report.by_timeframe]),
+        "",
+        "--- BY SCORE BAND " + "-" * 54,
+        "  Does a higher score actually mean a better outcome?  Measure, do not assume.",
+        _table([s.as_row() for s in report.by_score_band]),
         "",
         "--- BY DIRECTION " + "-" * 55,
         _table([s.as_row() for s in report.by_direction]),

@@ -84,6 +84,12 @@ class ComponentScore:
     bear: float = 0.0
     max_score: float = 1.0
     details: Dict[str, Any] = field(default_factory=dict)
+    #: False when this component cannot apply at all under the current
+    #: configuration - e.g. the HTF component when the signal timeframe is H4
+    #: and no confirmation timeframe exists.  :func:`src.scoring.compute_scorecard`
+    #: then redistributes its weight instead of scoring it as a flat zero, which
+    #: would silently cap the maximum achievable score.
+    applicable: bool = True
 
     def __post_init__(self) -> None:
         self.max_score = max(float(self.max_score), 1e-9)

@@ -203,6 +203,20 @@ def test_extreme_volatility_forces_high_volatility_regime(config, enriched):
     assert regime == "HIGH_VOLATILITY"
 
 
-def test_every_regime_has_a_configured_threshold(config):
+def test_every_regime_has_a_configured_threshold_offset(config):
     for regime in REGIMES:
-        assert regime in config.regime_thresholds, regime
+        assert regime in config.regime_threshold_offsets, regime
+
+
+def test_inapplicable_component_releases_its_weight(config):
+    """H4 has no confirmation timeframe; the score must still reach 100."""
+    components = _full_components(1.0, 0.0)
+    components["htf"] = ComponentScore(
+        "htf", 0.0, 0.0, HTF_MAX_SCORE, {"reason": "no confirmation timeframe"}, applicable=False
+    )
+    card = compute_scorecard(components, config)
+    assert card.bullish_score == pytest.approx(100.0)
+    assert card.excluded_components == ("htf",)
+    assert card.weight_scale > 1.0
+    assert card.component_score("htf", "BUY") == 0.0
+    assert card.confirmations("BUY")["htf"] is False

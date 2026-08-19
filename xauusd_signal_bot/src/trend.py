@@ -7,6 +7,8 @@ produce a maximum trend score.
 
 from __future__ import annotations
 
+from typing import Any, Dict, Optional
+
 import pandas as pd
 
 from .utils import BoundedCache, ComponentScore, clamp, fnum, frame_fingerprint, safe_div, scale
@@ -119,65 +121,125 @@ def trend_direction(df: pd.DataFrame, config) -> str:
 # --------------------------------------------------------------------------- #
 # higher-timeframe confirmation
 # --------------------------------------------------------------------------- #
-HTF_MAX_SCORE = 15.0
-
-#: how the M15/H1 sub-analyses combine into the single HTF component.
-#: The H1 (slowest) view carries the most weight; the fractions sum to 1.0.
-HTF_MIX = {
-    "h1_trend": 0.30,
-    "m15_trend": 0.25,
-    "h1_structure": 0.15,
-    "m15_structure": 0.10,
-    "h1_momentum": 0.10,
-    "m15_momentum": 0.10,
-}
-
-
 _HTF_CACHE = BoundedCache(maxsize=8)
 
+HTF_MAX_SCORE = 15.0
 
-def analyze_htf(df_m15: pd.DataFrame, df_h1: pd.DataFrame, config) -> ComponentScore:
-    """Blend M15 and H1 trend, structure and momentum into one 0-15 component.
+#: How the two confirmation timeframes combine into the single HTF component
+#: when both exist (M1..M30 signal timeframes).  The slower timeframe carries
+#: the most weight; the fractions sum to 1.0.
+HTF_MIX_PAIR = {
+    "higher_trend": 0.30,
+    "intermediate_trend": 0.25,
+    "higher_structure": 0.15,
+    "intermediate_structure": 0.10,
+    "higher_momentum": 0.10,
+    "intermediate_momentum": 0.10,
+}
 
-    Both frames must already carry indicator columns and contain closed candles
-    only.  Imports are local to keep module import order simple.
+#: Mix used when only ONE confirmation timeframe exists (signal timeframe H1,
+#: confirmed by H4 alone).  Same ordering of importance, renormalised.
+HTF_MIX_SINGLE = {
+    "trend": 0.45,
+    "structure": 0.30,
+    "momentum": 0.25,
+}
 
-    Memoised on the contents of both HTF frames: an M15 candle spans three M5
-    candles and an H1 candle spans twelve, so the higher-timeframe view is
-    unchanged for most evaluations.  The cache key is a content hash, so a
-    changed HTF frame can never return a stale result.
-    """
+#: Kept for backwards compatibility with the M5-only version.
+HTF_MIX = HTF_MIX_PAIR
+
+
+def _sub_scores(frame: pd.DataFrame, config):
+    """Run trend / structure / momentum on one confirmation timeframe."""
     from .momentum import MAX_SCORE as MOMENTUM_MAX, analyze_momentum
     from .structure import MAX_SCORE as STRUCTURE_MAX, analyze_structure
 
-    if df_m15 is None or df_h1 is None or len(df_m15) < 30 or len(df_h1) < 30:
-        return ComponentScore("htf", 0.0, 0.0, HTF_MAX_SCORE, {"reason": "insufficient HTF data"})
+    return {
+        "trend": (analyze_trend(frame, config), MAX_SCORE),
+        "structure": (analyze_structure(frame, config), STRUCTURE_MAX),
+        "momentum": (analyze_momentum(frame, config), MOMENTUM_MAX),
+    }
 
-    cache_key = (frame_fingerprint(df_m15), frame_fingerprint(df_h1))
+
+def _usable(frame: Optional[pd.DataFrame]) -> bool:
+    """A confirmation frame is usable once it has enough closed candles."""
+    return frame is not None and len(frame) >= 30
+
+
+def analyze_htf(
+    df_intermediate: Optional[pd.DataFrame],
+    df_higher: Optional[pd.DataFrame],
+    config,
+) -> ComponentScore:
+    """Blend the confirmation timeframes into one 0-15 component.
+
+    Both frames must already carry indicator columns and contain closed candles
+    only.  Either may be ``None``:
+
+    * **both present** - the usual case (signal timeframes M1..M30)
+    * **one present**  - signal timeframe H1, confirmed by H4 alone
+    * **neither**      - signal timeframe H4; the component is marked *not
+      applicable* and :func:`src.scoring.compute_scorecard` redistributes its
+      weight rather than scoring a flat zero
+
+    Memoised on the contents of the frames: an intermediate candle spans several
+    signal candles, so the higher-timeframe view is unchanged for most
+    evaluations.  The cache key is a content hash, so a changed frame can never
+    return a stale result.
+    """
+    have_intermediate = _usable(df_intermediate)
+    have_higher = _usable(df_higher)
+
+    if not have_intermediate and not have_higher:
+        return ComponentScore(
+            "htf", 0.0, 0.0, HTF_MAX_SCORE,
+            {"reason": "no confirmation timeframe", "intermediate_direction": "NONE",
+             "higher_direction": "NONE", "m15_direction": "NEUTRAL", "h1_direction": "NEUTRAL"},
+            applicable=False,
+        )
+
+    cache_key = (
+        frame_fingerprint(df_intermediate) if have_intermediate else 0,
+        frame_fingerprint(df_higher) if have_higher else 0,
+    )
     cached = _HTF_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    parts = {
-        "m15_trend": (analyze_trend(df_m15, config), MAX_SCORE),
-        "h1_trend": (analyze_trend(df_h1, config), MAX_SCORE),
-        "m15_structure": (analyze_structure(df_m15, config), STRUCTURE_MAX),
-        "h1_structure": (analyze_structure(df_h1, config), STRUCTURE_MAX),
-        "m15_momentum": (analyze_momentum(df_m15, config), MOMENTUM_MAX),
-        "h1_momentum": (analyze_momentum(df_h1, config), MOMENTUM_MAX),
-    }
-
     bull_fraction = bear_fraction = 0.0
-    details = {}
-    for key, (component, maximum) in parts.items():
-        share = HTF_MIX[key]
-        bull_fraction += share * safe_div(component.bull, maximum)
-        bear_fraction += share * safe_div(component.bear, maximum)
-        details[key] = (round(component.bull, 2), round(component.bear, 2))
+    details: Dict[str, Any] = {}
 
-    m15_direction = trend_direction(df_m15, config)
-    h1_direction = trend_direction(df_h1, config)
-    details.update({"m15_direction": m15_direction, "h1_direction": h1_direction})
+    if have_intermediate and have_higher:
+        parts = {
+            "intermediate": _sub_scores(df_intermediate, config),
+            "higher": _sub_scores(df_higher, config),
+        }
+        for role, sub in parts.items():
+            for key, (component, maximum) in sub.items():
+                share = HTF_MIX_PAIR[f"{role}_{key}"]
+                bull_fraction += share * safe_div(component.bull, maximum)
+                bear_fraction += share * safe_div(component.bear, maximum)
+                details[f"{role}_{key}"] = (round(component.bull, 2), round(component.bear, 2))
+        intermediate_direction = trend_direction(df_intermediate, config)
+        higher_direction = trend_direction(df_higher, config)
+    else:
+        frame = df_higher if have_higher else df_intermediate
+        for key, (component, maximum) in _sub_scores(frame, config).items():
+            share = HTF_MIX_SINGLE[key]
+            bull_fraction += share * safe_div(component.bull, maximum)
+            bear_fraction += share * safe_div(component.bear, maximum)
+            details[f"single_{key}"] = (round(component.bull, 2), round(component.bear, 2))
+        higher_direction = intermediate_direction = trend_direction(frame, config)
+
+    details.update(
+        {
+            "intermediate_direction": intermediate_direction,
+            "higher_direction": higher_direction,
+            # legacy key names, still read by htf_alignment and the tests
+            "m15_direction": intermediate_direction,
+            "h1_direction": higher_direction,
+        }
+    )
 
     return _HTF_CACHE.put(
         cache_key,
@@ -196,6 +258,8 @@ def htf_alignment(htf_component: ComponentScore, direction: str) -> str:
 
     Returns ``"ALIGNED"``, ``"COUNTER"`` or ``"NEUTRAL"``.
     """
+    if not htf_component.applicable:
+        return "NEUTRAL"
     h1_direction = str(htf_component.details.get("h1_direction", "NEUTRAL"))
     m15_direction = str(htf_component.details.get("m15_direction", "NEUTRAL"))
     wanted = "BULL" if direction == "BUY" else "BEAR"

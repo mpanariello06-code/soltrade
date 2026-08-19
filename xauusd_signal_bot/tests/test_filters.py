@@ -83,6 +83,7 @@ def test_threshold_varies_by_regime(config):
     normal = adaptive_threshold("WEAK_TREND", "NORMAL", "ALIGNED", config)
     ranging = adaptive_threshold("RANGE", "NORMAL", "ALIGNED", config)
     assert strong < normal < ranging
+    assert normal == pytest.approx(config.base_threshold)
 
 
 def test_high_volatility_demands_more_than_a_normal_market(config):
@@ -106,10 +107,15 @@ def test_counter_trend_setups_need_a_higher_score(config):
     assert counter == pytest.approx(aligned + config.counter_trend_extra_score)
 
 
-def test_threshold_never_exceeds_one_hundred(config):
-    config.regime_thresholds["RANGE"] = 99.0
+def test_threshold_is_clamped_to_the_configured_ceiling(config):
+    """No combination of offsets may push the bar outside the safe band."""
+    config.regime_threshold_offsets["RANGE"] = 40.0
     config.counter_trend_extra_score = 20.0
-    assert adaptive_threshold("RANGE", "NORMAL", "COUNTER", config) == 100.0
+    assert adaptive_threshold("RANGE", "NORMAL", "COUNTER", config) == config.max_threshold
+
+    config.regime_threshold_offsets["RANGE"] = -90.0
+    config.counter_trend_extra_score = 0.0
+    assert adaptive_threshold("RANGE", "NORMAL", "ALIGNED", config) == config.min_threshold
 
 
 def test_check_threshold_rejects_scores_below_the_bar(config, frame):
@@ -365,4 +371,5 @@ def test_pre_target_chain_reports_the_first_failure(config, frame):
 
 def test_pre_target_chain_returns_the_threshold_it_used(config, frame):
     outcome = run_pre_target_filters(_input(config, frame, regime="RANGE"), config)
-    assert outcome.threshold == pytest.approx(config.regime_thresholds["RANGE"])
+    expected = config.base_threshold + config.regime_threshold_offsets["RANGE"]
+    assert outcome.threshold == pytest.approx(expected)

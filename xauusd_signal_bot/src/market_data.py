@@ -12,6 +12,7 @@ tests) remains importable and runnable on any platform.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,11 @@ from .utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+#: The MetaTrader5 module keeps global terminal state and is not thread-safe.
+#: The Telegram control thread can ask for an on-demand analysis while the main
+#: loop is mid-poll, so every terminal call is serialised through this lock.
+_MT5_LOCK = threading.RLock()
 
 try:  # pragma: no cover - depends on the host OS
     import MetaTrader5 as mt5  # type: ignore
@@ -203,15 +209,48 @@ class MarketSnapshot:
 
     Every frame holds **closed candles only**; the last row of ``m5`` is the
     signal candle.  There is deliberately no field carrying the forming candle.
+
+    FIELD NAMES ARE ROLES, NOT LITERAL TIMEFRAMES.  ``m5`` is whatever the
+    *signal* timeframe currently is, ``m15`` the intermediate confirmation and
+    ``h1`` the higher confirmation - the names date from the M5-only version and
+    are kept so the analysis engines did not have to change.  Prefer the
+    ``signal_df`` / ``confirm_df`` / ``higher_df`` aliases in new code, and read
+    ``signal_timeframe`` / ``confirmation`` for what they actually hold.
+
+    ``m15`` and ``h1`` are ``None`` when the active hierarchy has no such
+    confirmation timeframe (H1 has only one, H4 has none by default).
     """
 
     symbol: str
     m5: pd.DataFrame
-    m15: pd.DataFrame
-    h1: pd.DataFrame
+    m15: Optional[pd.DataFrame] = None
+    h1: Optional[pd.DataFrame] = None
     m1: Optional[pd.DataFrame] = None
     spread_points: float = float("nan")
     evaluated_at: datetime = field(default_factory=now_utc)
+    signal_timeframe: str = ""
+    confirmation: str = ""
+
+    # role-based aliases -------------------------------------------------- #
+    @property
+    def signal_df(self) -> pd.DataFrame:
+        """Candles of the signal timeframe (last row = the signal candle)."""
+        return self.m5
+
+    @property
+    def confirm_df(self) -> Optional[pd.DataFrame]:
+        """Intermediate confirmation candles, or ``None``."""
+        return self.m15
+
+    @property
+    def higher_df(self) -> Optional[pd.DataFrame]:
+        """Higher confirmation candles, or ``None``."""
+        return self.h1
+
+    @property
+    def micro_df(self) -> Optional[pd.DataFrame]:
+        """Finer candles used only for intrabar TP/SL ordering, or ``None``."""
+        return self.m1
 
     @property
     def candle_time(self) -> datetime:
@@ -230,11 +269,55 @@ class MarketSnapshot:
 class MarketData:
     """Thin, resilient, read-only wrapper around the MetaTrader 5 terminal."""
 
+    #: How long a fetched frame may be reused for a *repeat* poll, per timeframe
+    #: minute.  A cached frame is never used when building the snapshot for a
+    #: newly closed candle - see :meth:`build_snapshot`.
+    CACHE_TTL_FRACTION = 0.25
+    CACHE_TTL_CAP_SECONDS = 120.0
+
     def __init__(self, config) -> None:
         self.config = config
         self.connected = False
         self._last_connect_attempt = 0.0
         self._reconnect_backoff = 5.0
+        # (symbol, timeframe) -> (fetched_at, count, frame)
+        self._cache: Dict[Tuple[str, str], Tuple[float, int, pd.DataFrame]] = {}
+        self._cache_lock = threading.RLock()
+
+    # -- candle cache ------------------------------------------------------ #
+    def _cache_ttl(self, timeframe: str) -> float:
+        """Seconds a frame of ``timeframe`` may be reused for."""
+        minutes = timeframe_minutes(timeframe)
+        return min(minutes * 60.0 * self.CACHE_TTL_FRACTION, self.CACHE_TTL_CAP_SECONDS)
+
+    def _cached(self, symbol: str, timeframe: str, count: int) -> Optional[pd.DataFrame]:
+        with self._cache_lock:
+            entry = self._cache.get((symbol, timeframe))
+        if entry is None:
+            return None
+        fetched_at, cached_count, frame = entry
+        if cached_count < count:
+            return None
+        if time.time() - fetched_at > self._cache_ttl(timeframe):
+            return None
+        return frame
+
+    def _store_cache(self, symbol: str, timeframe: str, count: int, frame: pd.DataFrame) -> None:
+        with self._cache_lock:
+            self._cache[(symbol, timeframe)] = (time.time(), count, frame)
+
+    def clear_cache(self, timeframe: Optional[str] = None) -> None:
+        """Drop cached candles.
+
+        Called when the signal timeframe changes so that no frame belonging to
+        the previous hierarchy can leak into the next evaluation.
+        """
+        with self._cache_lock:
+            if timeframe is None:
+                self._cache.clear()
+            else:
+                for key in [k for k in self._cache if k[1] == timeframe]:
+                    self._cache.pop(key, None)
 
     # -- connection ------------------------------------------------------- #
     def connect(self) -> bool:
@@ -257,18 +340,24 @@ class MarketData:
                     password=self.config.mt5_password,
                     server=self.config.mt5_server,
                 )
-            if not mt5.initialize(**kwargs):
+            with _MT5_LOCK:
+                initialised = mt5.initialize(**kwargs)
+            if not initialised:
                 LOGGER.error("MT5 initialize() failed: %s", mt5.last_error())
                 self.connected = False
                 return False
 
-            if not mt5.symbol_select(self.config.symbol, True):
+            with _MT5_LOCK:
+                selected = mt5.symbol_select(self.config.symbol, True)
+            if not selected:
                 LOGGER.error("Symbol '%s' is unavailable on this account", self.config.symbol)
-                mt5.shutdown()
+                with _MT5_LOCK:
+                    mt5.shutdown()
                 self.connected = False
                 return False
 
-            info = mt5.terminal_info()
+            with _MT5_LOCK:
+                info = mt5.terminal_info()
             LOGGER.info(
                 "MT5 connected (terminal=%s, symbol=%s)",
                 getattr(info, "name", "unknown"),
@@ -300,7 +389,8 @@ class MarketData:
         if not MT5_AVAILABLE:
             return False
         try:
-            return mt5.terminal_info() is not None
+            with _MT5_LOCK:
+                return mt5.terminal_info() is not None
         except Exception:  # noqa: BLE001
             return False
 
@@ -308,7 +398,8 @@ class MarketData:
         """Close the MT5 connection."""
         if MT5_AVAILABLE:
             try:
-                mt5.shutdown()
+                with _MT5_LOCK:
+                    mt5.shutdown()
             except Exception:  # noqa: BLE001
                 pass
         self.connected = False
@@ -317,21 +408,37 @@ class MarketData:
 
     # -- data ------------------------------------------------------------- #
     def get_candles(
-        self, symbol: str, timeframe: str, count: int, closed_only: bool = True
+        self,
+        symbol: str,
+        timeframe: str,
+        count: int,
+        closed_only: bool = True,
+        use_cache: bool = False,
+        cache_result: bool = True,
     ) -> pd.DataFrame:
         """Fetch candles, newest last, timestamps converted to UTC.
 
         With ``closed_only=True`` (the default and the only mode the signal
         engine may use) the still-forming candle at position 0 is dropped.
         Returns an empty frame on any failure - callers check emptiness.
+
+        ``use_cache`` reuses a recently fetched frame for the same
+        ``(symbol, timeframe)``.  It is off by default and is never enabled for
+        the frames that feed an actual evaluation, so a signal is always decided
+        on freshly fetched candles.
         """
+        if use_cache and closed_only:
+            cached = self._cached(symbol, timeframe, count)
+            if cached is not None:
+                return cached
         if not self.ensure_connection():
             return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
         try:
             # +1 because the forming candle is discarded below.
-            rates = mt5.copy_rates_from_pos(
-                symbol, _mt5_timeframe(timeframe), 0, int(count) + 1
-            )
+            with _MT5_LOCK:
+                rates = mt5.copy_rates_from_pos(
+                    symbol, _mt5_timeframe(timeframe), 0, int(count) + 1
+                )
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("copy_rates_from_pos failed for %s %s: %s", symbol, timeframe, exc)
             self.connected = False
@@ -351,7 +458,10 @@ class MarketData:
 
         if closed_only and len(df):
             df = df.iloc[:-1]  # position 0 of MT5 is the forming candle -> last here
-        return clean_candles(df)
+        cleaned = clean_candles(df)
+        if closed_only and cache_result and not cleaned.empty:
+            self._store_cache(symbol, timeframe, count, cleaned)
+        return cleaned
 
     def get_latest_candle(self, symbol: str, timeframe: str) -> Optional[pd.Series]:
         """Most recently *closed* candle, or ``None``."""
@@ -365,7 +475,8 @@ class MarketData:
         if not self.ensure_connection():
             return None
         try:
-            tick = mt5.symbol_info_tick(symbol)
+            with _MT5_LOCK:
+                tick = mt5.symbol_info_tick(symbol)
             if tick is None:
                 return None
             bid, ask = float(tick.bid), float(tick.ask)
@@ -381,12 +492,14 @@ class MarketData:
         if not self.ensure_connection():
             return float("nan")
         try:
-            info = mt5.symbol_info(symbol)
+            with _MT5_LOCK:
+                info = mt5.symbol_info(symbol)
             if info is None:
                 return float("nan")
             if getattr(info, "spread", 0):
                 return float(info.spread)
-            tick = mt5.symbol_info_tick(symbol)
+            with _MT5_LOCK:
+                tick = mt5.symbol_info_tick(symbol)
             point = float(getattr(info, "point", 0.0) or 0.0)
             if tick is None or point <= 0:
                 return float("nan")
@@ -396,43 +509,76 @@ class MarketData:
             return float("nan")
 
     # -- composite --------------------------------------------------------- #
-    def build_snapshot(self) -> Tuple[Optional[MarketSnapshot], str]:
-        """Fetch every timeframe and assemble a :class:`MarketSnapshot`.
+    def latest_closed_candle_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
+        """Open time of the most recently closed candle - a cheap "is there a
+        new bar?" probe that avoids downloading full history on every poll.
+        """
+        # cache_result=False: a 3-candle probe must not evict the full frame
+        frame = self.get_candles(symbol, timeframe, 3, closed_only=True, cache_result=False)
+        if frame.empty:
+            return None
+        return as_utc(pd.Timestamp(frame["time"].iloc[-1]).to_pydatetime())
+
+    def build_snapshot(
+        self, config=None, use_cache: bool = False
+    ) -> Tuple[Optional[MarketSnapshot], str]:
+        """Fetch every timeframe in the active hierarchy and assemble a snapshot.
+
+        ``config`` may be a runtime-adjusted view (see
+        :func:`src.runtime_state.effective_config`); it defaults to the config
+        this connector was built with.  The signal timeframe and its
+        confirmations come straight from that config, so switching timeframe
+        from Telegram changes what is fetched with no restart.
 
         Returns ``(snapshot, reason)``; ``snapshot`` is ``None`` when data could
         not be assembled and ``reason`` explains why.
         """
-        cfg = self.config
-        m5 = self.get_candles(cfg.symbol, cfg.signal_timeframe, cfg.candles_signal)
+        cfg = config or self.config
+        signal_tf = cfg.signal_timeframe
+
+        signal_df = self.get_candles(cfg.symbol, signal_tf, cfg.candles_signal)
         ok, reason = validate_candles(
-            m5, cfg.signal_timeframe, cfg.min_candles_required, cfg.max_candle_staleness_seconds
+            signal_df, signal_tf, cfg.min_candles_required, cfg.max_candle_staleness_seconds
         )
         if not ok:
-            return None, f"{cfg.signal_timeframe}: {reason}"
+            return None, f"{signal_tf}: {reason}"
 
-        m15 = self.get_candles(cfg.symbol, cfg.intermediate_timeframe, cfg.candles_intermediate)
-        ok, reason = validate_candles(m15, cfg.intermediate_timeframe, cfg.min_htf_candles_required)
-        if not ok:
-            return None, f"{cfg.intermediate_timeframe}: {reason}"
+        # Confirmation timeframes are optional: H1 has one, H4 has none.
+        frames: Dict[str, Optional[pd.DataFrame]] = {}
+        for role, timeframe, count in (
+            ("intermediate", cfg.intermediate_timeframe, cfg.candles_intermediate),
+            ("higher", cfg.higher_timeframe, cfg.candles_higher),
+        ):
+            if not timeframe:
+                frames[role] = None
+                continue
+            frame = self.get_candles(cfg.symbol, timeframe, count, use_cache=use_cache)
+            ok, reason = validate_candles(frame, timeframe, cfg.min_htf_candles_required)
+            if not ok:
+                return None, f"{timeframe}: {reason}"
+            frames[role] = frame
 
-        h1 = self.get_candles(cfg.symbol, cfg.higher_timeframe, cfg.candles_higher)
-        ok, reason = validate_candles(h1, cfg.higher_timeframe, cfg.min_htf_candles_required)
-        if not ok:
-            return None, f"{cfg.higher_timeframe}: {reason}"
-
-        m1 = self.get_candles(cfg.symbol, cfg.micro_timeframe, cfg.candles_micro)
-        if m1.empty:
-            m1 = None
+        micro = None
+        if cfg.micro_timeframe:
+            micro = self.get_candles(
+                cfg.symbol, cfg.micro_timeframe, cfg.candles_micro, use_cache=use_cache
+            )
+            if micro.empty:
+                micro = None
 
         return (
             MarketSnapshot(
                 symbol=cfg.symbol,
-                m5=m5,
-                m15=m15,
-                h1=h1,
-                m1=m1,
+                m5=signal_df,
+                m15=frames["intermediate"],
+                h1=frames["higher"],
+                m1=micro,
                 spread_points=self.get_spread(cfg.symbol),
                 evaluated_at=now_utc(),
+                signal_timeframe=signal_tf,
+                confirmation="+".join(
+                    tf for tf in (cfg.intermediate_timeframe, cfg.higher_timeframe) if tf
+                ) or "NONE",
             ),
             "",
         )

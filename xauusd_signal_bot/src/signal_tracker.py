@@ -81,6 +81,8 @@ SIGNAL_COLUMNS: Tuple[str, ...] = (
     "signal_id", "timestamp", "symbol", "timeframe", "direction",
     "entry", "sl", "tp1", "tp2", "tp3",
     "confidence", "bullish_score", "bearish_score", "regime", "status",
+    # operating context: which mode/timeframe/threshold produced this candidate
+    "mode", "signal_timeframe", "confirmation_timeframes", "threshold_used", "score",
     "session", "risk_reward", "rr1", "rr2", "rr3", "sl_mode",
     "confidence_label", "reason_summary", "status_updated_at", "tp_hits",
     "mfe_r", "mae_r",
@@ -90,6 +92,8 @@ OUTCOME_COLUMNS: Tuple[str, ...] = (
     "signal_id", "entry", "result", "exit_level", "R_multiple", "duration", "timestamp",
     "symbol", "direction", "signal_time", "bars", "tp_hits", "confidence", "regime",
     "session", "mfe_r", "mae_r",
+    # carried through from the signal so outcomes can be grouped without a join
+    "mode", "timeframe", "score", "threshold_used",
 )
 
 
@@ -420,23 +424,37 @@ def evaluate_progress(
 # cooldown / limit context
 # --------------------------------------------------------------------------- #
 def build_gate_state(
-    signal_rows: Sequence[Dict[str, Any]], active_count: int, reference_time: datetime
+    signal_rows: Sequence[Dict[str, Any]],
+    active_count: int,
+    reference_time: datetime,
+    timeframe: Optional[str] = None,
 ) -> GateState:
     """Derive cooldown and daily-limit context from past signals.
 
     Shared by the live tracker and the backtester so both apply identical
     cooldown rules.  Signals dated after ``reference_time`` are ignored, which
     is what keeps the backtest free of lookahead.
+
+    ``timeframe`` scopes the **cooldown** to signals from that timeframe: a
+    cooldown is measured in candles, and an M5 candle and an H4 candle are not
+    the same unit, so an old H4 signal must not mute a fresh M5 one.  The daily
+    cap and the concurrency cap stay global, because those exist to limit how
+    much the user is pinged overall.
     """
     reference_time = as_utc(reference_time)
     last_time: Optional[datetime] = None
     last_direction = ""
     last_same: Dict[str, Optional[datetime]] = {"BUY": None, "SELL": None}
     signals_today = 0
+    wanted = str(timeframe).upper() if timeframe else None
 
     for row in signal_rows:
         timestamp = parse_iso(str(row.get("timestamp", "")))
         if timestamp is None or timestamp > reference_time:
+            continue
+        if timestamp.date() == reference_time.date():
+            signals_today += 1
+        if wanted and str(row.get("timeframe", "")).upper() != wanted:
             continue
         direction = str(row.get("direction", "")).upper()
         if last_time is None or timestamp > last_time:
@@ -445,8 +463,6 @@ def build_gate_state(
             previous = last_same[direction]
             if previous is None or timestamp > previous:
                 last_same[direction] = timestamp
-        if timestamp.date() == reference_time.date():
-            signals_today += 1
 
     return GateState(
         last_signal_time=last_time,
@@ -485,6 +501,10 @@ def build_outcome_row(
         "session": signal_row.get("session", ""),
         "mfe_r": progress.mfe_r,
         "mae_r": progress.mae_r,
+        "mode": signal_row.get("mode", ""),
+        "timeframe": signal_row.get("timeframe", ""),
+        "score": signal_row.get("score", signal_row.get("confidence", "")),
+        "threshold_used": signal_row.get("threshold_used", ""),
     }
 
 
@@ -509,12 +529,15 @@ class SignalTracker:
     ``evaluations.csv`` is append-only and is never read by the live loop.
     """
 
-    def __init__(self, config, notifier=None) -> None:
+    def __init__(self, config, notifier=None, store=None) -> None:
         self.config = config
         self.notifier = notifier
         self.signals: List[Dict[str, Any]] = []
         self.outcome_ids: set = set()
         self.state: Dict[str, Any] = {}
+        # Shared with RuntimeState so the Telegram thread and the signal loop
+        # cannot clobber each other's keys in state.json.
+        self.store = store
 
     # -- loading ----------------------------------------------------------- #
     def load(self) -> None:
@@ -524,7 +547,7 @@ class SignalTracker:
         ensure_csv(cfg.outcomes_csv, OUTCOME_COLUMNS)
         self.signals = read_csv_rows(cfg.signals_csv)
         self.outcome_ids = {row.get("signal_id", "") for row in read_csv_rows(cfg.outcomes_csv)}
-        self.state = read_json(cfg.state_file, {})
+        self.state = self.store.snapshot() if self.store is not None else read_json(cfg.state_file, {})
         LOGGER.info(
             "Loaded %s signals (%s active) and %s recorded outcomes",
             len(self.signals),
@@ -540,7 +563,10 @@ class SignalTracker:
     def save_state(self, **updates: Any) -> None:
         """Merge ``updates`` into ``state.json`` and persist atomically."""
         self.state.update(updates)
-        atomic_write_json(self.config.state_file, self.state)
+        if self.store is not None:
+            self.store.update(**updates)
+        else:
+            atomic_write_json(self.config.state_file, self.state)
 
     @property
     def last_processed_candle(self) -> Optional[datetime]:
@@ -548,9 +574,20 @@ class SignalTracker:
         return parse_iso(str(self.state.get("last_processed_candle", "")))
 
     # -- gate --------------------------------------------------------------- #
-    def gate_state(self, reference_time: datetime) -> GateState:
+    def gate_state(self, reference_time: datetime, timeframe: Optional[str] = None) -> GateState:
         """Build the cooldown/limit context for the filter chain."""
-        return build_gate_state(self.signals, len(self.active_signals()), reference_time)
+        return build_gate_state(
+            self.signals, len(self.active_signals()), reference_time, timeframe
+        )
+
+    def active_timeframes(self) -> List[str]:
+        """Distinct timeframes that still have open signals to be tracked."""
+        seen: List[str] = []
+        for row in self.active_signals():
+            timeframe = str(row.get("timeframe", "")).upper()
+            if timeframe and timeframe not in seen:
+                seen.append(timeframe)
+        return seen
 
     # -- recording ---------------------------------------------------------- #
     def record_signal(self, signal) -> Dict[str, Any]:
@@ -623,11 +660,23 @@ class SignalTracker:
 
     # -- lifecycle ---------------------------------------------------------- #
     def update(
-        self, candles: pd.DataFrame, intrabar: Optional[pd.DataFrame] = None
+        self,
+        candles: pd.DataFrame,
+        intrabar: Optional[pd.DataFrame] = None,
+        timeframe: Optional[str] = None,
     ) -> List[TrackerEvent]:
-        """Re-evaluate every open signal against the latest candles."""
+        """Re-evaluate open signals against the latest candles.
+
+        ``timeframe`` restricts the update to signals raised on that timeframe.
+        A signal must be tracked with candles of its **own** timeframe - scoring
+        an H1 signal against M5 bars would mis-count its expiry and mis-read its
+        stop.  Pass ``None`` to apply ``candles`` to every open signal.
+        """
         events: List[TrackerEvent] = []
+        wanted = str(timeframe).upper() if timeframe else None
         for row in list(self.active_signals()):
+            if wanted and str(row.get("timeframe", "")).upper() != wanted:
+                continue
             try:
                 progress = evaluate_progress(row, candles, self.config, intrabar)
             except (KeyError, ValueError, TypeError) as exc:

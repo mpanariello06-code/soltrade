@@ -12,7 +12,7 @@ generation or CSV logging.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -67,12 +67,20 @@ class TelegramNotifier:
         return bool(self.config.telegram_enabled and self.token and self.chat_id)
 
     # -- transport --------------------------------------------------------- #
-    def _call(self, method: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _call(
+        self,
+        method: str,
+        payload: Dict[str, Any],
+        timeout: Optional[int] = None,
+        attempts: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         """POST to the Bot API with retries.  Returns the JSON result or ``None``."""
         url = API_BASE.format(token=self.token, method=method)
-        for attempt in range(MAX_ATTEMPTS):
+        timeout = REQUEST_TIMEOUT if timeout is None else timeout
+        max_attempts = MAX_ATTEMPTS if attempts is None else max(1, attempts)
+        for attempt in range(max_attempts):
             try:
-                response = self._session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+                response = self._session.post(url, json=payload, timeout=timeout)
                 if response.status_code == 200:
                     return response.json()
                 # 429 carries a retry-after hint; anything else we simply retry.
@@ -84,9 +92,9 @@ class TelegramNotifier:
                 )
             except requests.RequestException as exc:
                 LOGGER.warning("Telegram %s failed (attempt %s): %s", method, attempt + 1, exc)
-            if attempt < MAX_ATTEMPTS - 1:
+            if attempt < max_attempts - 1:
                 time.sleep(BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)])
-        LOGGER.error("Telegram %s failed after %s attempts", method, MAX_ATTEMPTS)
+        LOGGER.error("Telegram %s failed after %s attempts", method, max_attempts)
         return None
 
     def test_connection(self) -> bool:
@@ -104,22 +112,170 @@ class TelegramNotifier:
         self.connected = False
         return False
 
-    def send_message(self, text: str) -> bool:
-        """Send a plain-text message.  Returns ``True`` on success."""
+    def send_message(
+        self, text: str, keyboard: Optional[List[List[Dict[str, str]]]] = None
+    ) -> Optional[int]:
+        """Send a plain-text message, optionally with an inline keyboard.
+
+        Returns the sent ``message_id`` (truthy) on success, or ``None``.
+        """
         if not self.enabled:
             LOGGER.debug("Telegram disabled - message suppressed:\n%s", text)
-            return False
-        payload = {
+            return None
+        payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": text,
             "disable_web_page_preview": True,
         }
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
         result = self._call("sendMessage", payload)
+        if result and result.get("ok"):
+            return int(result.get("result", {}).get("message_id", 0)) or None
+        return None
+
+    def edit_message(
+        self,
+        message_id: int,
+        text: str,
+        keyboard: Optional[List[List[Dict[str, str]]]] = None,
+    ) -> bool:
+        """Replace the text/keyboard of an existing message.
+
+        Editing in place is what makes the control panel feel like a panel
+        rather than a growing wall of duplicate messages.
+        """
+        if not self.enabled or not message_id:
+            return False
+        payload: Dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "message_id": int(message_id),
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        result = self._call("editMessageText", payload, attempts=1)
+        if result and result.get("ok"):
+            return True
+        # "message is not modified" is a success for our purposes
+        description = str((result or {}).get("description", ""))
+        return "not modified" in description
+
+    def answer_callback(self, callback_id: str, text: str = "") -> bool:
+        """Acknowledge a button press so Telegram stops showing the spinner."""
+        if not self.enabled or not callback_id:
+            return False
+        payload: Dict[str, Any] = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text[:200]
+        result = self._call("answerCallbackQuery", payload, attempts=1)
         return bool(result and result.get("ok"))
 
+    def get_updates(self, offset: int, timeout: int = 25) -> List[Dict[str, Any]]:
+        """Long-poll for new updates.  Returns ``[]`` on any failure."""
+        if not self.enabled:
+            return []
+        payload = {
+            "offset": offset,
+            "timeout": int(timeout),
+            "allowed_updates": ["callback_query", "message"],
+        }
+        # one attempt only: a failed long-poll is simply retried by the caller's
+        # loop, and stacking retries here would multiply the wait.
+        result = self._call(
+            "getUpdates", payload, timeout=int(timeout) + REQUEST_TIMEOUT, attempts=1
+        )
+        if result and result.get("ok"):
+            return list(result.get("result", []))
+        return []
+
     # -- formatting --------------------------------------------------------- #
+    RESEARCH_DISCLAIMER = (
+        "⚠️ Research/paper-testing signal.\n"
+        "This setup is being collected for research/paper testing and is not a "
+        "validated trading signal."
+    )
+
+    def format_research_signal(self, signal) -> str:
+        """Render a RESEARCH-mode candidate (spec section 9).
+
+        Deliberately unlike the standard card: different header, no
+        confirmation checklist, and an explicit disclaimer, so a research
+        candidate can never be mistaken for a validated signal at a glance.
+        """
+        digits = self.config.digits
+        return "\n".join(
+            [
+                DIVIDER,
+                f"🔬 RESEARCH {signal.direction}",
+                DIVIDER,
+                "",
+                f"{signal.symbol} {signal.timeframe}",
+                "",
+                f"Score: {signal.confidence:.0f}/100",
+                f"Bullish: {signal.bullish_score:.0f}",
+                f"Bearish: {signal.bearish_score:.0f}",
+                f"Threshold: {signal.threshold_used:.0f}",
+                "",
+                "Regime:",
+                signal.regime.replace("_", " "),
+                "",
+                f"Entry: {signal.entry:.{digits}f}",
+                f"SL: {signal.stop_loss:.{digits}f}",
+                "",
+                f"TP1: {signal.tp1:.{digits}f}",
+                f"TP2: {signal.tp2:.{digits}f}",
+                f"TP3: {signal.tp3:.{digits}f}",
+                "",
+                "R:R:",
+                f"TP1 = {signal.rr1:.1f}R",
+                f"TP2 = {signal.rr2:.1f}R",
+                f"TP3 = {signal.rr3:.1f}R",
+                "",
+                "Reason:",
+                signal.reason_summary,
+                "",
+                DIVIDER,
+                self.RESEARCH_DISCLAIMER,
+            ]
+        )
+
+    def format_near_signal(self, evaluation) -> str:
+        """Render the optional NEAR_SIGNAL diagnostic (spec section 8)."""
+        card = evaluation.card
+        bullish = card.bullish_score if card else 0.0
+        bearish = card.bearish_score if card else 0.0
+        direction = "BUY" if bullish >= bearish else "SELL"
+        best = max(bullish, bearish)
+        return "\n".join(
+            [
+                DIVIDER,
+                "👀 NEAR SIGNAL",
+                DIVIDER,
+                "",
+                f"{evaluation.symbol} {evaluation.timeframe}  ({direction} side)",
+                "",
+                f"Threshold: {evaluation.threshold:.0f}",
+                f"Bullish: {bullish:.0f}",
+                f"Bearish: {bearish:.0f}",
+                f"Short by: {max(evaluation.threshold - best, 0.0):.1f}",
+                "",
+                f"Regime: {evaluation.regime.replace('_', ' ')}",
+                f"Blocked by: {evaluation.rejection_reason or '-'}",
+                "",
+                DIVIDER,
+                "Diagnostic only - NOT a signal.",
+            ]
+        )
+
     def format_signal(self, signal) -> str:
-        """Render the signal card (spec section 33)."""
+        """Render the signal card (spec section 33).
+
+        RESEARCH-mode candidates get their own, clearly-labelled format.
+        """
+        if getattr(signal, "is_research", False):
+            return self.format_research_signal(signal)
         icon = "🟢" if signal.direction == "BUY" else "🔴"
         digits = self.config.digits
         lines = [
@@ -174,14 +330,18 @@ class TelegramNotifier:
 
     def send_signal(self, signal) -> bool:
         """Send a new-signal card."""
-        return self.send_message(self.format_signal(signal))
+        return bool(self.send_message(self.format_signal(signal)))
+
+    def send_near_signal(self, evaluation) -> bool:
+        """Send a near-signal diagnostic (only when the user enabled them)."""
+        return bool(self.send_message(self.format_near_signal(evaluation)))
 
     def send_outcome(
         self, signal_row: Dict[str, Any], event: str, price: float, r_multiple: Optional[float] = None
     ) -> bool:
         """Send an outcome update."""
-        return self.send_message(self.format_outcome(signal_row, event, price, r_multiple))
+        return bool(self.send_message(self.format_outcome(signal_row, event, price, r_multiple)))
 
     def send_text(self, text: str) -> bool:
         """Send an arbitrary status message (startup/shutdown notices)."""
-        return self.send_message(text)
+        return bool(self.send_message(text))

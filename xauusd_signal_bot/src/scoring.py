@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-from .utils import ComponentScore, clamp
+from .utils import ComponentScore, clamp, safe_div
 
 #: config attribute name for each component's weight
 COMPONENT_WEIGHT_KEYS: Dict[str, str] = {
@@ -56,6 +56,10 @@ class ScoreCard:
     components: Dict[str, ComponentScore] = field(default_factory=dict)
     weighted_bull: Dict[str, float] = field(default_factory=dict)
     weighted_bear: Dict[str, float] = field(default_factory=dict)
+    #: >1.0 when some component was not applicable and its weight was shared out
+    weight_scale: float = 1.0
+    #: names of components excluded from scoring this evaluation
+    excluded_components: Tuple[str, ...] = ()
 
     @property
     def direction(self) -> str:
@@ -84,6 +88,9 @@ class ScoreCard:
         """Per-component confirmation flags used in the Telegram message."""
         flags: Dict[str, bool] = {}
         for name, component in self.components.items():
+            if not component.applicable:
+                flags[name] = False
+                continue
             bull, bear = component.normalised()
             value = bull if direction == "BUY" else bear
             flags[name] = value >= CONFIRMATION_THRESHOLD
@@ -95,16 +102,43 @@ class ScoreCard:
 
 
 def compute_scorecard(components: Dict[str, ComponentScore], config) -> ScoreCard:
-    """Combine component scores into bullish/bearish totals in ``[0, 100]``."""
+    """Combine component scores into bullish/bearish totals in ``[0, 100]``.
+
+    Components marked ``applicable=False`` are excluded and their weight is
+    redistributed proportionally across the rest, so the score stays on a true
+    0-100 scale.  Without this, running on H4 (which has no higher timeframe to
+    confirm against) would cap every score at 85 and make the thresholds
+    meaningless.
+    """
     weights = config.weights
     card = ScoreCard(components=dict(components))
 
+    applicable = {
+        name: component for name, component in components.items()
+        if component.applicable and COMPONENT_WEIGHT_KEYS.get(name)
+    }
+    # Only a component that is PRESENT and explicitly inapplicable releases its
+    # weight.  A component simply absent from the mapping contributes nothing
+    # and does not inflate the others - otherwise passing a partial component
+    # set (as unit tests do) would silently rescale the result.
+    released = sum(
+        float(getattr(weights, COMPONENT_WEIGHT_KEYS[name], 0.0))
+        for name, component in components.items()
+        if COMPONENT_WEIGHT_KEYS.get(name) and not component.applicable
+    )
+    active_weight = weights.total() - released
+    scale_factor = safe_div(weights.total(), active_weight, 1.0) if active_weight > 0 else 1.0
+    card.weight_scale = round(scale_factor, 4)
+    card.excluded_components = tuple(
+        sorted(name for name in components if name not in applicable)
+    )
+
     total_bull = total_bear = 0.0
-    for name, component in components.items():
+    for name, component in applicable.items():
         weight_key = COMPONENT_WEIGHT_KEYS.get(name)
         if weight_key is None:
             continue
-        weight = float(getattr(weights, weight_key, 0.0))
+        weight = float(getattr(weights, weight_key, 0.0)) * scale_factor
         bull_fraction, bear_fraction = component.normalised()
         bull_points = bull_fraction * weight
         bear_points = bear_fraction * weight
