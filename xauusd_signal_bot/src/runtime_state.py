@@ -31,16 +31,12 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .logger import get_logger
 from .timeframes import (
-    MODE_STANDARD,
+    MODE_SCALPING,
     RUN_STATES,
+    SIGNAL_TIMEFRAME,
     STATUS_PAUSED,
     STATUS_RUNNING,
     STATUS_STOPPED,
-    confirmation_label,
-    confirmation_timeframes,
-    micro_timeframe,
-    normalise_mode,
-    normalise_timeframe,
 )
 from .utils import atomic_write_json, parse_iso, read_json
 
@@ -117,12 +113,11 @@ class RuntimeState:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     status: str = STATUS_RUNNING
-    mode: str = MODE_STANDARD
-    signal_timeframe: str = "M5"
-    #: "MODE:TF" -> explicit threshold set by the user; absent means "use config"
-    threshold_overrides: Dict[str, float] = field(default_factory=dict)
+    #: Explicit threshold set from Telegram; ``None`` means "use config".
+    threshold_override: Optional[float] = None
     cooldown_candles: Optional[int] = None
     min_tp2_rr: Optional[float] = None
+    max_holding_candles: Optional[int] = None
     allowed_sessions: Optional[Tuple[str, ...]] = None
     near_signal_alerts: bool = False
 
@@ -138,15 +133,10 @@ class RuntimeState:
             config=config,
             store=store,
             status=str(saved.get("status", STATUS_RUNNING)).upper(),
-            mode=normalise_mode(saved.get("mode", config.mode)),
-            signal_timeframe=normalise_timeframe(
-                saved.get("signal_timeframe", config.signal_timeframe)
-            ),
-            threshold_overrides={
-                str(k): float(v) for k, v in dict(saved.get("threshold_overrides") or {}).items()
-            },
+            threshold_override=saved.get("threshold_override"),
             cooldown_candles=saved.get("cooldown_candles"),
             min_tp2_rr=saved.get("min_tp2_rr"),
+            max_holding_candles=saved.get("max_holding_candles"),
             allowed_sessions=tuple(sessions) if sessions else None,
             near_signal_alerts=bool(saved.get("near_signal_alerts", config.near_signal_alerts)),
         )
@@ -154,19 +144,19 @@ class RuntimeState:
             state.status = STATUS_RUNNING
         state._migrate_last_processed()
         LOGGER.info(
-            "Runtime state: %s | mode=%s | TF=%s (confirm %s) | threshold=%.0f",
-            state.status, state.mode, state.signal_timeframe,
-            confirmation_label(state.signal_timeframe), state.active_threshold(),
+            "Runtime state: %s | %s %s | threshold=%.0f | max hold=%s candles",
+            state.status, MODE_SCALPING, SIGNAL_TIMEFRAME,
+            state.active_threshold(), state.describe()["max_holding_candles"],
         )
         return state
 
     def _migrate_last_processed(self) -> None:
-        """Upgrade the pre-multi-timeframe single ``last_processed_candle`` key."""
+        """Upgrade state written by the earlier multi-timeframe build."""
         legacy = self.store.get("last_processed_candle")
         per_timeframe = self.store.get("last_processed_candles")
         if isinstance(legacy, str) and legacy and not per_timeframe:
-            self.store.update(last_processed_candles={self.signal_timeframe: legacy})
-            LOGGER.info("Migrated last_processed_candle to per-timeframe tracking")
+            self.store.update(last_processed_candles={SIGNAL_TIMEFRAME: legacy})
+            LOGGER.info("Migrated last_processed_candle to the M1 marker")
 
     # ------------------------------------------------------------------ #
     def persist(self) -> None:
@@ -176,11 +166,10 @@ class RuntimeState:
                 RUNTIME_KEY,
                 {
                     "status": self.status,
-                    "mode": self.mode,
-                    "signal_timeframe": self.signal_timeframe,
-                    "threshold_overrides": dict(self.threshold_overrides),
+                    "threshold_override": self.threshold_override,
                     "cooldown_candles": self.cooldown_candles,
                     "min_tp2_rr": self.min_tp2_rr,
+                    "max_holding_candles": self.max_holding_candles,
                     "allowed_sessions": list(self.allowed_sessions) if self.allowed_sessions else None,
                     "near_signal_alerts": self.near_signal_alerts,
                 },
@@ -217,78 +206,39 @@ class RuntimeState:
     def stop(self) -> str:
         return self.set_status(STATUS_STOPPED)
 
-    # -- mode / timeframe ------------------------------------------------ #
-    def set_mode(self, mode: str) -> str:
-        """Switch operating mode; the threshold follows the new mode."""
-        with self._lock:
-            self.mode = normalise_mode(mode, self.mode)
-        self.persist()
-        LOGGER.info("Mode -> %s (threshold %.0f)", self.mode, self.active_threshold())
-        return self.mode
-
-    def set_timeframe(self, timeframe: str) -> str:
-        """Switch the signal timeframe; the confirmation hierarchy follows."""
-        with self._lock:
-            self.signal_timeframe = normalise_timeframe(timeframe, self.signal_timeframe)
-        self.persist()
-        LOGGER.info(
-            "Signal timeframe -> %s (confirmation %s, threshold %.0f)",
-            self.signal_timeframe,
-            confirmation_label(self.signal_timeframe),
-            self.active_threshold(),
-        )
-        return self.signal_timeframe
-
-    def confirmation_timeframes(self) -> Tuple[Optional[str], Optional[str]]:
-        with self._lock:
-            return confirmation_timeframes(self.signal_timeframe)
-
-    def confirmation_label(self) -> str:
-        with self._lock:
-            return confirmation_label(self.signal_timeframe)
-
-    def micro_timeframe(self) -> Optional[str]:
-        with self._lock:
-            return micro_timeframe(self.signal_timeframe)
-
     # -- threshold -------------------------------------------------------- #
-    def _threshold_key(self) -> str:
-        return f"{self.mode}:{self.signal_timeframe}"
-
     def active_threshold(self) -> float:
-        """Base threshold for the current mode and timeframe."""
+        """Base threshold before the regime adjustment."""
         with self._lock:
-            override = self.threshold_overrides.get(self._threshold_key())
-            if override is not None:
-                return self.config.clamp_threshold(override)
-            return self.config.threshold_for(self.mode, self.signal_timeframe)
+            if self.threshold_override is not None:
+                return self.config.clamp_threshold(self.threshold_override)
+            return self.config.clamp_threshold(self.config.base_threshold)
 
     def default_threshold(self) -> float:
-        """Configured default for the current mode/timeframe, ignoring overrides."""
-        with self._lock:
-            return self.config.threshold_for(self.mode, self.signal_timeframe)
+        """Configured default, ignoring any override."""
+        return self.config.clamp_threshold(self.config.base_threshold)
 
     def has_threshold_override(self) -> bool:
         with self._lock:
-            return self._threshold_key() in self.threshold_overrides
+            return self.threshold_override is not None
 
     def set_threshold(self, value: float) -> float:
-        """Set an explicit threshold for the current mode/timeframe."""
+        """Set an explicit threshold."""
         clamped = self.config.clamp_threshold(value)
         with self._lock:
-            self.threshold_overrides[self._threshold_key()] = clamped
+            self.threshold_override = clamped
         self.persist()
-        LOGGER.info("Threshold -> %.0f (%s)", clamped, self._threshold_key())
+        LOGGER.info("Threshold -> %.0f", clamped)
         return clamped
 
     def adjust_threshold(self, delta: float) -> float:
-        """Nudge the threshold by ``delta``, respecting the configured limits."""
+        """Nudge the threshold, respecting the configured limits."""
         return self.set_threshold(self.active_threshold() + float(delta))
 
     def reset_threshold(self) -> float:
         """Drop the override and fall back to the configured default."""
         with self._lock:
-            self.threshold_overrides.pop(self._threshold_key(), None)
+            self.threshold_override = None
         self.persist()
         LOGGER.info("Threshold reset to default %.0f", self.active_threshold())
         return self.active_threshold()
@@ -312,25 +262,28 @@ class RuntimeState:
         self.persist()
         return self.allowed_sessions
 
+    def set_max_holding(self, candles: Optional[int]) -> Optional[int]:
+        """Maximum holding period in M1 candles before a scalp times out."""
+        with self._lock:
+            self.max_holding_candles = None if candles is None else max(1, int(candles))
+        self.persist()
+        return self.max_holding_candles
+
     def set_near_signal_alerts(self, enabled: bool) -> bool:
         with self._lock:
             self.near_signal_alerts = bool(enabled)
         self.persist()
         return self.near_signal_alerts
 
-    # -- per-timeframe candle bookkeeping --------------------------------- #
+    # -- candle bookkeeping ------------------------------------------------ #
     def last_processed_candle(self, timeframe: Optional[str] = None) -> Optional[datetime]:
-        """Last closed candle already evaluated on ``timeframe``.
-
-        Tracked *per timeframe* so switching to M15 and back to M5 cannot
-        re-evaluate an M5 candle that was already processed.
-        """
-        timeframe = timeframe or self.signal_timeframe
+        """Last closed M1 candle already evaluated."""
+        timeframe = timeframe or SIGNAL_TIMEFRAME
         table = self.store.get("last_processed_candles") or {}
         return parse_iso(str(table.get(timeframe, "")))
 
     def mark_candle_processed(self, timeframe: str, when: str) -> None:
-        """Record that ``timeframe``'s candle at ``when`` has been evaluated."""
+        """Record that the candle at ``when`` has been evaluated."""
         self.store.set_in_map("last_processed_candles", timeframe, when)
 
     # -- display ----------------------------------------------------------- #
@@ -339,17 +292,21 @@ class RuntimeState:
         with self._lock:
             return {
                 "status": self.status,
-                "mode": self.mode,
-                "signal_timeframe": self.signal_timeframe,
-                "confirmation": confirmation_label(self.signal_timeframe),
+                "mode": MODE_SCALPING,
+                "signal_timeframe": SIGNAL_TIMEFRAME,
+                "context_timeframe": self.config.context_timeframe or "NONE",
                 "threshold": self.active_threshold(),
-                "threshold_is_custom": self.has_threshold_override(),
+                "threshold_is_custom": self.threshold_override is not None,
                 "cooldown_candles": (
                     self.config.cooldown_candles if self.cooldown_candles is None
                     else self.cooldown_candles
                 ),
                 "min_tp2_rr": (
                     self.config.min_tp2_rr if self.min_tp2_rr is None else self.min_tp2_rr
+                ),
+                "max_holding_candles": (
+                    self.config.max_holding_candles if self.max_holding_candles is None
+                    else self.max_holding_candles
                 ),
                 "allowed_sessions": (
                     self.config.allowed_sessions if self.allowed_sessions is None
@@ -362,57 +319,24 @@ class RuntimeState:
 # --------------------------------------------------------------------------- #
 # folding runtime settings into a config view
 # --------------------------------------------------------------------------- #
-def config_view(
-    config,
-    mode: Optional[str] = None,
-    timeframe: Optional[str] = None,
-    threshold: Optional[float] = None,
-):
-    """Return a copy of ``config`` set up for one mode / signal timeframe.
+def effective_config(config, runtime: Optional["RuntimeState"]):
+    """Fold the live Telegram-controlled settings into a copy of ``config``.
 
-    This is the seam that keeps the whole analysis layer unchanged: the engines
-    still read ``config.signal_timeframe``, ``config.base_threshold`` and so on,
-    but the values now reflect the requested mode and timeframe - along with the
-    confirmation hierarchy that follows from it.
-
-    Used by both the live runner (via :func:`effective_config`) and the
-    backtester, so an offline run reproduces exactly what live mode would do.
-
-    The copy is shallow - ``weights``, ``indicators`` and ``sessions`` are shared
-    and never mutated here.
+    This is the seam that keeps the analysis layer unchanged: every engine still
+    reads plain config attributes, but the values reflect whatever the panel
+    last set.  The copy is shallow - ``weights``, ``indicators`` and ``sessions``
+    are shared and never mutated here.
     """
-    mode = normalise_mode(mode or getattr(config, "mode", MODE_STANDARD))
-    timeframe = normalise_timeframe(timeframe or config.signal_timeframe)
-    intermediate, higher = confirmation_timeframes(timeframe)
-
-    view = copy.copy(config)
-    view.mode = mode
-    view.signal_timeframe = timeframe
-    view.intermediate_timeframe = intermediate or ""
-    view.higher_timeframe = higher or ""
-    view.micro_timeframe = micro_timeframe(timeframe) or ""
-    view.base_threshold = (
-        config.clamp_threshold(threshold) if threshold is not None
-        else config.threshold_for(mode, timeframe)
-    )
-    return view
-
-
-def effective_config(config, runtime: Optional[RuntimeState]):
-    """Fold the live Telegram-controlled settings into a config copy."""
     if runtime is None:
         return config
 
     describe = runtime.describe()
-    view = config_view(
-        config,
-        mode=describe["mode"],
-        timeframe=describe["signal_timeframe"],
-        threshold=describe["threshold"],
-    )
+    view = copy.copy(config)
+    view.base_threshold = describe["threshold"]
     view.near_signal_alerts = describe["near_signal_alerts"]
     view.allowed_sessions = tuple(describe["allowed_sessions"])
     view.min_tp2_rr = float(describe["min_tp2_rr"])
+    view.max_holding_candles = int(describe["max_holding_candles"])
 
     cooldown = int(describe["cooldown_candles"])
     view.cooldown_candles = cooldown

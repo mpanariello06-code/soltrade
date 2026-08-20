@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 
@@ -166,14 +167,19 @@ def test_excessive_absolute_spread_is_rejected(config, frame):
     assert "excessive spread" in (check_spread(data, config) or "")
 
 
-def test_spread_relative_to_atr_is_checked(config, frame):
-    config.max_spread_atr_ratio = 0.0001
-    assert "ATR" in (check_spread(_input(config, frame), config) or "")
+def test_spread_relative_to_the_expected_move_is_checked(config, frame):
+    config.max_spread_to_expected_move = 0.0001
+    assert "expected move" in (check_spread(_input(config, frame), config) or "")
 
 
-def test_unknown_spread_is_not_a_rejection(config, frame):
-    """Backtests have no spread feed - that must not block every signal."""
+def test_unknown_spread_falls_back_to_the_assumed_cost(config, frame):
+    """A backtest must still be charged a spread rather than trading for free."""
+    config.assumed_spread_points = 5.0
     assert check_spread(_input(config, frame, spread_points=float("nan")), config) is None
+    config.assumed_spread_points = config.max_spread_points + 10
+    assert "excessive spread" in (
+        check_spread(_input(config, frame, spread_points=float("nan")), config) or ""
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -338,10 +344,13 @@ def test_candle_rejected_against_the_signal_direction(config, frame):
 # --------------------------------------------------------------------------- #
 # risk / reward  (spec 31)
 # --------------------------------------------------------------------------- #
-def _targets(rr2: float) -> Targets:
+def _targets(rr2: float, net_rr2: Optional[float] = None) -> Targets:
     return Targets(
-        entry=2300.0, stop_loss=2297.0, tp1=2303.0, tp2=2300.0 + 3.0 * rr2, tp3=2312.0,
-        risk=3.0, rr1=1.0, rr2=rr2, rr3=4.0, sl_mode="HYBRID", obstructed={},
+        entry=2300.0, stop_loss=2299.6, tp1=2300.3, tp2=2300.0 + 0.4 * rr2, tp3=2301.0,
+        risk=0.4, rr1=0.75, rr2=rr2, rr3=2.5, sl_mode="HYBRID", obstructed={},
+        cost_r=0.4, net_rr1=0.35,
+        net_rr2=rr2 - 0.4 if net_rr2 is None else net_rr2,
+        net_rr3=2.1,
     )
 
 
@@ -351,8 +360,15 @@ def test_insufficient_reward_is_rejected(config, frame):
 
 
 def test_sufficient_reward_passes(config, frame):
-    data = _input(config, frame, targets=_targets(config.min_tp2_rr + 0.2))
+    data = _input(config, frame, targets=_targets(config.min_tp2_rr + 0.6))
     assert check_risk_reward(data, config) is None
+
+
+def test_reward_that_survives_raw_but_not_costs_is_rejected(config, frame):
+    """The whole reason the cost model exists."""
+    data = _input(config, frame, targets=_targets(config.min_tp2_rr + 0.6, net_rr2=0.05))
+    reason = check_risk_reward(data, config)
+    assert reason and "NET R:R" in reason
 
 
 def test_missing_targets_are_rejected(config, frame):

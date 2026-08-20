@@ -1,49 +1,53 @@
-# XAUUSD Signal Engine (V1)
+# XAUUSD M1 Micro-Scalping Research System
 
-A standalone, deterministic **signal-only** system for XAUUSD (gold).
+A standalone, deterministic **signal-only** system for XAUUSD on the M1
+timeframe.
 
 ```
-MT5 market data
+MT5 M1 market data
       ↓
-technical + market-structure analysis
+M1 microstructure analysis (momentum, displacement, sweeps, immediate S/R)
       ↓
-multi-confirmation signal engine (9 components → 0-100 score)
+multi-confirmation scoring (9 components → 0-100)
       ↓
-strict filtering (threshold, conflict, fakeout, session, spread, cooldown)
+strict filtering (threshold, conflict, fakeout, spread, session, cooldown)
       ↓
-dynamic entry / SL / TP1-3 + R:R validation
+micro-scalping targets sized from live ATR + a full cost model
       ↓
 Telegram notification
       ↓
 CSV logging
       ↓
-automatic outcome tracking (TP/SL/expiry)
+outcome tracking with timeout, milestone timing, RAW **and NET** R
 ```
 
 > **This system never places, modifies or closes a trade.**
 > MetaTrader 5 is used as a *read-only market-data feed*. No order-execution
-> function is imported or called anywhere in the codebase. It is a paper-signal
-> and research tool.
+> function is imported or called anywhere. It is a paper-signal and research
+> tool.
 
-> **No profitability claim is made.** See [Honest assessment](#honest-assessment).
+> **No profitability claim is made — and the measured results are negative.**
+> See [Honest assessment](#honest-assessment). Reading only the RAW numbers
+> would be actively misleading at this timescale.
 
----
+**One timeframe (M1). One mode (SCALPING).** The multi-timeframe selector and
+the RESEARCH/STANDARD/CONSERVATIVE modes were removed.
 
 ## Table of contents
 
 1. [Quick start (Windows)](#quick-start-windows)
 2. [Project layout](#project-layout)
-3. [Operating modes](#operating-modes)
-4. [Telegram control panel](#telegram-control-panel)
-5. [Timeframes](#timeframes)
-6. [How the signal engine works](#how-the-signal-engine-works)
-7. [Scoring](#scoring)
-8. [Filtering](#filtering)
-9. [Near-signal diagnostic](#near-signal-diagnostic)
-10. [Entry, stop loss and take profits](#entry-stop-loss-and-take-profits)
+3. [What "scalping" means here](#what-scalping-means-here)
+4. [The cost model](#the-cost-model)
+5. [Targets](#targets)
+6. [Telegram control panel](#telegram-control-panel)
+7. [How the signal engine works](#how-the-signal-engine-works)
+8. [Scoring](#scoring)
+9. [Filtering](#filtering)
+10. [Near-signal diagnostic](#near-signal-diagnostic)
 11. [Telegram messages](#telegram-messages)
 12. [Where data is stored](#where-data-is-stored)
-13. [Outcome tracking and the R model](#outcome-tracking-and-the-r-model)
+13. [Outcome tracking, timeout and the R model](#outcome-tracking-timeout-and-the-r-model)
 14. [Backtesting](#backtesting)
 15. [Walk-forward testing](#walk-forward-testing)
 16. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
@@ -53,7 +57,7 @@ automatic outcome tracking (TP/SL/expiry)
 20. [Tests](#tests)
 21. [Honest assessment](#honest-assessment)
 22. [Known limitations](#known-limitations)
-23. [Recommended V2 improvements](#recommended-v2-improvements)
+23. [Recommended next steps](#recommended-next-steps)
 
 ---
 
@@ -156,7 +160,7 @@ python backtest.py --data history/XAUUSD_M5.csv
 ```
 xauusd_signal_bot/
 ├── main.py                  live paper-signal runner
-├── backtest.py              historical replay through the same engine
+├── backtest.py              M1 historical replay through the same engine
 ├── walkforward.py           in-sample / validation / out-of-sample report
 ├── performance.py           expectancy statistics from the CSVs
 ├── make_synthetic_history.py  generates test data (NOT real prices)
@@ -171,9 +175,9 @@ xauusd_signal_bot/
 │   ├── system_log.txt       rotating log
 │   └── state.json           last processed candle, last signal
 ├── src/
-│   ├── market_data.py       MT5 access (READ-ONLY), validation, resampling
+│   ├── market_data.py       MT5 access (READ-ONLY), validation, ticks, resampling
 │   ├── indicators.py        EMA/RSI/MACD/ATR/ADX/Stoch/BB/swings
-│   ├── trend.py             trend engine (0-20) + HTF engine (0-15)
+│   ├── trend.py             M1 trend engine + M5 context engine
 │   ├── momentum.py          momentum engine (0-15)
 │   ├── structure.py         swings, BOS, CHoCH (0-15)
 │   ├── liquidity.py         reference levels, sweeps (0-10)
@@ -182,18 +186,18 @@ xauusd_signal_bot/
 │   ├── volatility.py        ATR regime (0-5, direction-neutral)
 │   ├── price_action.py      candle confirmation (0-5)
 │   ├── regime.py            market-regime classifier
-│   ├── timeframes.py        signal timeframes + confirmation hierarchy
+│   ├── timeframes.py        M1 / SCALPING constants
 │   ├── runtime_state.py     live-editable settings, persisted to state.json
 │   ├── telegram_control.py  inline-button control panel
 │   ├── scoring.py           weighted aggregation → 0-100
 │   ├── filters.py           thresholds and rejection rules
-│   ├── targets.py           entry / SL / TP1-3 / R:R
+│   ├── targets.py           micro-scalping targets + the cost model
 │   ├── signal_engine.py     orchestration
-│   ├── signal_tracker.py    CSV persistence + outcome tracking
+│   ├── signal_tracker.py    CSV persistence + outcome tracking (timeout, net R)
 │   ├── telegram_bot.py      notifications
 │   ├── logger.py            logging setup
 │   └── utils.py             helpers
-└── tests/                   252 unit tests
+└── tests/                   216 unit tests
 ```
 
 ### Two deliberate deviations from a plain dependency list
@@ -209,184 +213,176 @@ xauusd_signal_bot/
 
 ---
 
-## Operating modes
+## What "scalping" means here
 
-Three modes, all sharing **exactly the same scoring engine**.  They differ only
-in how much confirmation a candidate must show before it is reported.
+The system looks for very short-term XAUUSD moves — minutes, not hours. The
+research concept is a first target of roughly **1–3 pips** (0.10–0.30 in price;
+gold is quoted to 2 decimals and a pip is the first decimal, so 1 pip = 10
+points).
 
-| Mode | Icon | Nominal threshold | Purpose |
-|---|---|---|---|
-| `RESEARCH` | 🔬 | 50 | Surface many candidates for observation, paper testing and future ML training |
-| `STANDARD` | 📊 | 72 | The default |
-| `CONSERVATIVE` | 🛡 | 80 | Demands more confirmation than STANDARD |
+> **That target is a starting concept, not a claim.** Whether a 1–3 pip move is
+> worth taking depends entirely on what it costs to take it, which is why the
+> cost model below is the most important part of this build.
 
-> **RESEARCH mode is not a "more profitable" mode.** It lowers the bar so that
-> more candidate setups become visible and get recorded. Every research message
-> is labelled `🔬 RESEARCH SIGNAL` and carries an explicit disclaimer. Nothing
-> about a research candidate is validated.
+Everything is sized from live conditions:
 
-The scoring weights, the engines and the filters are **unchanged** between
-modes. Only the threshold moves. That is deliberate: if research candidates
-were scored differently they could not be compared with standard ones, which
-would defeat the purpose of collecting them.
+| | |
+|---|---|
+| Signal timeframe | **M1** — fixed |
+| Context timeframe | M5 by default, optional (`CONTEXT_TIMEFRAME=""` to disable) |
+| Holding period | `MAX_HOLDING_CANDLES` minutes, default **15**, then TIMEOUT |
+| Targets | multiples of the **live M1 ATR**, floored by cost |
+| Stop | ATR / structure / hybrid, capped so the ladder's R:R stays coherent |
 
-Thresholds are per mode **and** per timeframe (see below), configurable in
-`config.py` and adjustable live from Telegram.
+M15/H1/H4 context was dropped deliberately: a one-hour trend says very little
+about a position held for three minutes, and carrying it made the engine reject
+good scalps for disagreeing with a timeframe that would not resolve inside the
+holding window.
+
+## The cost model
+
+At a few pips of target, the spread is not a rounding error — it is often the
+whole trade. Round-trip cost is
+
+```
+spread + entry slippage + exit slippage + commission (both sides)
+```
+
+With the defaults (20-point spread, 2+2 points slippage) that is **2.4 pips per
+round trip**. A 2-pip target does not survive it.
+
+Consequences, all enforced in code:
+
+* **TP1 is floored** at `MIN_TP1_COST_MULTIPLE` × cost (default 1.5×). If the
+  ATR-based target is smaller, it is raised — and the whole ladder is raised
+  proportionally, so a wider spread demands a *bigger* move rather than a
+  closer target.
+* **The stop is floored** at `MIN_SL_COST_MULTIPLE` × spread (default 2×), so
+  ordinary quote noise cannot take the trade out.
+* **A setup is rejected** when TP1 still cannot clear costs, or when the
+  cost-adjusted TP3 would exceed `MAX_TP3_PIPS` — a "scalp" that needs a
+  20-pip move is not a scalp.
+* **Every reward figure is reported twice**: `rr1/rr2/rr3` (RAW, price movement
+  only) and `net_rr1/net_rr2/net_rr3` (NET, after cost). `MIN_NET_TP2_RR`
+  rejects setups that pass the raw gate and still lose after costs.
+
+`cost_r` — the cost expressed in R — is fixed at signal time and carried through
+to the outcome, so NET R never depends on what the spread happens to be when
+the trade closes.
+
+## Targets
+
+```
+TP_i distance = tp_atr_multiples[i] × ATR      (market conditions)
+              ⌊ floored at min_tp_pips[i]      (tick grid)
+              ⌊ TP1 floored at 1.5 × cost      (worth taking)
+              → whole ladder lifted proportionally if TP1 was raised
+              → pulled back in front of major opposing structure
+              → re-ordered, rounded to the instrument's 2 decimals
+```
+
+Defaults: `tp_atr_multiples = (0.45, 1.00, 1.70)`, stop `0.70 × ATR` clamped to
+`[0.50, 0.80] × ATR`.
+
+The stop ceiling matters: HYBRID takes the *wider* of the ATR and structure
+distances, and on M1 the structure branch can otherwise put the stop 2–3 ATR
+away while the targets stay put — leaving the ladder's reward/risk below 1 by
+construction. `config.validate()` refuses a configuration where the widest
+allowed stop makes TP2 worth less than `MIN_TP2_RR`.
+
+**R:R is computed from the exact rounded prices that are published**, so the
+numbers in the Telegram message are the numbers that were validated.
 
 ## Telegram control panel
 
-Send `/panel` (or `/start`) to your bot to summon the panel. Buttons are the
-interface; text commands only exist to bring it up.
+Send `/panel` (or `/start`) to your bot. Buttons are the interface.
 
 ```
 ━━━━━━━━━━━━━━━━━━
-🤖 XAUUSD SIGNAL ENGINE
+⚡ XAUUSD SCALPER
 ━━━━━━━━━━━━━━━━━━
 
 Status: 🟢 RUNNING
-Mode: 🔬 RESEARCH
-Signal TF: M5
-Confirmation: M15+H1
-
-Threshold: 50
-Cooldown: 10 candles
-Min R:R (TP2): 1.5
+Mode: SCALPING
+Timeframe: M1
+Threshold: 68
 
 Signals today: 4
+Open signals: 1
+Paper Net R: -2.30
+
+Max hold: 15 min
 MT5: CONNECTED
 
-[▶️ START] [⏸ PAUSE] [⏹ STOP]
-[● 🔬 RESEARCH]
-[○ 📊 STANDARD]
-[○ 🛡 CONSERVATIVE]
-[ M1] [●M5] [ M15]
-[ M30] [ H1] [ H4]
-[🎯 THRESHOLD (50)]
-[📊 ANALYSIS]
+[▶️ START] [⏸ PAUSE]
+[📊 CURRENT ANALYSIS]
 [📈 PERFORMANCE]
-[⚙️ SETTINGS] [🔄 REFRESH]
+[⚙️ SETTINGS]
+[🔄 REFRESH]
 ```
 
-Every press takes effect in the running process - **nothing requires a
-restart** - and is persisted to `data/state.json`.
+No mode buttons and no timeframe buttons — there is nothing to switch. Every
+press takes effect in the running process and is persisted to `data/state.json`.
 
 | Control | Effect |
 |---|---|
-| START / PAUSE / STOP | PAUSE keeps MT5 connected and keeps tracking open signals, but generates no new ones. STOP shuts the engine down cleanly. |
-| Mode buttons | Switch RESEARCH / STANDARD / CONSERVATIVE; the threshold follows |
-| Timeframe buttons | Switch the signal timeframe; the confirmation hierarchy follows |
-| 🎯 THRESHOLD | `-5 / -1 / +1 / +5 / RESET`, clamped to 40-95 |
-| 📊 ANALYSIS | Latest evaluation on demand, from closed candles only. Read-only: it records nothing and cannot emit or suppress a signal |
-| 📈 PERFORMANCE | Summary from the CSVs, with BY TIMEFRAME / BY SCORE / BY REGIME / BY MODE views |
-| ⚙️ SETTINGS | Mode, timeframe, threshold, cooldown, minimum R:R, session filter, near-signal alerts |
+| START / PAUSE | PAUSE keeps MT5 connected and keeps tracking open scalps, but generates none. STOP lives in Settings so it cannot be hit by accident. |
+| 📊 CURRENT ANALYSIS | The latest evaluation on demand, from closed M1 candles only. Read-only: records nothing, cannot emit or suppress a signal. |
+| 📈 PERFORMANCE | From the CSVs, with BY SCORE / BY REGIME / BY SESSION / BY OUTCOME views. NET R leads. |
+| ⚙️ SETTINGS | Threshold, max holding period, cooldown, minimum R:R, session filter, near-signal alerts, STOP. |
 
 **Safety.** Updates from any chat other than `TELEGRAM_CHAT_ID` are ignored.
-Only the settings in `Config.telegram_editable_settings` are reachable -
+Only the settings in `Config.telegram_editable_settings` are reachable —
 credentials, the bot token, the symbol and all file paths have no handler and
-are never rendered into a message. On startup the poller **discards updates
-queued while the engine was down**, so a restart never replays stale presses.
-
-## Timeframes
-
-Six signal timeframes are supported. Changing one moves the whole confirmation
-hierarchy - confirming an M1 setup against H1 is a very different statement
-from confirming an M5 setup against H1.
-
-| Signal TF | Intermediate confirmation | Higher confirmation | Default STANDARD threshold | RESEARCH |
-|---|---|---|---|---|
-| M1 | M5 | M15 | 80 | 55 |
-| M5 | M15 | H1 | 72 | 50 |
-| M15 | M30 | H1 | 70 | 50 |
-| M30 | H1 | H4 | 68 | 50 |
-| H1 | H4 | — | 65 | 50 |
-| H4 | — | — | 65 | 50 |
-
-Faster timeframes carry a higher bar because their signals are noisier. These
-are **starting points, not optimised values**.
-
-When only one confirmation timeframe exists (H1), the HTF component is computed
-from that timeframe alone. When none exists (H4), the HTF component is marked
-*not applicable* and its 15 points are redistributed across the other eight
-components, so the score stays on a true 0-100 scale instead of being silently
-capped at 85.
-
-Switching timeframe clears the candle cache, and each timeframe keeps its **own**
-last-processed-candle marker in `state.json`, so switching away and back can
-never re-evaluate a candle that was already done. Signals raised on a timeframe
-you have since left are still tracked to completion, using candles of their own
-timeframe.
-
-## Near-signal diagnostic
-
-A rejected candidate whose best score lands within `NEAR_SIGNAL_MARGIN` (default
-10) points **below** the active threshold is recorded as `NEAR_SIGNAL` in
-`evaluations.csv`.
-
-```
-Threshold: 72
-Bullish: 66
--> NEAR SIGNAL
-```
-
-It is never sent as a trading signal. The point is to answer a question the
-score distribution alone cannot: *is the threshold slightly too strict for this
-market?* If most candles sit just under the bar, the threshold is the binding
-constraint; if they sit far below, it is not.
-
-Telegram alerts for near-signals are **off by default** and can be toggled in
-Settings.
-
+are never rendered into a message. On startup the poller discards updates
+queued while the engine was down, so a restart never replays stale presses.
 
 ---
 
 ## How the signal engine works
 
-The engine evaluates **once per newly closed M5 candle** — never on a forming
+The engine evaluates **once per newly closed M1 candle** — never on a forming
 candle, and never twice for the same candle. `main.py` polls MT5 every
-`POLL_SECONDS`, compares the newest closed candle's open time with
-`last_processed_candle` in `data/state.json`, and only proceeds when it changes.
+`POLL_SECONDS`, probes cheaply for a new close, and only then does the full
+fetch.
 
 For each evaluation:
 
 1. **Validate** — enough history, ordered timestamps, no duplicates, no NaN or
-   impossible OHLC, data not stale. Any failure → `NO SIGNAL`, reason logged.
-2. **Compute indicators** on M5, M15 and H1.
-3. **Run the nine analysis engines**, each producing an independent
-   bullish and bearish sub-score.
+   impossible OHLC, data not stale (an M1 candle over 3 minutes old means the
+   feed has stalled).
+2. **Compute indicators** on M1, and on the M5 context if enabled.
+3. **Run the nine analysis engines**, each producing independent bullish and
+   bearish sub-scores.
 4. **Aggregate** into `bullish_score` and `bearish_score`, both 0-100.
-5. **Classify the market regime**, which selects the score threshold.
+5. **Classify the regime**, which adjusts the threshold.
 6. **Filter** the stronger direction through the rejection chain.
-7. **Build entry / SL / TP1-3** and check R:R.
-8. **Emit** a signal, or record a `NO_SIGNAL` evaluation with its reason.
+7. **Build targets and cost** — and reject if the move cannot pay for itself.
+8. **Emit** a scalp, or record a `NO_SIGNAL` / `NEAR_SIGNAL` evaluation.
 
 Every evaluation is written to `data/evaluations.csv` **whether or not a signal
 was produced** — that file is the audit trail and the future ML training set.
 
-### The nine components
+### The nine components, re-weighted for M1
 
 | Component | Weight | What it looks at |
 |---|---|---|
-| Trend | 20 | EMA 9/21/50/200 alignment, price vs EMAs, EMA slopes, ADX, DI+/DI− |
-| HTF confirmation | 15 | M15 + H1 trend, structure and momentum blended (H1 weighted highest) |
-| Momentum | 15 | RSI level and slope, MACD state and acceleration, stochastic, ROC, RSI divergence |
-| Structure | 15 | Confirmed swings, HH/HL vs LH/LL, break of structure, change of character, consolidation |
-| Liquidity | 10 | Previous day/session extremes, equal highs/lows, sweeps and reclaims |
-| Support/Resistance | 10 | Clustered zones, breakouts, reactions, room to the next opposing zone |
-| Volume | 5 | Relative tick volume expansion, directional volume bias |
-| Volatility | 5 | ATR vs its own long-run average, Bollinger width (direction-neutral) |
-| Price action | 5 | Displacement, engulfing, wick rejection, close location |
+| Momentum | 22 | RSI/MACD/stochastic/ROC — short-term momentum and its acceleration |
+| Price action | 18 | Displacement, engulfing, wick rejection, close location |
+| Liquidity | 14 | Sweeps of the immediate highs/lows, reclaims, failed breaks |
+| Structure | 12 | Micro swings, break of structure, change of character |
+| Support/Resistance | 10 | The levels the next few pips must clear |
+| Trend | 10 | M1 EMA alignment and slope, ADX/DI (was 20 on the M5 build) |
+| Context | 6 | M5 bias only — secondary at this horizon (was 15) |
+| Volatility | 5 | Is the expected move large relative to noise |
+| Volume | 3 | Tick-volume confirmation — the weakest signal on M1 |
 
-**Avoiding double-counting.** The engines are kept disjoint in their inputs: the
-momentum engine never looks at EMA direction (that is the trend engine's job),
-structure uses only confirmed swing pivots, volatility is direction-neutral, and
-so on. The HTF component *does* re-run trend/structure/momentum, but on M15 and
-H1 — that is confirmation across timeframes, not a second count of the same bars.
+**These weights are not claimed to be optimal.** They were chosen by reasoning
+about a 15-minute holding period — momentum and candle shape matter, a
+multi-hour trend does not — and never by optimising against backtest results.
 
-**Momentum is never a signal on its own.** There is deliberately no
-"RSI below 30 ⇒ buy" rule. An oversold reading only contributes through the
-RSI-slope and divergence terms, which require the reading to actually be turning.
-
----
+Indicator periods were shortened to match: EMA 5/13/34/100, RSI 9, MACD 6/13/5,
+ATR 14 (i.e. 14 minutes), and structure pivots use a 1-bar fractal.
 
 ## Scoring
 
@@ -403,137 +399,94 @@ Weights live in `config.Weights` and must sum to 100 — `Config.validate()`
 enforces this at startup, and a unit test asserts that all components at maximum
 produce exactly 100.
 
+When the context timeframe is switched off (`CONTEXT_TIMEFRAME=""`) the context
+component is marked *not applicable* and its 6 points are redistributed across
+the other eight, so the score stays on a true 0-100 scale rather than being
+silently capped at 94.
+
 Confidence bands (`config.confidence_bands`) label the resulting score. See
-[Calibration](#calibration) for why the shipped band values are what they are.
+[Calibration](#calibration) for why the shipped values are what they are.
 
 ---
 
 ## Filtering
 
-Filters run in order; the **first** one to fire rejects the candidate and its
-reason is written to `evaluations.csv`.
+Filters run in order; the **first** to fire rejects the candidate and its reason
+is written to `evaluations.csv`.
 
 | # | Filter | Rule |
 |---|---|---|
 | 1 | Session | Candle's UTC session must be in `ALLOWED_SESSIONS` |
-| 2 | Spread | Reject above `MAX_SPREAD_POINTS`, or above `MAX_SPREAD_ATR_RATIO` × ATR |
-| 3 | Volatility | `EXTREME` volatility blocks signals (or raises the bar, configurable) |
-| 4 | Threshold | Dominant score ≥ the regime's adaptive threshold |
+| 2 | Spread | Absolute cap, **and** spread vs the move price can plausibly make in the holding window (ATR × √holding candles) |
+| 3 | Volatility | `EXTREME` volatility blocks signals (configurable) |
+| 4 | Threshold | Dominant score ≥ threshold + regime offset + counter-trend extra |
 | 5 | Separation | `dominant − opposite ≥ MIN_SCORE_SEPARATION` |
-| 6 | Fakeout | Five distinct unconfirmed-breakout / HTF-disagreement checks |
-| 7 | Cooldown | `COOLDOWN_CANDLES` any direction, `SAME_DIRECTION_COOLDOWN_CANDLES` repeated |
+| 6 | Fakeout | Unconfirmed breakouts, close back inside the range, context disagreement, thin participation, candle rejected in our direction |
+| 7 | Cooldown | `COOLDOWN_CANDLES` minutes any direction, longer for a repeat |
 | 8 | Limits | `MAX_SIGNALS_PER_DAY`, `MAX_CONCURRENT_ACTIVE_SIGNALS` |
-| 9 | R:R | TP2 reward ≥ `MIN_TP2_RR` |
+| 9 | Cost & R:R | TP1 must clear costs, TP3 must fit the scalp range, TP2 must pass **both** the raw and the net R:R gates |
+
+The spread test deserves a note. On M5 the old rule compared the spread with a
+single candle's ATR; on M1 those two are nearly the same size, so the rule was
+meaningless. It now compares the spread with the move available over the whole
+holding window, which is the quantity that actually decides whether a scalp can
+pay for itself.
 
 ### Adaptive threshold
 
-The regime chooses how much confirmation is demanded:
-
-| Regime | Threshold |
-|---|---|
-| `STRONG_BULL_TREND` / `STRONG_BEAR_TREND` | 68 |
-| `WEAK_TREND` / `BREAKOUT` | 72 (base) |
-| `LOW_VOLATILITY` | 75 |
-| `RANGE` / `HIGH_VOLATILITY` | 77 |
-| Extreme volatility | **no signal** |
-
-A **counter-trend** setup (against the H1 direction) adds
-`COUNTER_TREND_EXTRA_SCORE` on top.
-
-### Bull/bear conflict filter
-
-The spec's example: bull 84 / bear 79 is a *conflicted* market, not a buy. A
-signal needs both `score ≥ threshold` **and**
-`dominant − opposite ≥ MIN_SCORE_SEPARATION`.
-
-### Fakeout filter
-
-Rejects when: a breakout has neither volume nor a decisive body behind it; the
-candle closed back inside a range it broke on the previous bar; the higher
-timeframe actively disagrees; participation is thin (relative volume < 0.5); or
-the signal candle itself was rejected in our direction by a long opposing wick.
-
----
-
-## Entry, stop loss and take profits
-
-**Entry** = the close of the confirmed signal candle.
-
-**Stop loss** — three modes via `SL_MODE`:
-
-* `ATR` — `ATR × SL_ATR_MULTIPLIER`
-* `STRUCTURE` — beyond the last confirmed swing, plus `SL_STRUCTURE_BUFFER_ATR × ATR`
-* `HYBRID` *(default)* — the **wider** of the two
-
-HYBRID is the default because taking the wider distance keeps the stop from
-sitting exactly on the obvious swing where stop orders cluster, while the clamp
-to `[0.8, 3.0] × ATR` stops a distant swing producing absurd risk.
-
-**Take profits** — `R = |entry − stop|`, then TP1/TP2/TP3 at **1.0R / 1.8R /
-2.8R**. If a *major* opposing zone (previous day extreme, or a repeatedly
-rejected area) sits between entry and a target, that target is pulled back to
-just in front of it and flagged obstructed; it is never pulled closer than
-0.6/1.2/1.8R. The ladder is then re-ordered so TP1 < TP2 < TP3 always holds.
-
-Only *major* zones may truncate a target — otherwise every minor pivot on a noisy
-chart would clip TP2 and the R:R filter would reject everything.
-
-**R:R** is computed from the **rounded, published prices**, so the numbers in the
-Telegram message are the numbers that were validated.
-
----
+`SCALP_THRESHOLD` (default 68) plus a regime offset: strong trend −4, weak
+trend / breakout 0, low volatility +3, range / high volatility +5. Extreme
+volatility blocks signalling. A counter-context setup adds +5. The result is
+clamped to `[40, 95]`.
 
 ## Telegram messages
 
-Two message types, both plain text (no Markdown, so gold prices and emoji cannot
-break the formatting).
-
 ```
 ━━━━━━━━━━━━━━━━━━
-🟢 XAUUSD BUY
+⚡ XAUUSD M1 SCALP
 ━━━━━━━━━━━━━━━━━━
 
-⭐ Confidence: 87/100
-📊 Timeframe: M5
-📈 Regime: STRONG BULL TREND
-🕐 Session: LONDON NEW YORK OVERLAP
+Direction: BUY
 
-Entry: 3342.50
-SL: 3339.80
+Score: 71/100
 
-TP1: 3345.20
-TP2: 3347.90
-TP3: 3351.00
+Entry: 2345.67
 
-R:R
-TP1: 1.0R
-TP2: 1.8R
-TP3: 2.8R
+TP1: 2345.91   (2.4p)
+TP2: 2346.20   (5.3p)
+TP3: 2346.58   (9.1p)
 
-CONFIRMATIONS
-✅ Trend
-✅ HTF
-✅ Momentum
-✅ Structure
-✅ Liquidity
-✅ S/R
-✅ Volume
-✅ Volatility
-▫️ Price Action
+SL: 2345.42   (2.5p)
+
+Expected holding period:
+SHORT
+
+Spread:
+0.12  (12 points)
+
+Risk/Reward:
+TP1 0.96R
+TP2 2.12R
+TP3 3.64R
+
+After costs (1.6p = 0.64R):
+TP1 0.32R
+TP2 1.48R
+TP3 3.00R
+
+Reason:
+momentum=18.4; price_action=14.1; liquidity=9.8
 
 ━━━━━━━━━━━━━━━━━━
-Signal only - not financial advice.
+🔬 PAPER TEST ONLY
 ```
 
 Outcome alerts: `🎯 TP1/TP2/TP3 HIT`, `❌ SL HIT`, `⚠️ SIGNAL INVALIDATED`,
-`⌛ SIGNAL EXPIRED`.
+`⌛ SCALP TIMED OUT` — each reporting **raw and net** R.
 
 **No duplicate alerts.** An alert fires only when a signal's status *changes*
 against the value persisted in `signals.csv`. Because status is on disk, a
-restart replays nothing. Sends are retried three times with backoff and never
-raise — a Telegram outage cannot stop signal generation or CSV logging.
-
----
+restart replays nothing. Sends are retried with backoff and never raise.
 
 ## Where data is stored
 
@@ -543,11 +496,11 @@ them. No database.
 
 | File | Contents |
 |---|---|
-| `signals.csv` | One row per signal; `status` updated in place. Carries `mode`, `signal_timeframe`, `confirmation_timeframes`, `threshold_used` and `score` so research and standard candidates can be separated later |
-| `evaluations.csv` | **Every** evaluated candle: all nine sub-scores, regime, spread, decision (`BUY`/`SELL`/`NO_SIGNAL`/`NEAR_SIGNAL`), rejection reason, mode, timeframe, threshold used, near-signal flag, plus 23 raw `f_*` feature columns |
-| `outcomes.csv` | One row per closed signal: result, exit level, R multiple, duration, MFE/MAE, plus `mode`, `timeframe`, `score` and `threshold_used` carried through from the signal |
+| `signals.csv` | One row per scalp; `status` updated in place. Carries the full geometry and cost at signal time: `spread_points`, `cost_pips`, `cost_r`, `sl_pips`, `tp1/2/3_pips`, `atr`, `rr1-3`, `net_rr1-3`, `expected_hold` |
+| `evaluations.csv` | **Every** evaluated M1 candle: all nine sub-scores, regime, spread, decision (`BUY`/`SELL`/`NO_SIGNAL`/`NEAR_SIGNAL`), rejection reason, threshold used, near-signal flag, plus **41** raw `f_*` feature columns including the M1 microstructure block (`atr_pips`, `spread_pips`, `cost_pips`, `atr_to_cost`, `velocity_pips_per_min`, `acceleration`, `micro_range_pips_5/15`, `dist_to_high/low_5_pips`, `close_location`, `minute_of_hour`, `hour_of_day`) |
+| `outcomes.csv` | One row per closed scalp: result (incl. `TIMEOUT`), exit level, **`raw_r` and `net_r`**, `cost_r`, `spread_points`, `minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_price`/`mae_price`, `mfe_pips`/`mae_pips`, `timeout`, `ambiguous_bars` |
 | `system_log.txt` | Rotating log (5 MB × 3) |
-| `state.json` | `last_processed_candles` (per timeframe), `last_signal_id`, `last_signal_time`, and a `runtime` section holding the live Telegram-controlled settings |
+| `state.json` | `last_processed_candles` (the M1 marker), `last_signal_id`, `last_signal_time`, and a `runtime` section holding the live Telegram-controlled settings |
 
 `signals.csv` is deliberately small (a handful of rows per day) so it can be held
 in memory and rewritten on status changes. `evaluations.csv` is the large one and
@@ -564,75 +517,80 @@ vector the engine saw, and `outcomes.csv` joins to it via `signal_id` to supply
 the label. A future V2 could train
 
 ```
-features → P(setup succeeds) → probability filter → final signal
+M1 features → P(move clears costs within the holding window) → filter → signal
 ```
+
+That is the exact question a future model should answer: *given these M1
+conditions, how likely is a move large enough to clear the spread, slippage and
+commission before the holding window expires?* The feature vector and the
+labelled outcome (`net_r`, `minutes_to_tp1`, `timeout`) are both already stored.
 
 V1 deliberately contains **no** machine learning: it is transparent and
 deterministic, and the same inputs always give the same outputs.
 
 ---
 
-## Outcome tracking and the R model
+## Outcome tracking, timeout and the R model
 
-A signal is modelled as **three equal partials** taken at TP1/TP2/TP3. After TP1
-is reached the stop moves to breakeven (`MOVE_SL_TO_BREAKEVEN_AFTER_TP1`). The R
-multiple is the size-weighted sum of realised parts plus the remaining size
-marked out at the exit:
+A signal is modelled as **three equal partials** at TP1/TP2/TP3. After TP1 the
+stop moves to breakeven (`MOVE_SL_TO_BREAKEVEN_AFTER_TP1`).
 
-| Path | R |
-|---|---|
-| Stopped out before TP1 | **−1.00** |
-| TP1, then stopped at breakeven | **+0.33** |
-| TP1, TP2, then breakeven | **+0.93** |
-| All three targets | **+1.87** |
-| Expired after `SIGNAL_EXPIRY_CANDLES` | marked out at that candle's close |
+**Every scalp closes.** If it has not reached a target or the stop within
+`MAX_HOLDING_CANDLES` minutes it is marked to market and recorded as `TIMEOUT`.
+Nothing sits "active" indefinitely.
 
-Two rules keep this honest:
+| Path | RAW R | NET R (cost 0.6R) |
+|---|---|---|
+| Stopped before TP1 | −1.00 | −1.60 |
+| TP1, then breakeven | +0.33 | −0.27 |
+| TP1, TP2, then breakeven | +0.93 | +0.33 |
+| All three targets | +1.87 | +1.27 |
+| Timed out flat | ~0.00 | −0.60 |
+
+Note the second row: a trade that *reaches its first target* still loses money.
+That is the arithmetic the cost model exists to make visible.
+
+Because scalps resolve in minutes, the record carries **when**, not only
+whether: `minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_r`/`mae_r`,
+`mfe_pips`/`mae_pips`, `timeout`, and `ambiguous_bars`.
+
+### Rules that keep it honest
 
 * **A signal cannot trade against its own candle.** Tracking starts on the
   candle *after* the signal candle, because the entry is that candle's close.
-* **Ambiguous candles are resolved pessimistically.** When one M5 candle touches
-  both the next target and the stop, OHLC cannot say which came first. Live, the
-  M1 feed is replayed to resolve the order; when that is unavailable (always, in
-  a backtest) the system assumes **the stop was hit first**.
-* **A breakeven stop only activates on the next candle.** Activating it inside
-  the same bar that reached TP1 would stop out every winner at +0.33R, since the
-  bar's low may well have occurred before the target was tagged.
-
-`tp_hits` in `outcomes.csv` records how many targets were reached, so TP1/TP2/TP3
-hit rates stay meaningful even when the final `result` is `SL_HIT` at breakeven.
-
----
+* **Ambiguous candles.** When one M1 candle trades through both the next target
+  and the stop, OHLC cannot say which came first. Live, the raw **tick** feed is
+  replayed to resolve the order; when ticks are unavailable — always, in a
+  backtest — the system assumes **the stop was hit first**. At scalping
+  distances this is a large systematic penalty, which is why the live path
+  bothers with ticks and why live and backtested outcomes are not strictly
+  comparable.
+* **A breakeven stop activates only on the next candle**, since the bar's low
+  may well have occurred before the target was tagged.
 
 ## Backtesting
 
-Feed a CSV of M5 candles; M15 and H1 are derived by resampling, so one file is
-enough.
+Feed a CSV of **M1** candles; the M5 context is resampled from the same file.
 
 ```bash
-python backtest.py --data history/XAUUSD_M5.csv
-python backtest.py --data history/XAUUSD_M5.csv --start 2024-01-01 --end 2024-06-30
-python backtest.py --data history/XAUUSD_M5.csv --spread 25   # simulate a fixed spread
-python backtest.py --data history/XAUUSD_M5.csv --mode RESEARCH
-python backtest.py --data history/XAUUSD_M5.csv --timeframe M15   # hierarchy follows
+python backtest.py --data history/XAUUSD_M1.csv
+python backtest.py --data history/XAUUSD_M1.csv --spread 6      # raw/ECN account
+python backtest.py --data history/XAUUSD_M1.csv --start 2024-01-01 --end 2024-01-31
 ```
 
 Required columns: `time, open, high, low, close, tick_volume`
 (`date`/`datetime`/`timestamp` and `volume`/`vol` are accepted as aliases).
-Export from MT5 with *Tools → History Center*, or *View → Symbols → Bars*.
 
-**You need roughly 2,900 M5 candles of warm-up** (about 10 trading days) before
-the first signal can be produced, because the H1 view needs 220 closed H1 candles
-for its 200-period EMA. The backtester reports the first bar it actually
-evaluated.
+A backtest has no live quote, so **every trade is charged
+`ASSUMED_SPREAD_POINTS`** unless `--spread` overrides it. It never trades for
+free. It also has no tick feed, so every ambiguous candle is scored
+pessimistically — the backtest is the conservative one.
 
-Outputs `backtest_signals.csv`, `backtest_outcomes.csv` and
-`backtest_evaluations.csv`, then prints the performance report.
+Warm-up is about 1,000 M1 candles (the M5 context needs 150 closed candles).
+Expect roughly 50 bars/second; a day of M1 data is ~1,440 bars.
 
-Expect roughly **30-40 bars/second**; a full year of M5 data takes about half an
-hour and prints a progress line with an ETA.
-
----
+`python make_synthetic_history.py` generates an M1 file for smoke-testing the
+plumbing. It is **not** real data.
 
 ## Walk-forward testing
 
@@ -659,51 +617,46 @@ overfitting.
 
 ```bash
 python performance.py
-python performance.py --signals data/signals.csv --outcomes data/outcomes.csv
 ```
 
-Reports overall expectancy plus breakdowns by direction, session, regime and
-confidence band.
+The report leads with the **after-costs** block, because on a scalp the raw
+numbers are close to meaningless:
 
-**How to read it:**
-
-* **Average R is the headline number.** It is the expectancy per signal. Positive
-  and stable beats a high win rate.
-* **Profit factor** = gross R won ÷ gross R lost. Below 1.0 loses money.
-* **Max drawdown (in R)** tells you the worst peak-to-trough run — this is what
-  determines whether a strategy is survivable, not the average.
-* **Win rate is the least informative statistic here.** With a 1.0/1.8/2.8R
-  ladder, 45% winners with good R can beat 70% winners with poor R.
-* **Sample size dominates.** Fewer than ~100 closed signals tells you almost
-  nothing; treat 30 signals as noise, not evidence.
-* Check the breakdowns for concentration: if all the profit comes from one
-  session or one regime, that is a fragility, not an edge.
-
-Run at least a few weeks of live paper signals before drawing any conclusion.
-Backtests cannot model slippage, requotes, or news-driven gaps.
-
----
+* **Average NET R is the headline.** It is the expectancy per scalp after
+  spread, slippage and commission. Positive and stable is the only thing that
+  matters.
+* **Compare it with average RAW R.** The gap is what you are paying to trade. If
+  the raw number is positive and the net one is negative, the strategy has no
+  edge — it has a spread bill.
+* **Net win rate ≠ raw win rate.** A trade that reaches TP1 and then stops at
+  breakeven is a raw "win" and a net loss.
+* **Timeout rate** tells you whether the holding window fits the setup. A high
+  rate means scalps are being cut mid-move; a near-zero rate with a high SL rate
+  means the stop is too tight for the noise.
+* **`minutes_to_tp1`** is the most useful single diagnostic: if the median is
+  close to the holding limit, the window is too short.
+* **Score bands** answer whether a higher score actually produced a better
+  outcome. Do not assume it did — measure.
+* **Sample size dominates.** Fewer than ~200 closed scalps tells you very
+  little.
 
 ## Calibration
 
-**Read this before changing the thresholds.**
+**Read this before changing the threshold.**
 
-The score is an additive weighted sum of nine components, several of which are
-*event driven* — the liquidity engine only scores when a sweep actually happens,
-structure only scores a CHoCH when character actually changes. Those events
-rarely all coincide, so in practice the raw score distribution on XAUUSD M5 peaks
-in the low 80s rather than running to 100: the median bar scores around 47, the
-99th percentile around 76.
+The score is an additive weighted sum of nine components, several of them
+event-driven (a liquidity sweep either happened or it did not). Those events
+rarely coincide, so the distribution does not run to 100 — on the synthetic M1
+data the median candle scores about 45 and the 99th percentile about 71.
 
-The shipped thresholds keep the **structure** of the nominal 90/82/75 confidence
-bands (very strong / strong / moderate, regime-adaptive) but use the values the
-engine's actual distribution supports (80/72/66, base threshold 72). These were
-derived **from the score distribution alone, never from backtest profitability**.
+`SCALP_THRESHOLD` defaults to **68**: high enough to produce candidates without
+emitting one every other candle. On M1 there are 1,440 candles a day, so a
+threshold a few points too low buries the useful setups in noise.
 
-To re-derive them for your own broker's data:
+To re-derive it from your own broker's data:
 
 ```bash
-BASE_THRESHOLD=1 python backtest.py --data history/XAUUSD_M5.csv
+SCALP_THRESHOLD=40 python backtest.py --data history/XAUUSD_M1.csv
 python - <<'EOF'
 import pandas as pd
 d = pd.read_csv("data/backtest_evaluations.csv")
@@ -713,11 +666,12 @@ print(best.quantile([0.5, 0.9, 0.95, 0.99, 0.995]))
 EOF
 ```
 
-Set `BASE_THRESHOLD` near the 95th-99th percentile depending on how selective you
-want to be, and scale the regime thresholds around it in the same proportions.
-**Do not** tune thresholds by watching the P&L go up — that is how you overfit.
+Set the threshold near the 95th–99th percentile depending on how selective you
+want to be. **Do not tune it by watching the P&L go up** — that is how you
+overfit, and the evaluation set is the same data.
 
----
+The weights and target multiples carry the same warning: they were chosen from
+reasoning about the holding period, not from results.
 
 ## Timezones
 
@@ -761,9 +715,9 @@ structurally rather than by convention, and asserted by tests.
    and every structure/liquidity/S-R calculation goes through it.
    `test_confirmed_swings_do_not_repaint` asserts a pivot known at bar N is still
    present and unchanged at bar N+k.
-3. **Higher timeframes are cut by close time.** In the backtester an H1 candle
-   becomes visible only once its *close* time is at or before the M5 candle's
-   close time. `test_backtester_never_shows_an_unclosed_higher_timeframe_candle`
+3. **The context timeframe is cut by close time.** In the backtester an M5
+   candle becomes visible only once its *close* time is at or before the M1
+   candle's close time. `test_backtester_never_shows_an_unclosed_context_candle`
    asserts it.
 4. **Indicators are causal.** Every function in `src/indicators.py` computes bar
    *i* from bars `0..i` only. That is what lets the backtester pre-compute
@@ -773,10 +727,11 @@ structurally rather than by convention, and asserted by tests.
 5. **The cooldown context ignores the future.** `build_gate_state` discards any
    signal dated after the bar being evaluated.
 6. **Outcome tracking starts on the next candle**, since the entry is the signal
-   candle's close.
-7. **One evaluation per candle.** `state.json` records the last processed candle
-   open time; a candle can never be evaluated twice, so a signal cannot be
-   duplicated.
+   candle's close. Tick data used to resolve ambiguity is filtered to the bar's
+   own minute, so a later tick cannot decide an earlier candle.
+7. **One evaluation per candle.** `state.json` records the last processed M1
+   candle open time; a candle can never be evaluated twice, so a signal cannot
+   be duplicated.
 
 ---
 
@@ -786,105 +741,106 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-252 tests covering indicator correctness (against reference implementations),
-causality and no-repaint, score aggregation and weight reconfiguration,
-confidence bands, adaptive thresholds, bull/bear separation, spread, session,
-cooldown and duplicate prevention, fakeout rules, SL modes and clamping, TP
-ladder ordering and pull-back, R:R arithmetic, the full signal lifecycle,
-outcome scoring, CSV creation/append/schema-change handling, `state.json`
-round-trip and corruption tolerance, Telegram formatting (no network), and the
-backtester's no-lookahead guarantees.
+216 tests covering indicator correctness and causality, no-repaint swings,
+score aggregation and weight renormalisation, the adaptive threshold, bull/bear
+separation, the spread and **net** R:R gates, the cost model, target geometry
+(ATR scaling, pip floors, cost floors, proportional lifting, ordering, exact
+rounded pricing), timeout behaviour, milestone timing and excursions,
+pessimistic and tick-resolved ambiguous candles, the full signal lifecycle,
+CSV creation/append/schema-change handling, `state.json` round-trip and
+corruption tolerance, Telegram formatting and every panel control, duplicate
+prevention, restart safety, and the backtester's no-lookahead guarantees.
 
-Runtime is about 90 seconds — the end-to-end backtest tests dominate it.
-
----
+Runtime is about 100 seconds.
 
 ## Honest assessment
 
-**No claim is made that this system is profitable.** It has not been tested on
-real XAUUSD history. The repository ships `make_synthetic_history.py`, which
-generates a regime-switching random walk used only to exercise the code paths:
+**The measured results are negative after costs.** This is not a hedge — it is
+the finding.
 
-```bash
-python make_synthetic_history.py
-python backtest.py --data history/XAUUSD_M5_synthetic.csv
-```
+Backtested on 30,000 synthetic M1 candles (~20 trading days), charging spread
+plus 2+2 points of slippage:
 
-Results on synthetic data are meaningless as evidence of edge.
+| | spread 6 pts (raw/ECN) | spread 20 pts (retail) |
+|---|---|---|
+| Round-trip cost | 1.0 pip | 2.4 pips |
+| Signals | 348 | 42 (shorter slice) |
+| Median TP ladder | 1.6 / 3.6 / 6.0 pips | 3.6 / 6.5 / 10.9 pips |
+| Median stop | 2.9 pips | 4.0 pips |
+| Median TP2 R:R | 1.26R raw → **0.94R net** | 1.62R raw → **1.02R net** |
+| **Raw** win rate | 58.0% | 52.4% |
+| **Raw** expectancy | −0.090R | +0.033R |
+| **Net** win rate | 24.4% | 23.8% |
+| **Net** expectancy | **−0.518R** | **−0.567R** |
+| Median hold | 2 min | 15 min (64% timed out) |
 
-The walk-forward run on that synthetic data is instructive precisely because it
-looks *bad*:
+Read the two win-rate rows together. At a 20-point spread the strategy wins
+52% of the time and makes a *positive raw* expectancy — and still loses
+0.567R per trade. The gap is the spread.
 
-```
-segment          bars  signals  closed   win%    avgR   totalR     PF   maxDD
-IN_SAMPLE        4500       19      19   63.2   0.540    10.27   2.47    2.67
-VALIDATION       2250       13      13   76.9   0.422     5.49   3.48    1.00
-OUT_OF_SAMPLE    2250       19      18   44.4  -0.219    -3.95   0.58    5.64
-```
+The mechanism is visible in the outcome mix: at the tighter spread 58% of
+scalps touch TP1, but the breakeven stop then converts most of them into ~0R
+while the losers pay the full −1R *plus* costs. That asymmetry is what kills
+small-target scalping, and it is why the report leads with NET.
 
-Positive in-sample, positive in validation, **negative out-of-sample**, on ~50
-signals total. That is exactly the pattern you must learn to distrust, and it is
-what a small sample on near-random data should look like. Do not read the
-in-sample numbers as encouraging.
+Two further caveats:
 
-Before trusting this system with anything: run it on **real** multi-year XAUUSD
-M5 data, then paper-trade the live signals for weeks, and judge it on expectancy
-and drawdown over a few hundred signals.
+* **This is synthetic data.** A regime-switching random walk has no
+  microstructure, no order flow and no news. Results on it say nothing about
+  real gold — they only prove the machinery measures what it claims to.
+* **The 1–3 pip concept mostly does not survive contact with the cost model.**
+  At a 20-point spread the cost floor lifts TP1 to 3.6 pips, four times the
+  original concept. Only on a raw/ECN spread does a 1.6-pip first target
+  survive at all.
+
+Before trusting any of this: run it on **real** multi-month XAUUSD M1 data with
+your broker's actual spreads, then paper-trade the live signals for weeks, and
+judge on NET expectancy over a few hundred scalps.
 
 ---
 
 ## Known limitations
 
-* **Windows-only live mode** — the `MetaTrader5` package has no Linux/macOS build.
-* **Tick volume, not real volume** — MT5 forex/CFD feeds report tick counts, a
-  proxy for activity, not traded contracts.
-* **Backtests cannot model spread, slippage or requotes.** `--spread` applies a
-  constant, which is optimistic: real spreads widen exactly when the volatility
-  and news filters matter most.
-* **Intrabar order is unknown in backtests.** Without an M1 feed, any candle that
-  touches both target and stop is scored as a stop. Live tracking replays M1 and
-  is more accurate, so **live and backtested outcomes are not strictly
-  comparable**.
-* **Session windows are fixed UTC and do not follow DST.**
-* **Weekend gaps** — gold gaps over the weekend; a stop can be jumped, which this
-  model scores as a clean stop-out at the stop price. Real fills would be worse.
-* **The score scale is compressed** (see [Calibration](#calibration)); the
-  confidence number is a relative ranking, not a probability.
-* **Single symbol, single timeframe.** No portfolio logic, no correlation
-  awareness, no position sizing — it is a signal system, not a trading system.
-* **Backtest speed** — about 30-40 bars/second; multi-year runs take a while.
-* **No news or economic-calendar awareness.** NFP and CPI releases are exactly
-  when gold behaves worst for technical setups, and the engine cannot see them.
+* **Live mode is Windows-only** — the `MetaTrader5` package has no Linux/macOS
+  build. Everything else runs anywhere.
+* **Backtests cannot use ticks**, so every ambiguous candle is scored as a stop.
+  Live tracking replays ticks and will differ — **live and backtested outcomes
+  are not directly comparable**.
+* **Slippage is an assumption, not a measurement.** The defaults (2+2 points)
+  are plausible for liquid hours and optimistic around news.
+* **The cost model deducts cost once per trade**, not per partial. With three
+  partials the true cost is somewhat higher, so NET R here is mildly optimistic.
+* **Tick fetching adds MT5 load.** The buffer is incremental (about a minute of
+  ticks per poll) but a slow terminal may lag; set
+  `USE_TICKS_FOR_AMBIGUOUS_CANDLES=false` to fall back to pessimistic scoring.
+* **No news or economic-calendar awareness.** Scalping through an NFP release is
+  exactly where the spread and slippage assumptions break down.
+* **Session windows are fixed UTC** and do not follow DST.
+* **`assumed_spread_points` is a single number.** Real spreads vary by hour and
+  widen precisely when volatility makes setups look attractive.
+* **Weekend gaps** can jump the stop; the model scores that as a clean stop-out.
+* Everything remains **paper only** — no order execution exists anywhere.
+
+## Recommended next steps
+
+1. **Get real M1 data with recorded spreads.** Everything below is premature
+   until the numbers above are re-measured on real ticks. Record the live spread
+   per candle rather than assuming one.
+2. **Re-examine the breakeven rule.** It is the largest single driver of the raw
+   → net collapse. Test holding the original stop, or moving it only after TP2.
+3. **Re-examine the holding window.** 64% of scalps timed out at the wider
+   spread. `minutes_to_tp1` in the outcomes file tells you what the window
+   should be — but tune it on one period and verify on another.
+4. **Per-partial cost accounting**, so NET R stops being mildly optimistic.
+5. **An ML probability filter.** `evaluations.csv` + `outcomes.csv` already form
+   the training set, and the label (`net_r`) is already cost-adjusted. It would
+   sit *after* the deterministic engine as a veto, never replacing it.
+6. **Spread-aware scheduling** — only signal in the hours where the recorded
+   spread historically supports the target size.
+7. **Economic-calendar filter** around high-impact USD releases.
 
 ---
 
-## Recommended V2 improvements
-
-1. **Validate on real data first.** Multi-year XAUUSD M5 history, walk-forward,
-   then extended paper trading. Everything below is premature until this is done.
-2. **ML probability filter.** `evaluations.csv` + `outcomes.csv` already form a
-   training set. A gradient-boosted model estimating P(TP1 before SL) would sit
-   *after* the deterministic engine as a veto, never replacing it — keeping the
-   system explainable.
-3. **Economic-calendar filter.** Suppress signals in a window around
-   high-impact USD releases.
-4. **Spread and slippage modelling in the backtester**, using recorded live
-   spreads by hour of day rather than a constant.
-5. **M1-based backtesting** to resolve intrabar order, closing the gap between
-   backtested and live outcomes.
-6. **Dynamic partial sizing** — the current fixed thirds are a modelling choice,
-   not an optimised one.
-7. **Multi-symbol support** with correlation awareness (XAUUSD, DXY, US10Y).
-8. **A small dashboard** (the spec correctly excludes it from V1) reading the
-   CSVs — equity curve, live status, rejection-reason histogram.
-9. **Rejection-reason analytics.** The distribution in `evaluations.csv` shows
-   which filter dominates; if one rejects 95% of candidates, either it is
-   miscalibrated or the others are redundant.
-10. **Regime-specific parameters** — the thresholds already adapt, but SL/TP
-    geometry does not. Trends and ranges want different ladders.
-
----
-
-*This software produces trading signals for research and paper-testing. It is not
-financial advice, and it does not execute trades. Trading leveraged instruments
-carries substantial risk of loss.*
+*This software produces trading signals for research and paper-testing. It is
+not financial advice, and it does not execute trades. Trading leveraged
+instruments carries substantial risk of loss.*

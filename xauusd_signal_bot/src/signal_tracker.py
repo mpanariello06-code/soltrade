@@ -51,7 +51,16 @@ import pandas as pd
 from .filters import GateState
 from .logger import get_logger
 from .market_data import timeframe_minutes
-from .utils import as_utc, atomic_write_json, fnum, iso, now_utc, parse_iso, read_json
+from .utils import (
+    as_utc,
+    atomic_write_json,
+    fnum,
+    iso,
+    now_utc,
+    parse_iso,
+    read_json,
+    safe_div,
+)
 
 LOGGER = get_logger("tracker")
 
@@ -62,10 +71,10 @@ STATUS_TP1 = "TP1_HIT"
 STATUS_TP2 = "TP2_HIT"
 STATUS_TP3 = "TP3_HIT"
 STATUS_SL = "SL_HIT"
-STATUS_EXPIRED = "EXPIRED"
+STATUS_TIMEOUT = "TIMEOUT"
 STATUS_INVALIDATED = "INVALIDATED"
 
-TERMINAL_STATUSES = (STATUS_TP3, STATUS_SL, STATUS_EXPIRED, STATUS_INVALIDATED)
+TERMINAL_STATUSES = (STATUS_TP3, STATUS_SL, STATUS_TIMEOUT, STATUS_INVALIDATED)
 #: milestone ordering used to decide which alerts are newly due
 STATUS_RANK = {
     STATUS_ACTIVE: 0,
@@ -73,7 +82,7 @@ STATUS_RANK = {
     STATUS_TP2: 2,
     STATUS_TP3: 3,
     STATUS_SL: 4,
-    STATUS_EXPIRED: 4,
+    STATUS_TIMEOUT: 4,
     STATUS_INVALIDATED: 4,
 }
 
@@ -81,19 +90,27 @@ SIGNAL_COLUMNS: Tuple[str, ...] = (
     "signal_id", "timestamp", "symbol", "timeframe", "direction",
     "entry", "sl", "tp1", "tp2", "tp3",
     "confidence", "bullish_score", "bearish_score", "regime", "status",
-    # operating context: which mode/timeframe/threshold produced this candidate
-    "mode", "signal_timeframe", "confirmation_timeframes", "threshold_used", "score",
-    "session", "risk_reward", "rr1", "rr2", "rr3", "sl_mode",
-    "confidence_label", "reason_summary", "status_updated_at", "tp_hits",
-    "mfe_r", "mae_r",
+    "mode", "threshold_used", "score", "session",
+    # scalping geometry and costs, recorded at signal time
+    "spread_points", "cost_pips", "cost_r", "sl_pips", "tp1_pips", "tp2_pips", "tp3_pips",
+    "atr", "risk_reward", "rr1", "rr2", "rr3", "net_rr1", "net_rr2", "net_rr3",
+    "sl_mode", "expected_hold", "confidence_label", "reason_summary",
+    "status_updated_at", "tp_hits", "mfe_r", "mae_r",
 )
 
 OUTCOME_COLUMNS: Tuple[str, ...] = (
     "signal_id", "entry", "result", "exit_level", "R_multiple", "duration", "timestamp",
     "symbol", "direction", "signal_time", "bars", "tp_hits", "confidence", "regime",
     "session", "mfe_r", "mae_r",
-    # carried through from the signal so outcomes can be grouped without a join
     "mode", "timeframe", "score", "threshold_used",
+    # --- scalping detail -------------------------------------------------- #
+    # RAW R is price movement only; NET R is what is left after the spread,
+    # slippage and commission assumed at signal time.  Never quote RAW alone.
+    "raw_r", "net_r", "cost_r", "spread_points",
+    "minutes_to_tp1", "minutes_to_tp2", "minutes_to_tp3", "minutes_to_sl",
+    "bars_to_tp1", "bars_to_tp2", "bars_to_tp3", "bars_to_sl",
+    "mfe_price", "mae_price", "mfe_pips", "mae_pips",
+    "timeout", "ambiguous_bars",
 )
 
 
@@ -189,17 +206,37 @@ def rewrite_csv(path: Path, rows: Iterable[Dict[str, Any]], fieldnames: Sequence
 # --------------------------------------------------------------------------- #
 @dataclass
 class Progress:
-    """Deterministic state of one signal given the candles after it."""
+    """Deterministic state of one signal given the candles after it.
+
+    Scalps resolve in minutes, so the record carries *when* each milestone was
+    reached, not only whether it was - that timing is the most useful feature a
+    future model could learn from.
+    """
 
     status: str = STATUS_ACTIVE
     tp_hits: int = 0
     closed: bool = False
     exit_price: Optional[float] = None
     exit_time: Optional[datetime] = None
-    r_multiple: float = 0.0
+    r_multiple: float = 0.0          #: RAW R - price movement only
+    net_r: float = 0.0               #: R after the round-trip cost
+    cost_r: float = 0.0
     bars: int = 0
     mfe_r: float = 0.0
     mae_r: float = 0.0
+    mfe_price: float = 0.0
+    mae_price: float = 0.0
+    bars_to_tp1: Optional[int] = None
+    bars_to_tp2: Optional[int] = None
+    bars_to_tp3: Optional[int] = None
+    bars_to_sl: Optional[int] = None
+    candle_minutes: int = 1
+    timed_out: bool = False
+    ambiguous_bars: int = 0
+
+    def minutes_to(self, bars: Optional[int]) -> str:
+        """Milestone timing in minutes, or "" when it was never reached."""
+        return "" if bars is None else str(bars * self.candle_minutes)
 
 
 def _resolve_touch_order(
@@ -275,11 +312,27 @@ class PositionState:
         self.bars = 0
         self.mfe = 0.0
         self.mae = 0.0
+        self.mfe_price = self.entry
+        self.mae_price = self.entry
         self.status = STATUS_ACTIVE
         self.closed = False
         self.exit_price: Optional[float] = None
         self.exit_time: Optional[datetime] = None
         self.r_multiple = 0.0
+
+        # A scalp lives for minutes, so *when* each milestone was reached is as
+        # informative as whether it was.  Bars elapsed from the signal candle.
+        self.bars_to_tp: List[Optional[int]] = [None, None, None]
+        self.bars_to_sl: Optional[int] = None
+        self.timed_out = False
+        self.ambiguous_bars = 0      #: candles where TP and SL both traded
+
+        # Cost is fixed at signal time and carried through, so NET R never
+        # depends on what the spread happens to be when the trade closes.
+        self.cost_r = fnum(signal_row.get("cost_r"), 0.0)
+        if self.cost_r <= 0 and self.risk > 0:
+            spread = signal_row.get("spread_points")
+            self.cost_r = safe_div(config.round_trip_cost(spread), self.risk)
 
     @property
     def valid(self) -> bool:
@@ -309,10 +362,14 @@ class PositionState:
             self.pending_stop = None
 
         high, low, close = fnum(bar["high"]), fnum(bar["low"]), fnum(bar["close"])
-        favourable = self.sign * ((high if self.direction == "BUY" else low) - self.entry) / self.risk
-        adverse = self.sign * ((low if self.direction == "BUY" else high) - self.entry) / self.risk
-        self.mfe = max(self.mfe, favourable)
-        self.mae = min(self.mae, adverse)
+        best = high if self.direction == "BUY" else low
+        worst = low if self.direction == "BUY" else high
+        favourable = self.sign * (best - self.entry) / self.risk
+        adverse = self.sign * (worst - self.entry) / self.risk
+        if favourable > self.mfe:
+            self.mfe, self.mfe_price = favourable, best
+        if adverse < self.mae:
+            self.mae, self.mae_price = adverse, worst
 
         while True:
             next_target = self.targets[self.tp_hits] if self.tp_hits < len(self.targets) else None
@@ -324,6 +381,7 @@ class PositionState:
                 sl_touched = high >= self.current_stop
 
             if tp_touched and sl_touched:
+                self.ambiguous_bars += 1
                 first = _resolve_touch_order(
                     intrabar, bar_time, self.candle_minutes, next_target, self.current_stop, self.direction
                 )
@@ -333,6 +391,7 @@ class PositionState:
                     sl_touched = False
 
             if sl_touched:
+                self.bars_to_sl = self.bars
                 exit_r = self.sign * (self.current_stop - self.entry) / self.risk
                 self._close(STATUS_SL, self.current_stop, bar_time, self.realised + self.remaining * exit_r)
                 return True
@@ -340,6 +399,7 @@ class PositionState:
             if tp_touched:
                 self.realised += self.fractions[self.tp_hits] * self.rr[self.tp_hits]
                 self.remaining = max(0.0, self.remaining - self.fractions[self.tp_hits])
+                self.bars_to_tp[self.tp_hits] = self.bars
                 self.tp_hits += 1
                 if self.tp_hits == 1 and self.config.move_sl_to_breakeven_after_tp1:
                     self.pending_stop = self.entry
@@ -354,9 +414,12 @@ class PositionState:
                 continue
             break
 
-        if self.bars >= self.config.signal_expiry_candles:
+        if self.bars >= self.config.max_holding_candles:
+            # A scalp that has not resolved inside the holding window is closed
+            # at market; it must never sit "active" indefinitely.
             exit_r = self.sign * (close - self.entry) / self.risk
-            self._close(STATUS_EXPIRED, close, bar_time, self.realised + self.remaining * exit_r)
+            self.timed_out = True
+            self._close(STATUS_TIMEOUT, close, bar_time, self.realised + self.remaining * exit_r)
             return True
 
         self.status = {0: STATUS_ACTIVE, 1: STATUS_TP1, 2: STATUS_TP2}.get(self.tp_hits, STATUS_ACTIVE)
@@ -377,6 +440,11 @@ class PositionState:
         self.exit_time = at_time
         self.r_multiple = round(r_multiple, 4)
 
+    @property
+    def net_r(self) -> float:
+        """R after the round-trip cost fixed at signal time."""
+        return round(self.r_multiple - self.cost_r, 4)
+
     def to_progress(self) -> "Progress":
         """Snapshot the current state as a :class:`Progress`."""
         return Progress(
@@ -386,9 +454,20 @@ class PositionState:
             exit_price=self.exit_price,
             exit_time=self.exit_time,
             r_multiple=round(self.r_multiple, 4),
+            net_r=self.net_r,
+            cost_r=round(self.cost_r, 4),
             bars=self.bars,
             mfe_r=round(self.mfe, 3),
             mae_r=round(self.mae, 3),
+            mfe_price=round(self.mfe_price, 5),
+            mae_price=round(self.mae_price, 5),
+            bars_to_tp1=self.bars_to_tp[0],
+            bars_to_tp2=self.bars_to_tp[1],
+            bars_to_tp3=self.bars_to_tp[2],
+            bars_to_sl=self.bars_to_sl,
+            candle_minutes=self.candle_minutes,
+            timed_out=self.timed_out,
+            ambiguous_bars=self.ambiguous_bars,
         )
 
 
@@ -474,7 +553,7 @@ def build_gate_state(
 
 
 def build_outcome_row(
-    signal_row: Dict[str, Any], progress: "Progress", digits: int = 2
+    signal_row: Dict[str, Any], progress: "Progress", digits: int = 2, config=None
 ) -> Dict[str, Any]:
     """Build an ``outcomes.csv`` row.  Shared by the live tracker and backtester."""
     signal_time = parse_iso(str(signal_row.get("timestamp", "")))
@@ -483,6 +562,10 @@ def build_outcome_row(
         duration_minutes = round(
             (as_utc(progress.exit_time) - signal_time).total_seconds() / 60.0, 1
         )
+    pip = float(getattr(config, "pip_value", 0.10)) if config is not None else 0.10
+    entry = fnum(signal_row.get("entry"))
+    sign = 1.0 if str(signal_row.get("direction", "")).upper() == "BUY" else -1.0
+
     return {
         "signal_id": signal_row.get("signal_id", ""),
         "entry": signal_row.get("entry", ""),
@@ -505,6 +588,24 @@ def build_outcome_row(
         "timeframe": signal_row.get("timeframe", ""),
         "score": signal_row.get("score", signal_row.get("confidence", "")),
         "threshold_used": signal_row.get("threshold_used", ""),
+        "raw_r": progress.r_multiple,
+        "net_r": progress.net_r,
+        "cost_r": progress.cost_r,
+        "spread_points": signal_row.get("spread_points", ""),
+        "minutes_to_tp1": progress.minutes_to(progress.bars_to_tp1),
+        "minutes_to_tp2": progress.minutes_to(progress.bars_to_tp2),
+        "minutes_to_tp3": progress.minutes_to(progress.bars_to_tp3),
+        "minutes_to_sl": progress.minutes_to(progress.bars_to_sl),
+        "bars_to_tp1": "" if progress.bars_to_tp1 is None else progress.bars_to_tp1,
+        "bars_to_tp2": "" if progress.bars_to_tp2 is None else progress.bars_to_tp2,
+        "bars_to_tp3": "" if progress.bars_to_tp3 is None else progress.bars_to_tp3,
+        "bars_to_sl": "" if progress.bars_to_sl is None else progress.bars_to_sl,
+        "mfe_price": round(progress.mfe_price, digits),
+        "mae_price": round(progress.mae_price, digits),
+        "mfe_pips": round(sign * (progress.mfe_price - entry) / pip, 2) if entry else "",
+        "mae_pips": round(sign * (progress.mae_price - entry) / pip, 2) if entry else "",
+        "timeout": int(bool(progress.timed_out)),
+        "ambiguous_bars": progress.ambiguous_bars,
     }
 
 
@@ -519,6 +620,7 @@ class TrackerEvent:
     event: str
     price: float
     r_multiple: Optional[float] = None
+    net_r: Optional[float] = None
 
 
 class SignalTracker:
@@ -713,7 +815,7 @@ class SignalTracker:
         for level, status in ((1, STATUS_TP1), (2, STATUS_TP2), (3, STATUS_TP3)):
             if progress.tp_hits >= level and STATUS_RANK[status] > previous_rank:
                 milestones.append((status, fnum(row.get(f"tp{level}"))))
-        if progress.closed and progress.status in (STATUS_SL, STATUS_EXPIRED, STATUS_INVALIDATED):
+        if progress.closed and progress.status in (STATUS_SL, STATUS_TIMEOUT, STATUS_INVALIDATED):
             milestones.append((progress.status, fnum(progress.exit_price)))
 
         for status, price in milestones:
@@ -724,6 +826,7 @@ class SignalTracker:
                     event=status,
                     price=price,
                     r_multiple=progress.r_multiple if final else None,
+                    net_r=progress.net_r if final else None,
                 )
             )
 
@@ -740,10 +843,13 @@ class SignalTracker:
                 row.get("signal_id"),
                 event.event,
                 event.price,
-                f"{event.r_multiple:+.2f}R" if event.r_multiple is not None else "milestone",
+                f"{event.r_multiple:+.2f}R raw / {event.net_r:+.2f}R net"
+                if event.r_multiple is not None else "milestone",
             )
             if self.notifier is not None:
-                self.notifier.send_outcome(row, event.event, event.price, event.r_multiple)
+                self.notifier.send_outcome(
+                    row, event.event, event.price, event.r_multiple, event.net_r
+                )
         return events
 
     def _persist_signals(self) -> None:
@@ -755,6 +861,6 @@ class SignalTracker:
         signal_id = str(row.get("signal_id", ""))
         if signal_id in self.outcome_ids:
             return
-        outcome = build_outcome_row(row, progress, self.config.digits)
+        outcome = build_outcome_row(row, progress, self.config.digits, self.config)
         if append_csv(self.config.outcomes_csv, outcome, OUTCOME_COLUMNS):
             self.outcome_ids.add(signal_id)

@@ -1,22 +1,23 @@
-"""XAUUSD signal engine - live paper-signal runner.
+"""XAUUSD M1 micro-scalping research runner.
 
-Connects to MetaTrader 5 for **market data only**, evaluates one signal per
-newly closed candle of the active signal timeframe, notifies Telegram and logs
-everything to CSV.
+Connects to MetaTrader 5 for **market data only**, evaluates one candidate per
+newly closed M1 candle, notifies Telegram and logs everything to CSV.
 
 This program never places, modifies or closes an order.
 
-OPERATING MODES
----------------
-``RESEARCH``     collects far more candidate setups for observation and future
-                 ML training.  Every message is labelled as research and is
-                 explicitly *not* a validated trading signal.
-``STANDARD``     the default.
-``CONSERVATIVE`` demands more confirmation than STANDARD.
+SINGLE PURPOSE
+--------------
+One timeframe (M1) and one mode (SCALPING).  The multi-timeframe selector and
+the RESEARCH/STANDARD/CONSERVATIVE modes were removed; what remains is a
+dedicated micro-scalping research system.
 
-Mode, signal timeframe, threshold, cooldown, minimum R:R, session filter and
-run state are all controllable from the Telegram panel while the process runs,
-and are persisted in ``data/state.json``.
+Threshold, holding period, cooldown, minimum R:R, session filter and run state
+are controllable from the Telegram panel while the process runs and are
+persisted in ``data/state.json``.
+
+Every reward figure is reported twice - RAW and NET of the spread, slippage and
+commission assumed at signal time.  At a target of a few pips the cost is a
+large fraction of the move, so a raw number on its own would be misleading.
 """
 
 from __future__ import annotations
@@ -25,10 +26,6 @@ import signal as os_signal
 import sys
 import time
 from datetime import date, datetime
-from typing import Optional
-
-import pandas as pd
-
 from config import Config, load_config
 from src.logger import get_logger, setup_logging
 from src.market_data import MT5_AVAILABLE, MarketData
@@ -37,7 +34,7 @@ from src.signal_engine import EVALUATION_COLUMNS, SignalEngine
 from src.signal_tracker import SignalTracker, append_csv, ensure_csv
 from src.telegram_bot import TelegramNotifier
 from src.telegram_control import TelegramController
-from src.timeframes import MODE_ICONS, micro_timeframe
+from src.timeframes import MODE_SCALPING, SIGNAL_TIMEFRAME
 from src.utils import is_weekend, iso, now_utc, parse_iso
 
 LOGGER = get_logger("main")
@@ -124,18 +121,13 @@ class SignalRunner:
                 count += 1
         return count
 
+    def open_signals(self) -> int:
+        """Scalps still being tracked."""
+        return len(self.tracker.active_signals())
+
     def connection_state(self) -> str:
         """Human-readable MT5 connection state for the panel."""
         return "CONNECTED" if self.market.connected else "DISCONNECTED"
-
-    def on_timeframe_changed(self, previous: str, current: str) -> None:
-        """Drop cached candles belonging to the previous hierarchy.
-
-        Without this, the first evaluation after a switch could mix frames from
-        the old and new confirmation sets.
-        """
-        self.market.clear_cache()
-        LOGGER.info("Signal timeframe changed %s -> %s; candle cache cleared", previous, current)
 
     def analyze_now(self):
         """Evaluate the latest **closed** candle on demand, with no side effects.
@@ -160,7 +152,7 @@ class SignalRunner:
 
     # -- dashboard ---------------------------------------------------------- #
     def _print_dashboard(self, mt5_ok: bool, telegram_ok: bool) -> None:
-        """Print the simple console dashboard (spec section 40)."""
+        """Print the startup console dashboard."""
         cfg = self.config
         state = self.runtime.describe()
         last_signal = "none yet"
@@ -171,32 +163,35 @@ class SignalRunner:
                 f"({latest.get('timestamp')}) status={latest.get('status')}"
             )
         last_candle = self.runtime.last_processed_candle()
+        cost_pips = cfg.pips(cfg.round_trip_cost(None))
         lines = [
             "=" * BANNER_WIDTH,
-            "XAUUSD SIGNAL ENGINE",
+            "XAUUSD M1 SCALPER",
             f"Status: {state['status']}" if mt5_ok else "Status: NOT CONNECTED",
             "=" * BANNER_WIDTH,
             f"MT5:      {'CONNECTED' if mt5_ok else 'DISCONNECTED'}",
             f"Telegram: {'CONNECTED' if telegram_ok else 'DISABLED / UNAVAILABLE'}",
             "",
             f"Symbol:    {cfg.symbol}",
-            f"Mode:      {MODE_ICONS.get(state['mode'], '')} {state['mode']}",
-            f"Signal TF: {state['signal_timeframe']}",
-            f"Confirm:   {state['confirmation']}",
+            f"Mode:      {MODE_SCALPING}",
+            f"Timeframe: {SIGNAL_TIMEFRAME}   Context: {state['context_timeframe']}",
             f"Threshold: {state['threshold']:.0f} (adaptive by regime)",
+            f"Max hold:  {state['max_holding_candles']} minutes",
             f"Sessions:  {', '.join(state['allowed_sessions'])}",
             f"Broker UTC offset: {cfg.mt5_server_utc_offset_hours:+.1f}h",
+            "",
+            "Assumed round-trip cost:",
+            f"  {cost_pips:.1f} pips "
+            f"(spread {cfg.assumed_spread_points:.0f} + slippage "
+            f"{cfg.slippage_points_entry:.0f}+{cfg.slippage_points_exit:.0f} pts)",
             "",
             f"Last candle: {iso(last_candle) if last_candle else 'none yet'}",
             f"Last signal: {last_signal}",
             f"Signals today: {self.signals_today()}",
             "",
-            "MODE: PAPER SIGNAL ONLY - no orders are ever sent.",
+            "PAPER TEST ONLY - no orders are ever sent.",
+            "=" * BANNER_WIDTH,
         ]
-        if state["mode"] == "RESEARCH":
-            lines.append("RESEARCH MODE: candidates are collected for study,")
-            lines.append("not validated trading signals.")
-        lines.append("=" * BANNER_WIDTH)
         print("\n".join(lines), flush=True)
 
     # -- main loop ----------------------------------------------------------- #
@@ -220,33 +215,29 @@ class SignalRunner:
             return
 
         cfg = effective_config(self.config, self.runtime)
-        timeframe = cfg.signal_timeframe
-        last_processed = self.runtime.last_processed_candle(timeframe)
+        last_processed = self.runtime.last_processed_candle()
 
-        # Cheap probe first: most polls happen between candle closes, and there
-        # is no reason to re-download several hundred candles on every one of
-        # them.  A full fetch only happens when there is a new candle to
-        # evaluate, or an open signal whose TP/SL needs checking.
-        latest = self.market.latest_closed_candle_time(cfg.symbol, timeframe)
+        # Cheap probe first: M1 closes once a minute but we poll every few
+        # seconds, so most polls have nothing new to look at.
+        latest = self.market.latest_closed_candle_time(cfg.symbol, SIGNAL_TIMEFRAME)
         has_new_candle = latest is not None and (
             last_processed is None or latest > last_processed
         )
-        has_open_signals = bool(self.tracker.active_timeframes())
+        has_open_signals = bool(self.tracker.active_signals())
         if latest is not None and not has_new_candle and not has_open_signals:
             return
 
         snapshot, reason = self.market.build_snapshot(cfg, use_cache=not has_new_candle)
         if snapshot is None:
-            # Gold does not trade at the weekend; stale data then is expected and
-            # would otherwise fill the log with warnings for two days.
+            # Gold does not trade at the weekend; stale data then is expected.
             if is_weekend(now_utc()):
                 LOGGER.debug("Snapshot unavailable (market closed): %s", reason)
             else:
                 LOGGER.warning("Snapshot unavailable: %s", reason)
             return
 
-        # 1. Outcome tracking runs even while PAUSED: an already-open signal
-        #    must still reach its TP or SL, and those alerts are not new signals.
+        # 1. Outcome tracking runs even while PAUSED: an open scalp must still
+        #    reach its target, its stop or its timeout.
         self._track_open_signals(cfg, snapshot)
 
         if not self.runtime.is_running:
@@ -254,15 +245,13 @@ class SignalRunner:
 
         candle_time = snapshot.candle_time
         if last_processed is not None and candle_time <= last_processed:
-            return  # no new closed candle on this timeframe yet
+            return  # no new closed M1 candle yet
 
-        LOGGER.info(
-            "New closed %s candle %s (close %.2f)", timeframe, iso(candle_time), snapshot.close
-        )
+        LOGGER.debug("New closed M1 candle %s (close %.2f)", iso(candle_time), snapshot.close)
         self._roll_day(candle_time)
 
         # 2. evaluate the new candle
-        gate = self.tracker.gate_state(candle_time, timeframe)
+        gate = self.tracker.gate_state(candle_time, SIGNAL_TIMEFRAME)
         evaluation = self.engine.evaluate(snapshot, gate, config=cfg)
         append_csv(self.config.evaluations_csv, evaluation.to_row(), EVALUATION_COLUMNS)
 
@@ -271,57 +260,39 @@ class SignalRunner:
                 evaluation.signal.direction, candle_time, snapshot.close
             )
             self.tracker.record_signal(evaluation.signal)
-        else:
-            if evaluation.near_signal:
-                LOGGER.info(
-                    "NEAR SIGNAL | best %.1f vs threshold %.1f | %s",
-                    evaluation.best_score, evaluation.threshold, evaluation.rejection_reason,
-                )
-                if self.runtime.near_signal_alerts:
-                    self.notifier.send_near_signal(evaluation)
+        elif evaluation.near_signal:
             LOGGER.info(
-                "No signal | bull %.1f / bear %.1f | %s | %s",
-                evaluation.card.bullish_score if evaluation.card else 0.0,
-                evaluation.card.bearish_score if evaluation.card else 0.0,
-                evaluation.regime or "-",
-                evaluation.rejection_reason or "-",
+                "NEAR SIGNAL | best %.1f vs threshold %.1f | %s",
+                evaluation.best_score, evaluation.threshold, evaluation.rejection_reason,
             )
+            if self.runtime.near_signal_alerts:
+                self.notifier.send_near_signal(evaluation)
 
-        # 3. remember the candle so it is never processed twice, per timeframe
-        self.runtime.mark_candle_processed(timeframe, iso(candle_time))
+        # 3. remember the candle so it is never processed twice
+        self.runtime.mark_candle_processed(SIGNAL_TIMEFRAME, iso(candle_time))
 
     def _track_open_signals(self, cfg: Config, snapshot) -> None:
-        """Advance every open signal using candles of *its own* timeframe.
+        """Advance every open scalp against the newest M1 candles.
 
-        Signals raised on a timeframe the engine has since moved away from are
-        still tracked to completion - switching timeframe must not orphan them.
+        Ticks are replayed where available so that a candle which traded through
+        both the target and the stop is resolved by what actually happened
+        first, rather than by the pessimistic default.  At this scale that
+        distinction decides a meaningful share of outcomes.
         """
-        active = self.tracker.active_timeframes()
-        if not active:
+        if not self.tracker.active_signals():
             return
-
-        for timeframe in active:
+        ticks = None
+        if cfg.use_ticks_for_ambiguous_candles:
             try:
-                if timeframe == cfg.signal_timeframe:
-                    candles, intrabar = snapshot.m5, snapshot.m1
-                else:
-                    candles = self.market.get_candles(
-                        cfg.symbol, timeframe, cfg.candles_signal, use_cache=True
-                    )
-                    if candles.empty:
-                        continue
-                    intrabar = self._micro_candles(cfg, timeframe)
-                self.tracker.update(candles, intrabar, timeframe=timeframe)
-            except Exception as exc:  # noqa: BLE001 - one bad timeframe must not stop the rest
-                LOGGER.exception("Outcome tracking failed for %s: %s", timeframe, exc)
-
-    def _micro_candles(self, cfg: Config, timeframe: str) -> Optional[pd.DataFrame]:
-        """Finer candles used to resolve ambiguous TP/SL bars, if any exist."""
-        micro = micro_timeframe(timeframe)
-        if not micro:
-            return None
-        frame = self.market.get_candles(cfg.symbol, micro, cfg.candles_micro, use_cache=True)
-        return None if frame.empty else frame
+                ticks = self.market.refresh_tick_buffer(
+                    cfg.symbol, cfg.max_holding_candles + 2
+                )
+            except Exception as exc:  # noqa: BLE001 - ticks are an optimisation
+                LOGGER.debug("Tick refresh failed, staying pessimistic: %s", exc)
+        try:
+            self.tracker.update(snapshot.signal_df, ticks, timeframe=SIGNAL_TIMEFRAME)
+        except Exception as exc:  # noqa: BLE001 - tracking must not kill the loop
+            LOGGER.exception("Outcome tracking failed: %s", exc)
 
     def _roll_day(self, candle_time: datetime) -> None:
         """Note the day rollover (the counter itself is derived from the CSV)."""

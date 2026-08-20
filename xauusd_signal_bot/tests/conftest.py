@@ -13,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from typing import Optional  # noqa: E402
+
 from config import Config  # noqa: E402
 from src.indicators import compute_indicators  # noqa: E402
 
@@ -21,28 +23,56 @@ def make_candles(
     count: int = 3000,
     seed: int = 7,
     drift: float = 0.0,
-    volatility: float = 0.45,
+    volatility: float = 0.16,
     start_price: float = 2300.0,
-    freq: str = "5min",
+    freq: str = "1min",
 ) -> pd.DataFrame:
-    """Build a synthetic but *valid* OHLC series (high >= max(o,c) always)."""
+    """Build a synthetic but *valid* M1 OHLC series (high >= max(o,c) always).
+
+    The default volatility gives an M1 ATR of roughly 3-4 pips, which is the
+    right order for XAUUSD - small enough that the spread genuinely matters,
+    which is what the scalping tests need to exercise.
+    """
     rng = np.random.default_rng(seed)
     steps = rng.normal(drift, volatility, count)
     close = start_price + np.cumsum(steps)
     open_ = np.concatenate([[start_price], close[:-1]])
-    upper = np.maximum(open_, close) + np.abs(rng.normal(0, volatility * 0.9, count))
-    lower = np.minimum(open_, close) - np.abs(rng.normal(0, volatility * 0.9, count))
+    upper = np.maximum(open_, close) + np.abs(rng.normal(0, volatility * 0.7, count))
+    lower = np.minimum(open_, close) - np.abs(rng.normal(0, volatility * 0.7, count))
     return pd.DataFrame(
         {
-            "time": pd.date_range("2024-03-01", periods=count, freq=freq, tz="UTC"),
+            "time": pd.date_range("2024-05-01", periods=count, freq=freq, tz="UTC"),
             "open": open_.round(2),
             "high": upper.round(2),
             "low": lower.round(2),
             "close": close.round(2),
-            "tick_volume": rng.integers(60, 1500, count).astype(float),
+            "tick_volume": rng.integers(20, 400, count).astype(float),
             "spread": 20.0,
         }
     )
+
+
+def make_bars(
+    bars, start: str = "2024-05-01 12:01", freq: str = "1min"
+) -> pd.DataFrame:
+    """Build an explicit candle frame from ``(open, high, low, close)`` tuples."""
+    times = pd.date_range(start, periods=len(bars), freq=freq, tz="UTC")
+    return pd.DataFrame(
+        {
+            "time": times,
+            "open": [b[0] for b in bars],
+            "high": [b[1] for b in bars],
+            "low": [b[2] for b in bars],
+            "close": [b[3] for b in bars],
+            "tick_volume": 50.0,
+        }
+    )
+
+
+def make_ticks(prices, start: str = "2024-05-01 12:01", freq: str = "5s") -> pd.DataFrame:
+    """Build a tick frame in the shape the ambiguity resolver expects."""
+    times = pd.date_range(start, periods=len(prices), freq=freq, tz="UTC")
+    return pd.DataFrame({"time": times, "high": list(prices), "low": list(prices)})
 
 
 @pytest.fixture
@@ -117,8 +147,8 @@ class FakeNotifier:
         self.near_signals.append(evaluation)
         return True
 
-    def send_outcome(self, signal_row, event, price, r_multiple=None):
-        self.outcomes.append((signal_row.get("signal_id"), event, price, r_multiple))
+    def send_outcome(self, signal_row, event, price, r_multiple=None, net_r=None):
+        self.outcomes.append((signal_row.get("signal_id"), event, price, r_multiple, net_r))
         return True
 
     @property
@@ -135,26 +165,18 @@ class FakeNotifier:
 
 
 class FakeMarket:
-    """Replays a stored history one closed candle at a time.
-
-    Honours whatever signal/confirmation timeframes the passed config asks for,
-    so timeframe switching can be tested without MetaTrader 5.
-    """
+    """Replays a stored M1 history one closed candle at a time."""
 
     def __init__(self, config, candles: pd.DataFrame, start: int,
-                 source_timeframe: str = "M5",
-                 spread_points: float = float("nan")) -> None:
+                 spread_points: float = 12.0, ticks: Optional[pd.DataFrame] = None) -> None:
         from src.market_data import resample_candles  # local import: avoids cycles
 
         self._resample = resample_candles
         self.config = config
         self.candles = candles
         self.cursor = start
-        self.source_timeframe = source_timeframe
-        # Unknown by default, exactly like a backtest: a hard-coded spread that
-        # happens to exceed MAX_SPREAD_ATR_RATIO on the low-volatility fixture
-        # would reject every candle and make these tests pass vacuously.
         self.spread_points = spread_points
+        self.ticks = ticks
         self.connected = True
         self.cache_cleared = 0
         self.fetches = []
@@ -171,21 +193,33 @@ class FakeMarket:
     def advance(self, steps: int = 1):
         self.cursor += steps
 
-    def _frame(self, timeframe: str):
-        window = self.candles.iloc[: self.cursor + 1]
-        if timeframe == self.source_timeframe:
-            return window
-        return self._resample(window, self.source_timeframe, timeframe)
+    def _frame(self, timeframe: str, count: Optional[int] = None):
+        """Mirror MarketData: only the most recent ``count`` candles are visible.
 
-    def get_candles(self, symbol, timeframe, count, closed_only=True, use_cache=False):
+        Honouring the window matters - a longer history changes which reference
+        levels exist (a previous *day* only appears once the window spans one),
+        so a test double that ignores it would not reproduce live behaviour.
+        """
+        window = self.candles.iloc[: self.cursor + 1]
+        if timeframe != "M1":
+            window = self._resample(window, "M1", timeframe)
+        if count:
+            window = window.iloc[-int(count):]
+        return window
+
+    def get_candles(self, symbol, timeframe, count, closed_only=True, use_cache=False,
+                    cache_result=True):
         self.fetches.append(timeframe)
-        return self._frame(timeframe)
+        return self._frame(timeframe, count)
 
     def get_spread(self, symbol):
         return self.spread_points
 
+    def refresh_tick_buffer(self, symbol, minutes):
+        return self.ticks
+
     def latest_closed_candle_time(self, symbol, timeframe):
-        frame = self._frame(timeframe)
+        frame = self._frame(timeframe, 3)
         if frame.empty:
             return None
         return pd.Timestamp(frame["time"].iloc[-1]).to_pydatetime()
@@ -194,21 +228,21 @@ class FakeMarket:
         from src.market_data import MarketSnapshot
 
         cfg = config or self.config
-        confirm = cfg.intermediate_timeframe or None
-        higher = cfg.higher_timeframe or None
-        signal = self._frame(cfg.signal_timeframe)
+        signal = self._frame("M1", cfg.candles_signal)
         if signal.empty:
-            return None, f"{cfg.signal_timeframe}: no data"
+            return None, "M1: no data"
+        context = (
+            self._frame(cfg.context_timeframe, cfg.candles_context)
+            if cfg.context_timeframe else None
+        )
         return (
             MarketSnapshot(
                 symbol=cfg.symbol,
-                m5=signal,
-                m15=self._frame(confirm) if confirm else None,
-                h1=self._frame(higher) if higher else None,
-                m1=None,
+                signal_df=signal,
+                context_df=context,
                 spread_points=self.spread_points,
-                signal_timeframe=cfg.signal_timeframe,
-                confirmation="+".join(t for t in (confirm, higher) if t) or "NONE",
+                signal_timeframe="M1",
+                context_timeframe=cfg.context_timeframe or "",
             ),
             "",
         )
@@ -224,3 +258,23 @@ def isolated_config(config, tmp_path) -> Config:
     config.state_file = tmp_path / "state.json"
     config.telegram_chat_id = "4242"
     return config
+
+
+def build_snapshot(config, candles: pd.DataFrame, spread_points: float = 12.0):
+    """Assemble an M1 snapshot the way the live loop and backtester do."""
+    from src.indicators import compute_indicators
+    from src.market_data import MarketSnapshot, resample_candles
+
+    context = None
+    if config.context_timeframe:
+        context = compute_indicators(
+            resample_candles(candles, "M1", config.context_timeframe), config.indicators
+        )
+    return MarketSnapshot(
+        symbol=config.symbol,
+        signal_df=compute_indicators(candles, config.indicators),
+        context_df=context,
+        spread_points=spread_points,
+        signal_timeframe="M1",
+        context_timeframe=config.context_timeframe or "",
+    )

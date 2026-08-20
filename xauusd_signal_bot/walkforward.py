@@ -58,15 +58,15 @@ class Segment:
 
 
 def warmup_bars(config) -> int:
-    """Signal-timeframe bars needed before the highest timeframe is usable.
+    """M1 bars needed before the context timeframe is usable.
 
-    The H1 view needs ``min_htf_candles_required`` closed H1 candles, and one H1
-    candle spans twelve M5 candles - so a segment that starts cold cannot signal
-    for its first ~2600 bars.  Every segment is therefore prefixed with this
-    many bars of history.
+    A segment that starts cold cannot signal until the context frame has enough
+    closed candles, so every segment is prefixed with this many M1 bars.
     """
-    ratio = timeframe_minutes(config.higher_timeframe) // timeframe_minutes(config.signal_timeframe)
-    return int(config.min_htf_candles_required * ratio) + int(config.min_candles_required)
+    if not config.context_timeframe:
+        return int(config.min_candles_required)
+    ratio = timeframe_minutes(config.context_timeframe)
+    return int(config.min_context_candles * ratio) + int(config.min_candles_required)
 
 
 def split_history(
@@ -106,7 +106,7 @@ def run_walkforward(
     m5: pd.DataFrame,
     fractions: Sequence[float],
     out_dir: Optional[Path] = None,
-    spread_points: float = float("nan"),
+    spread_points: Optional[float] = None,
 ) -> List[Segment]:
     """Run every segment and collect its report."""
     config = load_config()
@@ -147,7 +147,7 @@ def render_walkforward(segments: List[Segment]) -> str:
         "Consistency across segments matters more than any single segment's numbers.",
         "",
     ]
-    header = f"{'segment':<14}{'bars':>7}{'signals':>9}{'closed':>8}{'win%':>7}{'avgR':>8}{'totalR':>9}{'PF':>7}{'maxDD':>8}"
+    header = f"{'segment':<14}{'bars':>7}{'signals':>9}{'closed':>8}{'netWin%':>7}{'avgNetR':>8}{'totNetR':>9}{'netPF':>7}{'maxDD':>8}"
     lines.append(header)
     lines.append("-" * len(header))
     for segment in segments:
@@ -155,10 +155,12 @@ def render_walkforward(segments: List[Segment]) -> str:
             lines.append(f"{segment.name:<14}{segment.bars:>7}{segment.signals:>9}{'-':>8}{'-':>7}{'-':>8}{'-':>9}{'-':>7}{'-':>8}")
             continue
         stats = segment.report.overall
-        profit_factor = "inf" if stats.profit_factor == float("inf") else f"{stats.profit_factor:.2f}"
+        profit_factor = (
+            "inf" if stats.net_profit_factor == float("inf") else f"{stats.net_profit_factor:.2f}"
+        )
         lines.append(
             f"{segment.name:<14}{segment.bars:>7}{segment.signals:>9}{stats.closed:>8}"
-            f"{stats.win_rate:>7.1f}{stats.average_r:>8.3f}{stats.total_r:>9.2f}"
+            f"{stats.net_win_rate:>7.1f}{stats.average_net_r:>8.3f}{stats.total_net_r:>9.2f}"
             f"{profit_factor:>7}{stats.max_drawdown_r:>8.2f}"
         )
     lines += ["", "Periods:"]
@@ -166,7 +168,7 @@ def render_walkforward(segments: List[Segment]) -> str:
         lines.append(f"  {segment.name:<14} {segment.start}  ->  {segment.end}")
     lines += [
         "",
-        "Read this as: does expectancy (avgR) hold up outside the data the rules",
+        "Read this as: does NET expectancy hold up outside the data the rules",
         "were developed on?  A large drop from IN_SAMPLE to OUT_OF_SAMPLE is the",
         "signature of overfitting.",
         "=" * 78,
@@ -178,13 +180,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
     config = load_config()
     parser = argparse.ArgumentParser(description="Walk-forward robustness report")
-    parser.add_argument("--data", type=Path, required=True, help="M5 history CSV")
+    parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument(
         "--split", type=float, nargs=3, default=(0.5, 0.25, 0.25),
         metavar=("IN", "VAL", "OOS"), help="segment fractions (default 0.5 0.25 0.25)",
     )
     parser.add_argument("--out", type=Path, default=None, help="write per-segment CSVs here")
-    parser.add_argument("--spread", type=float, default=float("nan"))
+    parser.add_argument("--spread", type=float, default=None)
     args = parser.parse_args(argv)
 
     setup_logging(config.log_file, config.log_level)

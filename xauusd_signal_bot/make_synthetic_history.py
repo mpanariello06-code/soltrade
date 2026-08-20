@@ -1,4 +1,4 @@
-"""Generate a synthetic XAUUSD M5 history for smoke-testing the pipeline.
+"""Generate a synthetic XAUUSD M1 history for smoke-testing the pipeline.
 
 This produces a regime-switching random walk that *looks* like gold - trending
 stretches, ranging stretches, quiet stretches - so every code path in the engine,
@@ -24,17 +24,19 @@ import numpy as np
 import pandas as pd
 
 #: (drift per bar, volatility per bar) for each synthetic regime
+#: (drift per M1 bar, volatility per M1 bar) in price terms.  These give an M1
+#: ATR of roughly 2-5 pips, which is the right order for XAUUSD.
 REGIMES = {
-    "up": (0.05, 0.50),
-    "down": (-0.05, 0.50),
-    "range": (0.0, 0.55),
-    "quiet": (0.0, 0.25),
+    "up": (0.018, 0.16),
+    "down": (-0.018, 0.16),
+    "range": (0.0, 0.18),
+    "quiet": (0.0, 0.08),
 }
 REGIME_PROBABILITIES = (0.30, 0.30, 0.25, 0.15)
 
 
-def generate(bars: int = 9000, seed: int = 42, start_price: float = 2300.0) -> pd.DataFrame:
-    """Build a regime-switching synthetic M5 series with valid OHLC."""
+def generate(bars: int = 30000, seed: int = 42, start_price: float = 2300.0) -> pd.DataFrame:
+    """Build a regime-switching synthetic M1 series with valid OHLC."""
     rng = np.random.default_rng(seed)
     names = list(REGIMES)
 
@@ -42,7 +44,7 @@ def generate(bars: int = 9000, seed: int = 42, start_price: float = 2300.0) -> p
     volatility = np.zeros(bars)
     cursor = 0
     while cursor < bars:
-        length = int(rng.integers(200, 900))
+        length = int(rng.integers(400, 2400))
         regime = rng.choice(names, p=REGIME_PROBABILITIES)
         drift[cursor : cursor + length], volatility[cursor : cursor + length] = REGIMES[regime]
         cursor += length
@@ -54,22 +56,22 @@ def generate(bars: int = 9000, seed: int = 42, start_price: float = 2300.0) -> p
 
     return pd.DataFrame(
         {
-            "time": pd.date_range("2024-03-01", periods=bars, freq="5min", tz="UTC"),
+            "time": pd.date_range("2024-03-01", periods=bars, freq="1min", tz="UTC"),
             "open": open_.round(2),
             "high": high.round(2),
             "low": low.round(2),
             "close": close.round(2),
-            "tick_volume": rng.integers(60, 1500, bars).astype(float),
+            "tick_volume": rng.integers(20, 400, bars).astype(float),
         }
     )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
-    parser = argparse.ArgumentParser(description="Generate synthetic XAUUSD M5 history")
-    parser.add_argument("--bars", type=int, default=9000, help="number of M5 candles")
+    parser = argparse.ArgumentParser(description="Generate synthetic XAUUSD M1 history")
+    parser.add_argument("--bars", type=int, default=30000, help="number of M1 candles")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out", type=Path, default=Path("history/XAUUSD_M5_synthetic.csv"))
+    parser.add_argument("--out", type=Path, default=Path("history/XAUUSD_M1_synthetic.csv"))
     args = parser.parse_args(argv)
 
     frame = generate(args.bars, args.seed)

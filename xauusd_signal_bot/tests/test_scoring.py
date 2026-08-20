@@ -11,7 +11,14 @@ from src.regime import REGIMES, classify_regime
 from src.scoring import compute_scorecard, confidence_band, reason_summary
 from src.structure import MAX_SCORE as STRUCTURE_MAX, analyze_structure
 from src.support_resistance import MAX_SCORE as SR_MAX, analyze_support_resistance
-from src.trend import HTF_MAX_SCORE, MAX_SCORE as TREND_MAX, analyze_htf, analyze_trend, htf_alignment
+from src.trend import (
+    CONTEXT_MAX_SCORE,
+    HTF_MAX_SCORE,
+    MAX_SCORE as TREND_MAX,
+    analyze_context,
+    analyze_trend,
+    htf_alignment,
+)
 from src.utils import ComponentScore
 from src.volatility import MAX_SCORE as VOL_MAX, analyze_volatility
 from src.volume import MAX_SCORE as VOLUME_MAX, analyze_volume
@@ -68,6 +75,13 @@ def test_component_contribution_equals_its_configured_weight(config):
 def test_reweighting_changes_the_score(config):
     config.weights.trend = 30.0
     config.weights.momentum = 5.0
+    config.weights.price_action = 20.0
+    config.weights.liquidity = 14.0
+    config.weights.structure = 12.0
+    config.weights.support_resistance = 10.0
+    config.weights.htf = 6.0
+    config.weights.volatility = 2.0
+    config.weights.volume = 1.0
     config.validate()
     card = compute_scorecard(
         {
@@ -99,9 +113,11 @@ def test_confirmation_count_and_flags(config):
 
 
 def test_reason_summary_lists_the_strongest_components(config):
+    """Momentum leads on M1, so it must head the summary."""
     card = compute_scorecard(_full_components(1.0, 0.0), config)
     summary = reason_summary(card, "BUY")
-    assert "trend" in summary
+    assert summary.startswith("momentum")
+    assert "price_action" in summary
     assert summary.count(";") <= 3
 
 
@@ -127,7 +143,7 @@ def test_confidence_band_matches_configuration(config):
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
 def test_every_engine_stays_within_its_maximum(config, seed):
-    frame = compute_indicators(make_candles(1200, seed=seed), config.indicators)
+    frame = compute_indicators(make_candles(1500, seed=seed), config.indicators)
     engines = (
         (analyze_trend(frame, config), TREND_MAX),
         (analyze_momentum(frame, config), MOMENTUM_MAX),
@@ -158,23 +174,31 @@ def test_engines_return_zero_on_insufficient_data(config):
         assert "insufficient" in str(component.details.get("reason", "")).lower()
 
 
-def test_htf_alignment_classification(config):
-    aligned = ComponentScore("htf", 10, 2, 15, {"h1_direction": "BULL", "m15_direction": "BULL"})
-    counter = ComponentScore("htf", 2, 10, 15, {"h1_direction": "BEAR", "m15_direction": "BEAR"})
-    neutral = ComponentScore("htf", 5, 5, 15, {"h1_direction": "NEUTRAL", "m15_direction": "NEUTRAL"})
+def test_context_alignment_classification(config):
+    aligned = ComponentScore("htf", 10, 2, 15, {"context_direction": "BULL"})
+    counter = ComponentScore("htf", 2, 10, 15, {"context_direction": "BEAR"})
+    neutral = ComponentScore("htf", 5, 5, 15, {"context_direction": "NEUTRAL"})
     assert htf_alignment(aligned, "BUY") == "ALIGNED"
     assert htf_alignment(counter, "BUY") == "COUNTER"
     assert htf_alignment(neutral, "BUY") == "NEUTRAL"
     assert htf_alignment(counter, "SELL") == "ALIGNED"
 
 
-def test_htf_engine_blends_both_timeframes(config):
-    candles = make_candles(4000, seed=27, drift=0.06)
-    m15 = compute_indicators(resample_candles(candles, "M5", "M15"), config.indicators)
-    h1 = compute_indicators(resample_candles(candles, "M5", "H1"), config.indicators)
-    component = analyze_htf(m15, h1, config)
-    assert 0.0 <= component.bull <= HTF_MAX_SCORE
-    assert "h1_direction" in component.details and "m15_direction" in component.details
+def test_context_engine_scores_one_timeframe(config):
+    candles = make_candles(3000, seed=27, drift=0.02)
+    context = compute_indicators(resample_candles(candles, "M1", "M5"), config.indicators)
+    component = analyze_context(context, config)
+    assert 0.0 <= component.bull <= CONTEXT_MAX_SCORE
+    assert component.applicable
+    assert "context_direction" in component.details
+
+
+def test_context_is_not_applicable_when_switched_off(config):
+    """Pure M1 microstructure: the context weight must be shared out, not zeroed."""
+    component = analyze_context(None, config)
+    assert component.applicable is False
+    assert component.bull == 0.0 and component.bear == 0.0
+    assert htf_alignment(component, "BUY") == "NEUTRAL"
 
 
 # --------------------------------------------------------------------------- #
@@ -209,10 +233,10 @@ def test_every_regime_has_a_configured_threshold_offset(config):
 
 
 def test_inapplicable_component_releases_its_weight(config):
-    """H4 has no confirmation timeframe; the score must still reach 100."""
+    """With context switched off the score must still be able to reach 100."""
     components = _full_components(1.0, 0.0)
     components["htf"] = ComponentScore(
-        "htf", 0.0, 0.0, HTF_MAX_SCORE, {"reason": "no confirmation timeframe"}, applicable=False
+        "htf", 0.0, 0.0, HTF_MAX_SCORE, {"reason": "no context timeframe"}, applicable=False
     )
     card = compute_scorecard(components, config)
     assert card.bullish_score == pytest.approx(100.0)

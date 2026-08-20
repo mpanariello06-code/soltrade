@@ -30,7 +30,7 @@ import pandas as pd
 from .indicators import compute_indicators
 from .liquidity import analyze_liquidity
 from .logger import get_logger
-from .market_data import MarketSnapshot, timeframe_minutes, validate_candles
+from .market_data import MarketSnapshot, validate_candles
 from .momentum import analyze_momentum
 from .price_action import analyze_price_action
 from .regime import classify_regime
@@ -38,17 +38,19 @@ from .scoring import ScoreCard, compute_scorecard, confidence_band, reason_summa
 from .structure import analyze_structure
 from .support_resistance import analyze_support_resistance
 from .targets import build_targets
-from .trend import analyze_htf, analyze_trend, htf_alignment
+from .trend import analyze_context, analyze_trend, htf_alignment
 from .utils import (
     ComponentScore,
+    as_utc,
     detect_session,
     fnum,
     iso,
     make_signal_id,
     now_utc,
+    safe_div,
 )
 from .volatility import analyze_volatility, classify_volatility
-from .timeframes import confirmation_label
+from .timeframes import MODE_SCALPING, SIGNAL_TIMEFRAME, expected_hold_label
 from .volume import analyze_volume
 from .filters import (
     FilterInput,
@@ -69,6 +71,14 @@ FEATURE_KEYS: Tuple[str, ...] = (
     "close_minus_ema200", "bb_width", "structure_bos_bull", "structure_bos_bear",
     "structure_choch_bull", "structure_choch_bear", "consolidating",
     "swept_bull", "swept_bear", "sr_state",
+    # --- M1 microstructure -------------------------------------------------- #
+    # Everything a future model would need to answer "was the next few minutes'
+    # move big enough to clear costs?" without re-deriving it from raw candles.
+    "atr_pips", "spread_pips", "cost_pips", "atr_to_cost", "range_pips",
+    "body_pips", "upper_wick_pips", "lower_wick_pips", "close_location",
+    "displacement_atr", "velocity_pips_per_min", "acceleration",
+    "micro_range_pips_5", "micro_range_pips_15", "dist_to_high_5_pips",
+    "dist_to_low_5_pips", "minute_of_hour", "hour_of_day",
 )
 
 #: Column order of ``evaluations.csv``.  The first block matches the spec
@@ -78,9 +88,8 @@ EVALUATION_COLUMNS: Tuple[str, ...] = (
     "trend_score", "htf_score", "momentum_score", "structure_score",
     "liquidity_score", "sr_score", "volume_score", "volatility_score",
     "price_action_score", "regime", "spread", "decision", "rejection_reason",
-    # operating context - what the engine was configured as at this moment
-    "mode", "signal_timeframe", "confirmation_timeframes", "threshold_used",
-    "near_signal", "session", "volatility_band", "htf_alignment", "signal_id",
+    "mode", "threshold_used", "near_signal", "session", "volatility_band",
+    "htf_alignment", "signal_id",
 ) + tuple(f"f_{key}" for key in FEATURE_KEYS)
 
 DECISION_BUY = "BUY"
@@ -118,16 +127,20 @@ class Signal:
     rr3: float = 0.0
     sl_mode: str = ""
     confirmations: Dict[str, bool] = field(default_factory=dict)
-    #: operating context, preserved so research and standard signals can be
-    #: told apart when the CSVs are analysed later
-    mode: str = "STANDARD"
-    confirmation_timeframes: str = ""
+    mode: str = "SCALPING"
     threshold_used: float = 0.0
 
-    @property
-    def is_research(self) -> bool:
-        """True for a candidate collected under RESEARCH mode."""
-        return self.mode == "RESEARCH"
+    # -- scalping geometry and costs, fixed at signal time ------------------ #
+    spread_points: float = float("nan")
+    cost_pips: float = 0.0
+    cost_r: float = 0.0
+    sl_pips: float = 0.0
+    tp_pips: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    net_rr1: float = 0.0
+    net_rr2: float = 0.0
+    net_rr3: float = 0.0
+    atr: float = 0.0
+    expected_hold: str = "SHORT"
 
     def to_row(self) -> Dict[str, Any]:
         """Flat mapping for ``signals.csv``."""
@@ -148,11 +161,21 @@ class Signal:
             "regime": self.regime,
             "status": "ACTIVE",
             "mode": self.mode,
-            "signal_timeframe": self.timeframe,
-            "confirmation_timeframes": self.confirmation_timeframes,
             "threshold_used": round(self.threshold_used, 2),
             "score": self.confidence,
             "session": self.session,
+            "spread_points": round(self.spread_points, 1) if pd.notna(self.spread_points) else "",
+            "cost_pips": self.cost_pips,
+            "cost_r": self.cost_r,
+            "sl_pips": self.sl_pips,
+            "tp1_pips": self.tp_pips[0],
+            "tp2_pips": self.tp_pips[1],
+            "tp3_pips": self.tp_pips[2],
+            "atr": self.atr,
+            "net_rr1": self.net_rr1,
+            "net_rr2": self.net_rr2,
+            "net_rr3": self.net_rr3,
+            "expected_hold": self.expected_hold,
             "risk_reward": self.risk_reward,
             "rr1": self.rr1,
             "rr2": self.rr2,
@@ -181,8 +204,7 @@ class Evaluation:
     htf_alignment: str = ""
     signal: Optional[Signal] = None
     features: Dict[str, float] = field(default_factory=dict)
-    mode: str = "STANDARD"
-    confirmation_timeframes: str = ""
+    mode: str = "SCALPING"
     #: diagnostic flag - close to the threshold but rejected
     near_signal: bool = False
 
@@ -243,8 +265,6 @@ class Evaluation:
         row.update(
             {
                 "mode": self.mode,
-                "signal_timeframe": self.timeframe,
-                "confirmation_timeframes": self.confirmation_timeframes,
                 "threshold_used": round(self.threshold, 2),
                 "near_signal": int(bool(self.near_signal)),
                 "session": self.session,
@@ -267,7 +287,7 @@ class SignalEngine:
 
     def __init__(self, config) -> None:
         self.config = config
-        self.timeframe_minutes = timeframe_minutes(config.signal_timeframe)
+        self.timeframe_minutes = 1   #: M1 - the only signal timeframe
 
     # -- helpers ---------------------------------------------------------- #
     @staticmethod
@@ -285,16 +305,39 @@ class SignalEngine:
         return compute_indicators(df, params)
 
     def _collect_features(
-        self, m5: pd.DataFrame, components: Dict[str, ComponentScore]
+        self, df: pd.DataFrame, components: Dict[str, ComponentScore], config, spread_points
     ) -> Dict[str, float]:
-        """Raw indicator readings preserved for future ML training."""
-        row = m5.iloc[-1]
+        """Raw readings preserved for future ML training.
+
+        The eventual question a model would answer is *"given these M1
+        conditions, how likely is a move large enough to clear costs within the
+        holding window?"* - so the vector carries the microstructure and the
+        cost context, not just the indicator values.
+        """
+        row = df.iloc[-1]
+        pip = config.pip_value
         structure = components["structure"].details
         liquidity = components["liquidity"].details
         sr = components["support_resistance"].details
+
+        atr_value = fnum(row["atr"])
+        cost_price = config.round_trip_cost(spread_points)
+        spread_price = config.effective_spread_points(spread_points) * config.point_value
+        high, low = fnum(row["high"]), fnum(row["low"])
+        candle_range = max(high - low, 1e-9)
+        close = fnum(row["close"])
+        candle_time = as_utc(pd.Timestamp(row["time"]).to_pydatetime())
+
+        window5 = df.iloc[-5:]
+        window15 = df.iloc[-15:]
+        # Velocity over the last 5 minutes, in pips per minute; acceleration is
+        # how much faster the last 3 minutes were than the 5 before them.
+        velocity = safe_div(close - fnum(df["close"].iloc[-6]), 5.0 * pip) if len(df) > 6 else 0.0
+        recent = safe_div(close - fnum(df["close"].iloc[-4]), 3.0 * pip) if len(df) > 4 else 0.0
+
         return {
-            "close": round(fnum(row["close"]), 3),
-            "atr": round(fnum(row["atr"]), 4),
+            "close": round(close, 3),
+            "atr": round(atr_value, 4),
             "atr_ratio": round(fnum(components["volatility"].details.get("atr_ratio"), 1.0), 3),
             "adx": round(fnum(row["adx"]), 2),
             "plus_di": round(fnum(row["plus_di"]), 2),
@@ -306,7 +349,7 @@ class SignalEngine:
             "rel_volume": round(fnum(row["rel_volume"], 1.0), 3),
             "body_ratio": round(fnum(row["body_ratio"]), 3),
             "ema_fast_minus_slow": round(fnum(row["ema_fast"]) - fnum(row["ema_slow"]), 3),
-            "close_minus_ema200": round(fnum(row["close"]) - fnum(row["ema_trend"]), 3),
+            "close_minus_ema200": round(close - fnum(row["ema_trend"]), 3),
             "bb_width": round(fnum(row["bb_width"]), 5),
             "structure_bos_bull": int(bool(structure.get("bos_bull"))),
             "structure_bos_bear": int(bool(structure.get("bos_bear"))),
@@ -315,23 +358,43 @@ class SignalEngine:
             "consolidating": int(bool(structure.get("consolidating"))),
             "swept_bull": int(bool(liquidity.get("swept_bull"))),
             "swept_bear": int(bool(liquidity.get("swept_bear"))),
-            "sr_state": {"NEUTRAL": 0, "NEAR_SUPPORT": 1, "NEAR_RESISTANCE": 2, "BREAKOUT": 3, "BREAKDOWN": 4}.get(
-                str(sr.get("state", "NEUTRAL")), 0
+            "sr_state": {
+                "NEUTRAL": 0, "NEAR_SUPPORT": 1, "NEAR_RESISTANCE": 2,
+                "BREAKOUT": 3, "BREAKDOWN": 4,
+            }.get(str(sr.get("state", "NEUTRAL")), 0),
+            # --- M1 microstructure --------------------------------------- #
+            "atr_pips": round(config.pips(atr_value), 3),
+            "spread_pips": round(config.pips(spread_price), 3),
+            "cost_pips": round(config.pips(cost_price), 3),
+            "atr_to_cost": round(safe_div(atr_value, cost_price), 3),
+            "range_pips": round(config.pips(candle_range), 3),
+            "body_pips": round(config.pips(abs(close - fnum(row["open"]))), 3),
+            "upper_wick_pips": round(config.pips(fnum(row["upper_wick"])), 3),
+            "lower_wick_pips": round(config.pips(fnum(row["lower_wick"])), 3),
+            "close_location": round(safe_div(close - low, candle_range), 3),
+            "displacement_atr": round(safe_div(abs(close - fnum(row["open"])), max(atr_value, 1e-9)), 3),
+            "velocity_pips_per_min": round(velocity, 3),
+            "acceleration": round(recent - velocity, 3),
+            "micro_range_pips_5": round(
+                config.pips(fnum(window5["high"].max()) - fnum(window5["low"].min())), 3
             ),
+            "micro_range_pips_15": round(
+                config.pips(fnum(window15["high"].max()) - fnum(window15["low"].min())), 3
+            ),
+            "dist_to_high_5_pips": round(config.pips(fnum(window5["high"].max()) - close), 3),
+            "dist_to_low_5_pips": round(config.pips(close - fnum(window5["low"].min())), 3),
+            "minute_of_hour": candle_time.minute,
+            "hour_of_day": candle_time.hour,
         }
 
     def _validate(self, snapshot: MarketSnapshot, config=None) -> str:
         """Return an empty string when the snapshot is usable, else the reason."""
         cfg = config or self.config
-        checks = [(snapshot.m5, cfg.signal_timeframe, cfg.min_candles_required)]
-        # A confirmation timeframe is optional (H1 has one, H4 has none), but
-        # whenever a frame *is* supplied it must be as sound as the signal one.
-        for frame, label in (
-            (snapshot.m15, cfg.intermediate_timeframe),
-            (snapshot.h1, cfg.higher_timeframe),
-        ):
-            if frame is not None and label:
-                checks.append((frame, label, cfg.min_htf_candles_required))
+        checks = [(snapshot.signal_df, SIGNAL_TIMEFRAME, cfg.min_candles_required)]
+        if snapshot.context_df is not None and cfg.context_timeframe:
+            checks.append(
+                (snapshot.context_df, cfg.context_timeframe, cfg.min_context_candles)
+            )
         for frame, label, minimum in checks:
             ok, reason = validate_candles(frame, label, minimum)
             if not ok:
@@ -345,24 +408,23 @@ class SignalEngine:
         gate: Optional[GateState] = None,
         config=None,
     ) -> Evaluation:
-        """Evaluate one closed candle and return the full :class:`Evaluation`.
+        """Evaluate one closed M1 candle and return the full :class:`Evaluation`.
 
         ``config`` lets the caller pass a runtime-adjusted view of the
-        configuration (mode, signal timeframe, threshold) without rebuilding the
-        engine - see :func:`src.runtime_state.effective_config`.
+        configuration (threshold, holding period) without rebuilding the engine.
         """
         cfg = config or self.config
         gate = gate or GateState()
-        candle_time = snapshot.candle_time if not snapshot.m5.empty else now_utc()
-        confirmation = snapshot.confirmation or confirmation_label(cfg.signal_timeframe)
+        candle_time = (
+            snapshot.candle_time if not snapshot.signal_df.empty else now_utc()
+        )
 
         evaluation = Evaluation(
             timestamp=candle_time,
             symbol=snapshot.symbol,
-            timeframe=cfg.signal_timeframe,
+            timeframe=SIGNAL_TIMEFRAME,
             spread_points=snapshot.spread_points,
-            mode=str(getattr(cfg, "mode", "STANDARD")).upper(),
-            confirmation_timeframes=confirmation,
+            mode=MODE_SCALPING,
         )
 
         reason = self._validate(snapshot, cfg)
@@ -371,34 +433,39 @@ class SignalEngine:
             return evaluation
 
         params = cfg.indicators
-        m5 = self._ensure_indicators(snapshot.m5, params)
-        m15 = self._ensure_indicators(snapshot.m15, params) if snapshot.m15 is not None else None
-        h1 = self._ensure_indicators(snapshot.h1, params) if snapshot.h1 is not None else None
+        m1 = self._ensure_indicators(snapshot.signal_df, params)
+        context = (
+            self._ensure_indicators(snapshot.context_df, params)
+            if snapshot.context_df is not None
+            else None
+        )
 
         # -- 3. analysis engines ------------------------------------------- #
         components: Dict[str, ComponentScore] = {
-            "trend": analyze_trend(m5, cfg),
-            "htf": analyze_htf(m15, h1, cfg),
-            "momentum": analyze_momentum(m5, cfg),
-            "structure": analyze_structure(m5, cfg),
-            "liquidity": analyze_liquidity(m5, cfg),
-            "support_resistance": analyze_support_resistance(m5, cfg),
-            "volume": analyze_volume(m5, cfg),
-            "volatility": analyze_volatility(m5, cfg),
-            "price_action": analyze_price_action(m5, cfg),
+            "trend": analyze_trend(m1, cfg),
+            "htf": analyze_context(context, cfg),
+            "momentum": analyze_momentum(m1, cfg),
+            "structure": analyze_structure(m1, cfg),
+            "liquidity": analyze_liquidity(m1, cfg),
+            "support_resistance": analyze_support_resistance(m1, cfg),
+            "volume": analyze_volume(m1, cfg),
+            "volatility": analyze_volatility(m1, cfg),
+            "price_action": analyze_price_action(m1, cfg),
         }
 
         # -- 4/5. scoring and regime ---------------------------------------- #
         card = compute_scorecard(components, cfg)
-        regime, _regime_details = classify_regime(m5, components, cfg)
-        volatility_band, _ratio = classify_volatility(m5, cfg)
+        regime, _regime_details = classify_regime(m1, components, cfg)
+        volatility_band, _ratio = classify_volatility(m1, cfg)
         session = detect_session(candle_time, cfg.sessions, cfg.session_priority)
 
         evaluation.card = card
         evaluation.regime = regime
         evaluation.volatility_band = volatility_band
         evaluation.session = session
-        evaluation.features = self._collect_features(m5, components)
+        evaluation.features = self._collect_features(
+            m1, components, cfg, snapshot.spread_points
+        )
 
         direction = card.direction
         if direction == "NONE":
@@ -410,7 +477,7 @@ class SignalEngine:
         evaluation.htf_alignment = alignment
 
         filter_input = FilterInput(
-            df=m5,
+            df=m1,
             card=card,
             direction=direction,
             regime=regime,
@@ -419,7 +486,7 @@ class SignalEngine:
             spread_points=snapshot.spread_points,
             candle_time=candle_time,
             htf_alignment=alignment,
-            timeframe_minutes=timeframe_minutes(cfg.signal_timeframe),
+            timeframe_minutes=1,
             gate=gate,
         )
 
@@ -430,8 +497,10 @@ class SignalEngine:
             evaluation.rejection_reason = outcome.reason
             return self._finish_rejected(evaluation, cfg)
 
-        # -- 7. targets and R:R --------------------------------------------- #
-        targets, target_reason = build_targets(m5, cfg, direction)
+        # -- 7. targets, costs and R:R --------------------------------------- #
+        targets, target_reason = build_targets(
+            m1, cfg, direction, spread_points=snapshot.spread_points
+        )
         if targets is None:
             evaluation.rejection_reason = target_reason or "could not build targets"
             return self._finish_rejected(evaluation, cfg)
@@ -444,10 +513,11 @@ class SignalEngine:
 
         # -- 8. build the signal --------------------------------------------- #
         score = card.bullish_score if direction == DECISION_BUY else card.bearish_score
+        atr_pips = cfg.pips(targets.atr)
         signal = Signal(
             signal_id=make_signal_id(snapshot.symbol, candle_time, direction),
             symbol=snapshot.symbol,
-            timeframe=cfg.signal_timeframe,
+            timeframe=SIGNAL_TIMEFRAME,
             direction=direction,
             timestamp=candle_time,
             entry=targets.entry,
@@ -468,23 +538,29 @@ class SignalEngine:
             rr3=targets.rr3,
             sl_mode=targets.sl_mode,
             confirmations=card.confirmations(direction),
-            mode=evaluation.mode,
-            confirmation_timeframes=confirmation,
+            mode=MODE_SCALPING,
             threshold_used=round(outcome.threshold, 2),
+            spread_points=targets.spread_points,
+            cost_pips=targets.cost_pips,
+            cost_r=targets.cost_r,
+            sl_pips=targets.sl_pips,
+            tp_pips=targets.tp_pips,
+            net_rr1=targets.net_rr1,
+            net_rr2=targets.net_rr2,
+            net_rr3=targets.net_rr3,
+            atr=targets.atr,
+            expected_hold=expected_hold_label(targets.tp_pips[2], atr_pips),
         )
 
         evaluation.decision = direction
         evaluation.signal = signal
         LOGGER.info(
-            "%s %s %s @ %.2f | score %.1f | regime %s | RR2 %.2f | %s",
-            "RESEARCH SIGNAL" if signal.is_research else "SIGNAL",
-            signal.direction,
-            signal.symbol,
-            signal.entry,
-            signal.confidence,
-            signal.regime,
-            signal.rr2,
-            signal.reason_summary,
+            "SCALP %s %s @ %.2f | score %.1f | SL %.1fp TP %.1f/%.1f/%.1fp | "
+            "netRR %.2f/%.2f/%.2f | cost %.1fp | %s",
+            signal.direction, signal.symbol, signal.entry, signal.confidence,
+            signal.sl_pips, *signal.tp_pips,
+            signal.net_rr1, signal.net_rr2, signal.net_rr3,
+            signal.cost_pips, signal.regime,
         )
         return evaluation
 

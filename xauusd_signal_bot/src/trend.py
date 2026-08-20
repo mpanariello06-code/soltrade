@@ -119,156 +119,102 @@ def trend_direction(df: pd.DataFrame, config) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# higher-timeframe confirmation
+# short-term context timeframe
 # --------------------------------------------------------------------------- #
-_HTF_CACHE = BoundedCache(maxsize=8)
+_CONTEXT_CACHE = BoundedCache(maxsize=8)
 
-HTF_MAX_SCORE = 15.0
+CONTEXT_MAX_SCORE = 15.0
+#: Backwards-compatible alias - the component key in the scorecard is still
+#: ``htf`` so every stored CSV column keeps working.
+HTF_MAX_SCORE = CONTEXT_MAX_SCORE
 
-#: How the two confirmation timeframes combine into the single HTF component
-#: when both exist (M1..M30 signal timeframes).  The slower timeframe carries
-#: the most weight; the fractions sum to 1.0.
-HTF_MIX_PAIR = {
-    "higher_trend": 0.30,
-    "intermediate_trend": 0.25,
-    "higher_structure": 0.15,
-    "intermediate_structure": 0.10,
-    "higher_momentum": 0.10,
-    "intermediate_momentum": 0.10,
-}
-
-#: Mix used when only ONE confirmation timeframe exists (signal timeframe H1,
-#: confirmed by H4 alone).  Same ordering of importance, renormalised.
-HTF_MIX_SINGLE = {
+#: How the context timeframe's three sub-analyses combine.  Trend dominates: at
+#: this horizon the context exists to say "which way is the last half hour
+#: leaning", not to add a second opinion on entry timing.
+CONTEXT_MIX = {
     "trend": 0.45,
     "structure": 0.30,
     "momentum": 0.25,
 }
 
-#: Kept for backwards compatibility with the M5-only version.
-HTF_MIX = HTF_MIX_PAIR
 
+def analyze_context(df_context: Optional[pd.DataFrame], config) -> ComponentScore:
+    """Score the short-term context timeframe (M5 by default) as one component.
 
-def _sub_scores(frame: pd.DataFrame, config):
-    """Run trend / structure / momentum on one confirmation timeframe."""
+    Returns a **not-applicable** component when context is switched off or the
+    frame is too short.  :func:`src.scoring.compute_scorecard` then redistributes
+    its weight rather than scoring a flat zero, which would silently cap the
+    maximum achievable score.
+
+    Memoised on the frame's contents: one M5 candle spans five M1 candles, so
+    the context view is unchanged for most evaluations.  The cache key is a
+    content hash, so a changed frame can never return a stale result.
+    """
     from .momentum import MAX_SCORE as MOMENTUM_MAX, analyze_momentum
     from .structure import MAX_SCORE as STRUCTURE_MAX, analyze_structure
 
-    return {
-        "trend": (analyze_trend(frame, config), MAX_SCORE),
-        "structure": (analyze_structure(frame, config), STRUCTURE_MAX),
-        "momentum": (analyze_momentum(frame, config), MOMENTUM_MAX),
-    }
-
-
-def _usable(frame: Optional[pd.DataFrame]) -> bool:
-    """A confirmation frame is usable once it has enough closed candles."""
-    return frame is not None and len(frame) >= 30
-
-
-def analyze_htf(
-    df_intermediate: Optional[pd.DataFrame],
-    df_higher: Optional[pd.DataFrame],
-    config,
-) -> ComponentScore:
-    """Blend the confirmation timeframes into one 0-15 component.
-
-    Both frames must already carry indicator columns and contain closed candles
-    only.  Either may be ``None``:
-
-    * **both present** - the usual case (signal timeframes M1..M30)
-    * **one present**  - signal timeframe H1, confirmed by H4 alone
-    * **neither**      - signal timeframe H4; the component is marked *not
-      applicable* and :func:`src.scoring.compute_scorecard` redistributes its
-      weight rather than scoring a flat zero
-
-    Memoised on the contents of the frames: an intermediate candle spans several
-    signal candles, so the higher-timeframe view is unchanged for most
-    evaluations.  The cache key is a content hash, so a changed frame can never
-    return a stale result.
-    """
-    have_intermediate = _usable(df_intermediate)
-    have_higher = _usable(df_higher)
-
-    if not have_intermediate and not have_higher:
+    if df_context is None or len(df_context) < 30:
         return ComponentScore(
-            "htf", 0.0, 0.0, HTF_MAX_SCORE,
-            {"reason": "no confirmation timeframe", "intermediate_direction": "NONE",
-             "higher_direction": "NONE", "m15_direction": "NEUTRAL", "h1_direction": "NEUTRAL"},
+            "htf", 0.0, 0.0, CONTEXT_MAX_SCORE,
+            {"reason": "no context timeframe", "context_direction": "NONE",
+             "m15_direction": "NEUTRAL", "h1_direction": "NEUTRAL"},
             applicable=False,
         )
 
-    cache_key = (
-        frame_fingerprint(df_intermediate) if have_intermediate else 0,
-        frame_fingerprint(df_higher) if have_higher else 0,
-    )
-    cached = _HTF_CACHE.get(cache_key)
+    cache_key = frame_fingerprint(df_context)
+    cached = _CONTEXT_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
+    parts = {
+        "trend": (analyze_trend(df_context, config), MAX_SCORE),
+        "structure": (analyze_structure(df_context, config), STRUCTURE_MAX),
+        "momentum": (analyze_momentum(df_context, config), MOMENTUM_MAX),
+    }
     bull_fraction = bear_fraction = 0.0
     details: Dict[str, Any] = {}
+    for key, (component, maximum) in parts.items():
+        share = CONTEXT_MIX[key]
+        bull_fraction += share * safe_div(component.bull, maximum)
+        bear_fraction += share * safe_div(component.bear, maximum)
+        details[f"context_{key}"] = (round(component.bull, 2), round(component.bear, 2))
 
-    if have_intermediate and have_higher:
-        parts = {
-            "intermediate": _sub_scores(df_intermediate, config),
-            "higher": _sub_scores(df_higher, config),
-        }
-        for role, sub in parts.items():
-            for key, (component, maximum) in sub.items():
-                share = HTF_MIX_PAIR[f"{role}_{key}"]
-                bull_fraction += share * safe_div(component.bull, maximum)
-                bear_fraction += share * safe_div(component.bear, maximum)
-                details[f"{role}_{key}"] = (round(component.bull, 2), round(component.bear, 2))
-        intermediate_direction = trend_direction(df_intermediate, config)
-        higher_direction = trend_direction(df_higher, config)
-    else:
-        frame = df_higher if have_higher else df_intermediate
-        for key, (component, maximum) in _sub_scores(frame, config).items():
-            share = HTF_MIX_SINGLE[key]
-            bull_fraction += share * safe_div(component.bull, maximum)
-            bear_fraction += share * safe_div(component.bear, maximum)
-            details[f"single_{key}"] = (round(component.bull, 2), round(component.bear, 2))
-        higher_direction = intermediate_direction = trend_direction(frame, config)
-
+    direction = trend_direction(df_context, config)
     details.update(
         {
-            "intermediate_direction": intermediate_direction,
-            "higher_direction": higher_direction,
-            # legacy key names, still read by htf_alignment and the tests
-            "m15_direction": intermediate_direction,
-            "h1_direction": higher_direction,
+            "context_direction": direction,
+            # legacy key names, still read by htf_alignment
+            "m15_direction": direction,
+            "h1_direction": direction,
         }
     )
 
-    return _HTF_CACHE.put(
+    return _CONTEXT_CACHE.put(
         cache_key,
         ComponentScore(
             "htf",
-            clamp(bull_fraction * HTF_MAX_SCORE, 0.0, HTF_MAX_SCORE),
-            clamp(bear_fraction * HTF_MAX_SCORE, 0.0, HTF_MAX_SCORE),
-            HTF_MAX_SCORE,
+            clamp(bull_fraction * CONTEXT_MAX_SCORE, 0.0, CONTEXT_MAX_SCORE),
+            clamp(bear_fraction * CONTEXT_MAX_SCORE, 0.0, CONTEXT_MAX_SCORE),
+            CONTEXT_MAX_SCORE,
             details,
         ),
     )
 
 
-def htf_alignment(htf_component: ComponentScore, direction: str) -> str:
-    """Is ``direction`` with, against or neutral to the higher timeframe?
+def htf_alignment(context_component: ComponentScore, direction: str) -> str:
+    """Is ``direction`` with, against or neutral to the context timeframe?
 
-    Returns ``"ALIGNED"``, ``"COUNTER"`` or ``"NEUTRAL"``.
+    Returns ``"ALIGNED"``, ``"COUNTER"`` or ``"NEUTRAL"``.  With context switched
+    off every candidate is NEUTRAL, so no counter-trend penalty applies.
     """
-    if not htf_component.applicable:
+    if not context_component.applicable:
         return "NEUTRAL"
-    h1_direction = str(htf_component.details.get("h1_direction", "NEUTRAL"))
-    m15_direction = str(htf_component.details.get("m15_direction", "NEUTRAL"))
+    context_direction = str(context_component.details.get("context_direction", "NEUTRAL"))
     wanted = "BULL" if direction == "BUY" else "BEAR"
     opposite = "BEAR" if direction == "BUY" else "BULL"
 
-    if h1_direction == wanted:
+    if context_direction == wanted:
         return "ALIGNED"
-    if h1_direction == opposite:
-        return "COUNTER"
-    if m15_direction == opposite:
+    if context_direction == opposite:
         return "COUNTER"
     return "NEUTRAL"

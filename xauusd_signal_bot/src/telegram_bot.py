@@ -34,22 +34,8 @@ OUTCOME_ICONS: Dict[str, str] = {
     "TP3_HIT": "🎯 TP3 HIT",
     "SL_HIT": "❌ SL HIT",
     "INVALIDATED": "⚠️ SIGNAL INVALIDATED",
-    "EXPIRED": "⌛ SIGNAL EXPIRED",
+    "TIMEOUT": "⌛ SCALP TIMED OUT",
 }
-
-#: component key -> label shown in the CONFIRMATIONS block
-CONFIRMATION_LABELS = (
-    ("trend", "Trend"),
-    ("htf", "HTF"),
-    ("momentum", "Momentum"),
-    ("structure", "Structure"),
-    ("liquidity", "Liquidity"),
-    ("support_resistance", "S/R"),
-    ("volume", "Volume"),
-    ("volatility", "Volatility"),
-    ("price_action", "Price Action"),
-)
-
 
 class TelegramNotifier:
     """Minimal, resilient Telegram sender."""
@@ -191,58 +177,60 @@ class TelegramNotifier:
         return []
 
     # -- formatting --------------------------------------------------------- #
-    RESEARCH_DISCLAIMER = (
-        "⚠️ Research/paper-testing signal.\n"
-        "This setup is being collected for research/paper testing and is not a "
-        "validated trading signal."
-    )
+    PAPER_DISCLAIMER = "🔬 PAPER TEST ONLY"
 
-    def format_research_signal(self, signal) -> str:
-        """Render a RESEARCH-mode candidate (spec section 9).
+    def format_signal(self, signal) -> str:
+        """Render the M1 scalp card.
 
-        Deliberately unlike the standard card: different header, no
-        confirmation checklist, and an explicit disclaimer, so a research
-        candidate can never be mistaken for a validated signal at a glance.
+        Both RAW and NET reward are shown.  Quoting raw R alone on a trade whose
+        target is a few pips would be actively misleading - the spread is often
+        a large fraction of the move.
         """
         digits = self.config.digits
-        return "\n".join(
-            [
-                DIVIDER,
-                f"🔬 RESEARCH {signal.direction}",
-                DIVIDER,
-                "",
-                f"{signal.symbol} {signal.timeframe}",
-                "",
-                f"Score: {signal.confidence:.0f}/100",
-                f"Bullish: {signal.bullish_score:.0f}",
-                f"Bearish: {signal.bearish_score:.0f}",
-                f"Threshold: {signal.threshold_used:.0f}",
-                "",
-                "Regime:",
-                signal.regime.replace("_", " "),
-                "",
-                f"Entry: {signal.entry:.{digits}f}",
-                f"SL: {signal.stop_loss:.{digits}f}",
-                "",
-                f"TP1: {signal.tp1:.{digits}f}",
-                f"TP2: {signal.tp2:.{digits}f}",
-                f"TP3: {signal.tp3:.{digits}f}",
-                "",
-                "R:R:",
-                f"TP1 = {signal.rr1:.1f}R",
-                f"TP2 = {signal.rr2:.1f}R",
-                f"TP3 = {signal.rr3:.1f}R",
-                "",
-                "Reason:",
-                signal.reason_summary,
-                "",
-                DIVIDER,
-                self.RESEARCH_DISCLAIMER,
-            ]
-        )
+        spread_price = signal.spread_points * self.config.point_value
+        lines = [
+            DIVIDER,
+            f"⚡ {signal.symbol} M1 SCALP",
+            DIVIDER,
+            "",
+            f"Direction: {signal.direction}",
+            "",
+            f"Score: {signal.confidence:.0f}/100",
+            "",
+            f"Entry: {signal.entry:.{digits}f}",
+            "",
+            f"TP1: {signal.tp1:.{digits}f}   ({signal.tp_pips[0]:.1f}p)",
+            f"TP2: {signal.tp2:.{digits}f}   ({signal.tp_pips[1]:.1f}p)",
+            f"TP3: {signal.tp3:.{digits}f}   ({signal.tp_pips[2]:.1f}p)",
+            "",
+            f"SL: {signal.stop_loss:.{digits}f}   ({signal.sl_pips:.1f}p)",
+            "",
+            "Expected holding period:",
+            signal.expected_hold,
+            "",
+            "Spread:",
+            f"{spread_price:.2f}  ({signal.spread_points:.0f} points)",
+            "",
+            "Risk/Reward:",
+            f"TP1 {signal.rr1:.2f}R",
+            f"TP2 {signal.rr2:.2f}R",
+            f"TP3 {signal.rr3:.2f}R",
+            "",
+            f"After costs ({signal.cost_pips:.1f}p = {signal.cost_r:.2f}R):",
+            f"TP1 {signal.net_rr1:.2f}R",
+            f"TP2 {signal.net_rr2:.2f}R",
+            f"TP3 {signal.net_rr3:.2f}R",
+            "",
+            "Reason:",
+            signal.reason_summary,
+            "",
+            DIVIDER,
+            self.PAPER_DISCLAIMER,
+        ]
+        return "\n".join(lines)
 
     def format_near_signal(self, evaluation) -> str:
-        """Render the optional NEAR_SIGNAL diagnostic (spec section 8)."""
+        """Render the optional NEAR_SIGNAL diagnostic."""
         card = evaluation.card
         bullish = card.bullish_score if card else 0.0
         bearish = card.bearish_score if card else 0.0
@@ -254,7 +242,7 @@ class TelegramNotifier:
                 "👀 NEAR SIGNAL",
                 DIVIDER,
                 "",
-                f"{evaluation.symbol} {evaluation.timeframe}  ({direction} side)",
+                f"{evaluation.symbol} M1  ({direction} side)",
                 "",
                 f"Threshold: {evaluation.threshold:.0f}",
                 f"Bullish: {bullish:.0f}",
@@ -269,61 +257,29 @@ class TelegramNotifier:
             ]
         )
 
-    def format_signal(self, signal) -> str:
-        """Render the signal card (spec section 33).
-
-        RESEARCH-mode candidates get their own, clearly-labelled format.
-        """
-        if getattr(signal, "is_research", False):
-            return self.format_research_signal(signal)
-        icon = "🟢" if signal.direction == "BUY" else "🔴"
-        digits = self.config.digits
-        lines = [
-            DIVIDER,
-            f"{icon} {signal.symbol} {signal.direction}",
-            DIVIDER,
-            "",
-            f"⭐ Confidence: {signal.confidence:.0f}/100",
-            f"📊 Timeframe: {signal.timeframe}",
-            f"📈 Regime: {signal.regime.replace('_', ' ')}",
-            f"🕐 Session: {signal.session.replace('_', ' ')}",
-            "",
-            f"Entry: {signal.entry:.{digits}f}",
-            f"SL: {signal.stop_loss:.{digits}f}",
-            "",
-            f"TP1: {signal.tp1:.{digits}f}",
-            f"TP2: {signal.tp2:.{digits}f}",
-            f"TP3: {signal.tp3:.{digits}f}",
-            "",
-            "R:R",
-            f"TP1: {signal.rr1:.1f}R",
-            f"TP2: {signal.rr2:.1f}R",
-            f"TP3: {signal.rr3:.1f}R",
-            "",
-            "CONFIRMATIONS",
-        ]
-        for key, label in CONFIRMATION_LABELS:
-            mark = "✅" if signal.confirmations.get(key) else "▫️"
-            lines.append(f"{mark} {label}")
-        lines += ["", DIVIDER, "Signal only - not financial advice."]
-        return "\n".join(lines)
-
     def format_outcome(
-        self, signal_row: Dict[str, Any], event: str, price: float, r_multiple: Optional[float] = None
+        self,
+        signal_row: Dict[str, Any],
+        event: str,
+        price: float,
+        r_multiple: Optional[float] = None,
+        net_r: Optional[float] = None,
     ) -> str:
-        """Render a TP/SL/expiry update for an existing signal."""
+        """Render a TP/SL/timeout update for an existing signal."""
         digits = self.config.digits
         header = OUTCOME_ICONS.get(event, event)
         lines = [
             DIVIDER,
             f"{header}",
             DIVIDER,
-            f"{signal_row.get('symbol', '')} {signal_row.get('direction', '')}"
+            f"{signal_row.get('symbol', '')} M1 {signal_row.get('direction', '')}"
             f" @ {float(signal_row.get('entry', 0.0)):.{digits}f}",
             f"Level: {price:.{digits}f}",
         ]
         if r_multiple is not None:
-            lines.append(f"Result: {r_multiple:+.2f}R")
+            lines.append(f"Raw: {r_multiple:+.2f}R")
+        if net_r is not None:
+            lines.append(f"Net after costs: {net_r:+.2f}R")
         lines.append(f"Signal: {signal_row.get('signal_id', '')}")
         lines.append(DIVIDER)
         return "\n".join(lines)
@@ -337,10 +293,17 @@ class TelegramNotifier:
         return bool(self.send_message(self.format_near_signal(evaluation)))
 
     def send_outcome(
-        self, signal_row: Dict[str, Any], event: str, price: float, r_multiple: Optional[float] = None
+        self,
+        signal_row: Dict[str, Any],
+        event: str,
+        price: float,
+        r_multiple: Optional[float] = None,
+        net_r: Optional[float] = None,
     ) -> bool:
         """Send an outcome update."""
-        return bool(self.send_message(self.format_outcome(signal_row, event, price, r_multiple)))
+        return bool(
+            self.send_message(self.format_outcome(signal_row, event, price, r_multiple, net_r))
+        )
 
     def send_text(self, text: str) -> bool:
         """Send an arbitrary status message (startup/shutdown notices)."""

@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .timeframes import SIGNAL_TIMEFRAME
 from .utils import (
     BoundedCache,
     as_utc,
@@ -207,60 +208,32 @@ def resample_candles(df: pd.DataFrame, source_tf: str, target_tf: str) -> pd.Dat
 class MarketSnapshot:
     """Everything the signal engine is allowed to see for one evaluation.
 
-    Every frame holds **closed candles only**; the last row of ``m5`` is the
-    signal candle.  There is deliberately no field carrying the forming candle.
+    Both frames hold **closed candles only**; the last row of ``signal_df`` is
+    the M1 signal candle.  There is deliberately no field carrying the forming
+    candle.
 
-    FIELD NAMES ARE ROLES, NOT LITERAL TIMEFRAMES.  ``m5`` is whatever the
-    *signal* timeframe currently is, ``m15`` the intermediate confirmation and
-    ``h1`` the higher confirmation - the names date from the M5-only version and
-    are kept so the analysis engines did not have to change.  Prefer the
-    ``signal_df`` / ``confirm_df`` / ``higher_df`` aliases in new code, and read
-    ``signal_timeframe`` / ``confirmation`` for what they actually hold.
-
-    ``m15`` and ``h1`` are ``None`` when the active hierarchy has no such
-    confirmation timeframe (H1 has only one, H4 has none by default).
+    ``context_df`` is the short-term context timeframe (M5 by default) and is
+    ``None`` when context is switched off - the context component is then marked
+    not-applicable and its weight is shared out.
     """
 
     symbol: str
-    m5: pd.DataFrame
-    m15: Optional[pd.DataFrame] = None
-    h1: Optional[pd.DataFrame] = None
-    m1: Optional[pd.DataFrame] = None
+    signal_df: pd.DataFrame
+    context_df: Optional[pd.DataFrame] = None
     spread_points: float = float("nan")
     evaluated_at: datetime = field(default_factory=now_utc)
-    signal_timeframe: str = ""
-    confirmation: str = ""
-
-    # role-based aliases -------------------------------------------------- #
-    @property
-    def signal_df(self) -> pd.DataFrame:
-        """Candles of the signal timeframe (last row = the signal candle)."""
-        return self.m5
-
-    @property
-    def confirm_df(self) -> Optional[pd.DataFrame]:
-        """Intermediate confirmation candles, or ``None``."""
-        return self.m15
-
-    @property
-    def higher_df(self) -> Optional[pd.DataFrame]:
-        """Higher confirmation candles, or ``None``."""
-        return self.h1
-
-    @property
-    def micro_df(self) -> Optional[pd.DataFrame]:
-        """Finer candles used only for intrabar TP/SL ordering, or ``None``."""
-        return self.m1
+    signal_timeframe: str = "M1"
+    context_timeframe: str = ""
 
     @property
     def candle_time(self) -> datetime:
-        """UTC open time of the signal candle."""
-        return as_utc(pd.Timestamp(self.m5["time"].iloc[-1]).to_pydatetime())
+        """UTC open time of the M1 signal candle."""
+        return as_utc(pd.Timestamp(self.signal_df["time"].iloc[-1]).to_pydatetime())
 
     @property
     def close(self) -> float:
         """Close price of the signal candle."""
-        return float(self.m5["close"].iloc[-1])
+        return float(self.signal_df["close"].iloc[-1])
 
 
 # --------------------------------------------------------------------------- #
@@ -283,6 +256,8 @@ class MarketData:
         # (symbol, timeframe) -> (fetched_at, count, frame)
         self._cache: Dict[Tuple[str, str], Tuple[float, int, pd.DataFrame]] = {}
         self._cache_lock = threading.RLock()
+        self._tick_buffer: Optional[pd.DataFrame] = None
+        self._tick_last_time: Optional[datetime] = None
 
     # -- candle cache ------------------------------------------------------ #
     def _cache_ttl(self, timeframe: str) -> float:
@@ -522,63 +497,102 @@ class MarketData:
     def build_snapshot(
         self, config=None, use_cache: bool = False
     ) -> Tuple[Optional[MarketSnapshot], str]:
-        """Fetch every timeframe in the active hierarchy and assemble a snapshot.
-
-        ``config`` may be a runtime-adjusted view (see
-        :func:`src.runtime_state.effective_config`); it defaults to the config
-        this connector was built with.  The signal timeframe and its
-        confirmations come straight from that config, so switching timeframe
-        from Telegram changes what is fetched with no restart.
+        """Fetch M1 and the context timeframe, and assemble a snapshot.
 
         Returns ``(snapshot, reason)``; ``snapshot`` is ``None`` when data could
         not be assembled and ``reason`` explains why.
         """
         cfg = config or self.config
-        signal_tf = cfg.signal_timeframe
-
-        signal_df = self.get_candles(cfg.symbol, signal_tf, cfg.candles_signal)
+        signal_df = self.get_candles(cfg.symbol, SIGNAL_TIMEFRAME, cfg.candles_signal)
         ok, reason = validate_candles(
-            signal_df, signal_tf, cfg.min_candles_required, cfg.max_candle_staleness_seconds
+            signal_df,
+            SIGNAL_TIMEFRAME,
+            cfg.min_candles_required,
+            cfg.max_candle_staleness_seconds,
         )
         if not ok:
-            return None, f"{signal_tf}: {reason}"
+            return None, f"{SIGNAL_TIMEFRAME}: {reason}"
 
-        # Confirmation timeframes are optional: H1 has one, H4 has none.
-        frames: Dict[str, Optional[pd.DataFrame]] = {}
-        for role, timeframe, count in (
-            ("intermediate", cfg.intermediate_timeframe, cfg.candles_intermediate),
-            ("higher", cfg.higher_timeframe, cfg.candles_higher),
-        ):
-            if not timeframe:
-                frames[role] = None
-                continue
-            frame = self.get_candles(cfg.symbol, timeframe, count, use_cache=use_cache)
-            ok, reason = validate_candles(frame, timeframe, cfg.min_htf_candles_required)
-            if not ok:
-                return None, f"{timeframe}: {reason}"
-            frames[role] = frame
-
-        micro = None
-        if cfg.micro_timeframe:
-            micro = self.get_candles(
-                cfg.symbol, cfg.micro_timeframe, cfg.candles_micro, use_cache=use_cache
+        context_df = None
+        context_tf = cfg.context_timeframe
+        if context_tf:
+            frame = self.get_candles(
+                cfg.symbol, context_tf, cfg.candles_context, use_cache=use_cache
             )
-            if micro.empty:
-                micro = None
+            ok, reason = validate_candles(frame, context_tf, cfg.min_context_candles)
+            if not ok:
+                return None, f"{context_tf}: {reason}"
+            context_df = frame
 
         return (
             MarketSnapshot(
                 symbol=cfg.symbol,
-                m5=signal_df,
-                m15=frames["intermediate"],
-                h1=frames["higher"],
-                m1=micro,
+                signal_df=signal_df,
+                context_df=context_df,
                 spread_points=self.get_spread(cfg.symbol),
                 evaluated_at=now_utc(),
-                signal_timeframe=signal_tf,
-                confirmation="+".join(
-                    tf for tf in (cfg.intermediate_timeframe, cfg.higher_timeframe) if tf
-                ) or "NONE",
+                signal_timeframe=SIGNAL_TIMEFRAME,
+                context_timeframe=context_tf or "",
             ),
             "",
         )
+
+    # -- ticks: resolving ambiguous candles -------------------------------- #
+    def refresh_tick_buffer(self, symbol: str, minutes: int) -> Optional[pd.DataFrame]:
+        """Maintain a rolling buffer of raw ticks for the last ``minutes``.
+
+        At M1 scalping scale a single candle very often trades through both the
+        target and the stop, and OHLC cannot say which came first.  Replaying
+        ticks resolves that ordering; without them the tracker falls back to the
+        pessimistic assumption (stop first), which is a large systematic penalty
+        when the whole trade is a few pips wide.
+
+        Only the delta since the previous call is fetched, so the cost per poll
+        is roughly one minute of ticks.  Returns ``None`` when ticks are
+        unavailable - the caller must treat that as "stay pessimistic".
+        """
+        if not MT5_AVAILABLE or not self.ensure_connection():
+            return self._tick_buffer
+
+        now = now_utc()
+        window_start = now - timedelta(minutes=max(int(minutes), 1))
+        fetch_from = window_start
+        if self._tick_last_time is not None and self._tick_last_time > window_start:
+            fetch_from = self._tick_last_time
+
+        offset = self.config.mt5_server_utc_offset_hours
+        try:
+            with _MT5_LOCK:
+                ticks = mt5.copy_ticks_range(
+                    symbol,
+                    fetch_from + timedelta(hours=offset),
+                    now + timedelta(hours=offset),
+                    mt5.COPY_TICKS_ALL,
+                )
+        except Exception as exc:  # noqa: BLE001 - ticks are an optimisation
+            LOGGER.debug("copy_ticks_range failed: %s", exc)
+            return self._tick_buffer
+
+        if ticks is not None and len(ticks):
+            frame = pd.DataFrame(ticks)
+            times = pd.to_datetime(frame["time_msc"], unit="ms", utc=True)
+            times = times - pd.Timedelta(hours=offset)
+            # Bid is used for both extremes: we only need the ORDER in which the
+            # levels were touched, not an exact fill price.
+            price = pd.to_numeric(frame.get("bid"), errors="coerce")
+            fresh = pd.DataFrame({"time": times, "high": price, "low": price}).dropna()
+            with self._cache_lock:
+                if self._tick_buffer is None or self._tick_buffer.empty:
+                    self._tick_buffer = fresh
+                else:
+                    self._tick_buffer = pd.concat([self._tick_buffer, fresh], ignore_index=True)
+
+        with self._cache_lock:
+            buffer = self._tick_buffer
+            if buffer is not None and not buffer.empty:
+                buffer = buffer[buffer["time"] >= window_start].reset_index(drop=True)
+                self._tick_buffer = buffer
+                self._tick_last_time = as_utc(
+                    pd.Timestamp(buffer["time"].iloc[-1]).to_pydatetime()
+                ) if len(buffer) else None
+            return self._tick_buffer

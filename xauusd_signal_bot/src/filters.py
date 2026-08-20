@@ -8,6 +8,7 @@ it possible to audit *why* the system stayed flat.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional, Tuple
@@ -112,16 +113,26 @@ def check_session(data: FilterInput, config) -> Optional[str]:
 
 
 def check_spread(data: FilterInput, config) -> Optional[str]:
-    """Reject when the quoted spread is abnormal, absolutely or versus ATR."""
-    spread = data.spread_points
-    if spread is None or not pd.notna(spread):
-        return None  # spread unavailable (e.g. backtest) - not a rejection
+    """Reject when the spread is abnormal in absolute terms or vs the likely move.
+
+    The second test is the one that matters for scalping: what counts is not the
+    spread against a single M1 candle (they are nearly the same size) but the
+    spread against how far price can plausibly travel inside the holding window.
+    """
+    spread = config.effective_spread_points(data.spread_points)
     if spread > config.max_spread_points:
         return f"excessive spread ({spread:.0f} > {config.max_spread_points:.0f} points)"
+
     atr_value = fnum(data.df["atr"].iloc[-1])
-    spread_price = spread * config.point_value
-    if atr_value > 0 and safe_div(spread_price, atr_value) > config.max_spread_atr_ratio:
-        return f"excessive spread vs ATR ({spread_price:.2f} vs ATR {atr_value:.2f})"
+    if atr_value > 0:
+        expected_move = atr_value * math.sqrt(max(config.max_holding_candles, 1))
+        ratio = safe_div(spread * config.point_value, expected_move)
+        if ratio > config.max_spread_to_expected_move:
+            return (
+                f"spread too large vs expected move "
+                f"({config.pips(spread * config.point_value):.1f}p vs "
+                f"{config.pips(expected_move):.1f}p over {config.max_holding_candles}m)"
+            )
     return None
 
 
@@ -243,11 +254,24 @@ def check_limits(data: FilterInput, config) -> Optional[str]:
 
 
 def check_risk_reward(data: FilterInput, config) -> Optional[str]:
-    """Reject setups whose TP2 reward does not justify the risk."""
-    if data.targets is None:
+    """Reject setups whose TP2 reward does not justify the risk - before *and*
+    after trading costs.
+
+    The net test is not redundant: a 1.3R raw setup carrying a 1.1R cost is a
+    loser dressed as a winner, and at scalping distances that is the normal
+    case rather than the exception.
+    """
+    targets = data.targets
+    if targets is None:
         return "no valid targets"
-    if data.targets.rr2 < config.min_tp2_rr:
-        return f"insufficient R:R (TP2 {data.targets.rr2:.2f} < {config.min_tp2_rr:.2f})"
+    if targets.rr2 < config.min_tp2_rr:
+        return f"insufficient R:R (TP2 {targets.rr2:.2f} < {config.min_tp2_rr:.2f})"
+    if targets.net_rr2 < config.min_net_tp2_rr:
+        return (
+            f"insufficient NET R:R after costs "
+            f"(TP2 {targets.net_rr2:.2f} < {config.min_net_tp2_rr:.2f}, "
+            f"cost {targets.cost_r:.2f}R)"
+        )
     return None
 
 

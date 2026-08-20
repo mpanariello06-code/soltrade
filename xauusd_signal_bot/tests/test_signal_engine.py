@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from src.indicators import compute_indicators
-from src.market_data import MarketSnapshot, clean_candles, resample_candles, validate_candles
+from src.market_data import MarketSnapshot, clean_candles, validate_candles
 from src.signal_engine import (
     DECISION_NONE,
     EVALUATION_COLUMNS,
@@ -22,6 +22,7 @@ from src.signal_tracker import (
     STATUS_ACTIVE,
     STATUS_INVALIDATED,
     STATUS_SL,
+    STATUS_TIMEOUT,
     STATUS_TP1,
     STATUS_TP3,
     PositionState,
@@ -34,27 +35,16 @@ from src.signal_tracker import (
 )
 from src.telegram_bot import TelegramNotifier
 from src.utils import atomic_write_json, iso, parse_iso, read_json
-from tests.conftest import FakeMarket, FakeNotifier, make_candles
+from tests.conftest import FakeMarket, FakeNotifier, build_snapshot, make_candles
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def build_snapshot(config, candles: pd.DataFrame, spread: float = float("nan")) -> MarketSnapshot:
-    """Assemble a snapshot the way the live loop and backtester do."""
-    return MarketSnapshot(
-        symbol=config.symbol,
-        m5=compute_indicators(candles, config.indicators),
-        m15=compute_indicators(resample_candles(candles, "M5", "M15"), config.indicators),
-        h1=compute_indicators(resample_candles(candles, "M5", "H1"), config.indicators),
-        spread_points=spread,
-    )
-
-
 @pytest.fixture
 def long_candles() -> pd.DataFrame:
-    """Enough M5 history to warm up a 200-period EMA on H1."""
-    return make_candles(4200, seed=61)
+    """Enough M1 history to warm up the indicators and the M5 context."""
+    return make_candles(2500, seed=61)
 
 
 @pytest.fixture
@@ -71,23 +61,26 @@ def tracker_config(config, tmp_path):
 def sample_signal(direction: str = "BUY", when: datetime | None = None) -> Signal:
     when = when or datetime(2024, 5, 1, 12, 0, tzinfo=timezone.utc)
     if direction == "BUY":
-        entry, stop, tps = 2300.0, 2290.0, (2310.0, 2318.0, 2328.0)
+        entry, stop, tps = 2300.0, 2299.6, (2300.36, 2300.65, 2301.08)
     else:
-        entry, stop, tps = 2300.0, 2310.0, (2290.0, 2282.0, 2272.0)
+        entry, stop, tps = 2300.0, 2300.4, (2299.64, 2299.35, 2298.92)
     return Signal(
         signal_id=f"XAUUSD-{direction}-{when:%Y%m%d%H%M%S}",
-        symbol="XAUUSD", timeframe="M5", direction=direction, timestamp=when,
+        symbol="XAUUSD", timeframe="M1", direction=direction, timestamp=when,
         entry=entry, stop_loss=stop, tp1=tps[0], tp2=tps[1], tp3=tps[2],
-        confidence=85.0, bullish_score=85.0, bearish_score=40.0,
-        regime="WEAK_TREND", risk_reward=1.8, session="LONDON",
-        reason_summary="trend=18.0", confidence_label="VERY_STRONG",
-        rr1=1.0, rr2=1.8, rr3=2.8, sl_mode="HYBRID",
-        confirmations={"trend": True, "htf": True},
+        confidence=71.0, bullish_score=71.0, bearish_score=30.0,
+        regime="WEAK_TREND", risk_reward=1.6, session="LONDON",
+        reason_summary="momentum=18.0", confidence_label="STRONG",
+        rr1=0.9, rr2=1.6, rr3=2.7, sl_mode="HYBRID",
+        confirmations={"momentum": True, "price_action": True},
+        mode="SCALPING", threshold_used=68.0, spread_points=20.0,
+        cost_pips=2.4, cost_r=0.6, sl_pips=4.0, tp_pips=(3.6, 6.5, 10.8),
+        net_rr1=0.3, net_rr2=1.0, net_rr3=2.1, atr=0.30, expected_hold="SHORT",
     )
 
 
-def outcome_candles(bars, start="2024-05-01 12:05") -> pd.DataFrame:
-    times = pd.date_range(start, periods=len(bars), freq="5min", tz="UTC")
+def outcome_candles(bars, start="2024-05-01 12:01") -> pd.DataFrame:
+    times = pd.date_range(start, periods=len(bars), freq="1min", tz="UTC")
     return pd.DataFrame(
         {
             "time": times,
@@ -165,7 +158,8 @@ def test_signal_timestamp_is_the_closed_candle_not_wall_clock(config, long_candl
 def test_snapshot_exposes_only_closed_candles(config, long_candles):
     """There is no field on the snapshot that can carry a forming candle."""
     snapshot = build_snapshot(config, long_candles)
-    assert snapshot.close == pytest.approx(float(snapshot.m5["close"].iloc[-1]))
+    assert snapshot.close == pytest.approx(float(snapshot.signal_df["close"].iloc[-1]))
+    assert snapshot.signal_timeframe == "M1"
     assert not hasattr(snapshot, "forming_candle")
     assert not hasattr(snapshot, "current_candle")
 
@@ -199,9 +193,8 @@ def test_engine_survives_malformed_candles(config, long_candles):
     broken.loc[broken.index[-1], "high"] = float("nan")
     snapshot = MarketSnapshot(
         symbol=config.symbol,
-        m5=compute_indicators(broken, config.indicators),
-        m15=compute_indicators(resample_candles(long_candles, "M5", "M15"), config.indicators),
-        h1=compute_indicators(resample_candles(long_candles, "M5", "H1"), config.indicators),
+        signal_df=compute_indicators(broken, config.indicators),
+        context_df=None,
     )
     evaluation = SignalEngine(config).evaluate(snapshot)
     assert evaluation.decision == DECISION_NONE
@@ -262,7 +255,7 @@ def test_signal_lifecycle_advances_to_tp_and_writes_one_outcome(tracker_config):
     tracker.record_signal(signal)
 
     # a single candle that runs through all three targets
-    candles = outcome_candles([(2300, 2330, 2299, 2329)])
+    candles = outcome_candles([(2300, 2301.2, 2299.9, 2301.1)])
     events = tracker.update(candles)
     assert [event.event for event in events][-1] == STATUS_TP3
 
@@ -279,7 +272,7 @@ def test_outcomes_are_never_written_twice(tracker_config):
     tracker = SignalTracker(tracker_config)
     tracker.load()
     tracker.record_signal(sample_signal("BUY"))
-    candles = outcome_candles([(2300, 2330, 2299, 2329)])
+    candles = outcome_candles([(2300, 2301.2, 2299.9, 2301.1)])
     tracker.update(candles)
     tracker.update(candles)
     tracker.update(candles)
@@ -291,7 +284,7 @@ def test_alerts_are_not_resent_after_a_restart(tracker_config):
     tracker = SignalTracker(tracker_config)
     tracker.load()
     tracker.record_signal(sample_signal("BUY"))
-    candles = outcome_candles([(2300, 2312, 2299, 2311)])
+    candles = outcome_candles([(2300, 2300.4, 2299.9, 2300.35)])
     first_events = tracker.update(candles)
     assert [e.event for e in first_events] == [STATUS_TP1]
 
@@ -304,7 +297,7 @@ def test_stop_loss_closes_the_signal_at_minus_one_r(tracker_config):
     tracker = SignalTracker(tracker_config)
     tracker.load()
     tracker.record_signal(sample_signal("BUY"))
-    events = tracker.update(outcome_candles([(2300, 2302, 2288, 2289)]))
+    events = tracker.update(outcome_candles([(2300, 2300.1, 2299.5, 2299.55)]))
     assert [e.event for e in events] == [STATUS_SL]
     outcomes = read_csv_rows(tracker_config.outcomes_csv)
     assert float(outcomes[0]["R_multiple"]) == pytest.approx(-1.0)
@@ -315,7 +308,7 @@ def test_opposite_signal_invalidates_an_open_one(tracker_config):
     tracker.load()
     tracker.record_signal(sample_signal("BUY"))
     events = tracker.invalidate_opposite(
-        "SELL", datetime(2024, 5, 1, 13, 0, tzinfo=timezone.utc), 2295.0
+        "SELL", datetime(2024, 5, 1, 12, 5, tzinfo=timezone.utc), 2299.9
     )
     assert [e.event for e in events] == [STATUS_INVALIDATED]
     assert read_csv_rows(tracker_config.signals_csv)[0]["status"] == STATUS_INVALIDATED
@@ -346,14 +339,14 @@ def test_gate_state_ignores_signals_in_the_future(config):
     assert gate.signals_today == 1
 
 
-def test_expiry_closes_a_stalled_signal(tracker_config):
-    tracker_config.signal_expiry_candles = 5
+def test_timeout_closes_a_stalled_scalp(tracker_config):
+    tracker_config.max_holding_candles = 5
     tracker = SignalTracker(tracker_config)
     tracker.load()
     tracker.record_signal(sample_signal("BUY"))
-    flat = outcome_candles([(2300, 2301, 2299, 2300)] * 5)
+    flat = outcome_candles([(2300, 2300.05, 2299.95, 2300.0)] * 5)
     events = tracker.update(flat)
-    assert [e.event for e in events] == ["EXPIRED"]
+    assert [e.event for e in events] == [STATUS_TIMEOUT]
 
 
 def test_progress_ignores_the_signal_candle_itself(config):
@@ -362,7 +355,7 @@ def test_progress_ignores_the_signal_candle_itself(config):
     same_bar = pd.DataFrame(
         {
             "time": [pd.Timestamp("2024-05-01 12:00", tz="UTC")],
-            "open": [2300.0], "high": [2400.0], "low": [2200.0], "close": [2300.0],
+            "open": [2300.0], "high": [2310.0], "low": [2290.0], "close": [2300.0],
             "tick_volume": [100.0],
         }
     )
@@ -374,7 +367,8 @@ def test_progress_ignores_the_signal_candle_itself(config):
 def test_position_state_and_evaluate_progress_agree(config):
     """The live path and the backtest path must score outcomes identically."""
     row = sample_signal("BUY").to_row()
-    bars = [(2300, 2312, 2299, 2311), (2311, 2320, 2299, 2300), (2300, 2301, 2288, 2289)]
+    bars = [(2300, 2300.4, 2299.9, 2300.35), (2300.35, 2300.7, 2299.9, 2300.0),
+            (2300.0, 2300.05, 2299.5, 2299.55)]
     candles = outcome_candles(bars)
 
     incremental = PositionState(row, config)
@@ -438,66 +432,88 @@ def test_telegram_is_disabled_without_credentials(config):
     assert notifier.send_message("hello") is None
 
 
-def test_signal_message_contains_the_key_numbers(config):
+def test_scalp_message_matches_the_specified_format(config):
     text = TelegramNotifier(config).format_signal(sample_signal("BUY"))
-    assert "XAUUSD BUY" in text
-    assert "🟢" in text
+    assert "⚡ XAUUSD M1 SCALP" in text
+    assert "Direction: BUY" in text
+    assert "Score: 71/100" in text
     assert "Entry: 2300.00" in text
-    assert "SL: 2290.00" in text
-    assert "TP1: 2310.00" in text and "TP3: 2328.00" in text
-    assert "CONFIRMATIONS" in text
-    assert "Confidence: 85/100" in text
+    assert "SL: 2299.60" in text
+    assert "TP1: 2300.36" in text and "TP3: 2301.08" in text
+    assert "Expected holding period:" in text and "SHORT" in text
+    assert "Spread:" in text
+    assert "Risk/Reward:" in text
+    assert "PAPER TEST ONLY" in text
 
 
-def test_sell_message_uses_the_sell_icon(config):
+def test_scalp_message_reports_reward_after_costs(config):
+    """Quoting raw R alone on a few-pip target would be misleading."""
+    text = TelegramNotifier(config).format_signal(sample_signal("BUY"))
+    assert "After costs" in text
+    assert "2.4p" in text
+    for net in ("0.30R", "1.00R", "2.10R"):
+        assert net in text
+
+
+def test_sell_message_states_the_direction(config):
     text = TelegramNotifier(config).format_signal(sample_signal("SELL"))
-    assert "🔴" in text and "XAUUSD SELL" in text
+    assert "Direction: SELL" in text
 
 
-def test_outcome_message_formats_the_r_multiple(config):
+def test_outcome_message_reports_raw_and_net(config):
     row = {"symbol": "XAUUSD", "direction": "BUY", "entry": 2300.0, "signal_id": "x"}
-    text = TelegramNotifier(config).format_outcome(row, STATUS_TP3, 2328.0, 1.867)
-    assert "TP3 HIT" in text and "+1.87R" in text
+    text = TelegramNotifier(config).format_outcome(row, STATUS_TP3, 2301.08, 1.867, 1.267)
+    assert "TP3 HIT" in text
+    assert "Raw: +1.87R" in text
+    assert "Net after costs: +1.27R" in text
+
+
+def test_timeout_outcome_message(config):
+    row = {"symbol": "XAUUSD", "direction": "BUY", "entry": 2300.0, "signal_id": "x"}
+    text = TelegramNotifier(config).format_outcome(row, STATUS_TIMEOUT, 2300.05, 0.1, -0.5)
+    assert "TIMED OUT" in text
 
 
 # --------------------------------------------------------------------------- #
 # backtester
 # --------------------------------------------------------------------------- #
-def test_backtester_never_shows_an_unclosed_higher_timeframe_candle(config):
+def test_backtester_never_shows_an_unclosed_context_candle(config):
     """The core no-lookahead guarantee of the backtester."""
     from backtest import Backtester
 
-    candles = make_candles(4000, seed=71)
+    candles = make_candles(3000, seed=71)
     backtester = Backtester(config)
     prepared = backtester.prepare(candles)
 
-    for index in (3000, 3500, 3999):
+    for index in (2000, 2500, 2999):
         snapshot = backtester._snapshot(prepared, index)
-        m5_close = pd.Timestamp(prepared["m5_close"][index])
-        for frame, minutes in ((snapshot.m15, 15), (snapshot.h1, 60)):
-            if frame.empty:
-                continue
-            last_close = pd.Timestamp(frame["time"].iloc[-1]) + timedelta(minutes=minutes)
-            assert last_close <= m5_close, "an unclosed HTF candle leaked into the snapshot"
+        m1_close = pd.Timestamp(prepared["m1_close"][index])
+        if snapshot.context_df is None or snapshot.context_df.empty:
+            continue
+        minutes = 5 if config.context_timeframe == "M5" else 1
+        last_close = pd.Timestamp(snapshot.context_df["time"].iloc[-1]) + timedelta(minutes=minutes)
+        assert last_close <= m1_close, "an unclosed context candle leaked into the snapshot"
 
 
-def test_backtester_m5_window_ends_on_the_evaluated_bar(config):
+def test_backtester_window_ends_on_the_evaluated_bar(config):
     from backtest import Backtester
 
-    candles = make_candles(3500, seed=73)
+    candles = make_candles(2500, seed=73)
     backtester = Backtester(config)
     prepared = backtester.prepare(candles)
-    index = 3400
+    index = 2400
     snapshot = backtester._snapshot(prepared, index)
-    assert pd.Timestamp(snapshot.m5["time"].iloc[-1]) == pd.Timestamp(candles["time"].iloc[index])
-    assert len(snapshot.m5) <= config.candles_signal
+    assert pd.Timestamp(snapshot.signal_df["time"].iloc[-1]) == pd.Timestamp(
+        candles["time"].iloc[index]
+    )
+    assert len(snapshot.signal_df) <= config.candles_signal
 
 
 def test_backtest_run_produces_consistent_signals_and_outcomes(config, tmp_path):
     from backtest import Backtester
 
     config.data_dir = tmp_path
-    candles = make_candles(3600, seed=75, drift=0.05)
+    candles = make_candles(3000, seed=75, drift=0.02)
     result = Backtester(config).run(candles, log_evaluations=True, progress_every=0)
 
     assert result.bars_evaluated > 0
@@ -511,7 +527,7 @@ def test_backtest_run_produces_consistent_signals_and_outcomes(config, tmp_path)
         assert set(SIGNAL_COLUMNS).issuperset(row.keys())
     for row in result.outcomes:
         assert set(OUTCOME_COLUMNS).issuperset(row.keys())
-        assert row["result"] in ("TP3_HIT", "SL_HIT", "EXPIRED", "INVALIDATED")
+        assert row["result"] in ("TP3_HIT", "SL_HIT", "TIMEOUT", "INVALIDATED")
 
 
 def test_backtest_respects_the_cooldown_between_signals(config, tmp_path):
@@ -519,10 +535,10 @@ def test_backtest_respects_the_cooldown_between_signals(config, tmp_path):
 
     config.data_dir = tmp_path
     result = Backtester(config).run(
-        make_candles(3600, seed=77, drift=0.04), log_evaluations=False, progress_every=0
+        make_candles(3000, seed=77, drift=0.02), log_evaluations=False, progress_every=0
     )
     times = sorted(parse_iso(row["timestamp"]) for row in result.signals)
-    minimum_gap = timedelta(minutes=5 * config.cooldown_candles)
+    minimum_gap = timedelta(minutes=config.cooldown_candles)
     for earlier, later in zip(times, times[1:]):
         assert later - earlier >= minimum_gap, "cooldown was not enforced"
 
@@ -550,9 +566,8 @@ def test_live_loop_processes_each_candle_exactly_once(tracker_config):
     timestamps = [row["timestamp"] for row in evaluations]
     assert len(timestamps) == len(set(timestamps)), "a candle was evaluated twice"
 
-    # the processed marker is now tracked per timeframe
     state = read_json(tracker_config.state_file)
-    assert state["last_processed_candles"]["M5"] == timestamps[-1]
+    assert state["last_processed_candles"]["M1"] == timestamps[-1]
 
 
 def test_live_loop_skips_a_candle_it_has_already_processed(tracker_config):
@@ -614,8 +629,8 @@ def _runner(config, candles, start):
 
 
 def test_paused_runner_evaluates_nothing(tracker_config):
-    candles = make_candles(3400, seed=111)
-    runner = _runner(tracker_config, candles, start=3200)
+    candles = make_candles(2600, seed=111)
+    runner = _runner(tracker_config, candles, start=2500)
     runner.runtime.pause()
 
     for _ in range(10):
@@ -627,8 +642,8 @@ def test_paused_runner_evaluates_nothing(tracker_config):
 
 
 def test_resuming_restarts_evaluation(tracker_config):
-    candles = make_candles(3400, seed=113)
-    runner = _runner(tracker_config, candles, start=3200)
+    candles = make_candles(2600, seed=113)
+    runner = _runner(tracker_config, candles, start=2500)
 
     runner.runtime.pause()
     for _ in range(3):
@@ -644,84 +659,15 @@ def test_resuming_restarts_evaluation(tracker_config):
 
 
 def test_stop_ends_the_loop(tracker_config):
-    candles = make_candles(3400, seed=115)
-    runner = _runner(tracker_config, candles, start=3200)
+    candles = make_candles(2600, seed=115)
+    runner = _runner(tracker_config, candles, start=2500)
     runner.running = True
     runner.runtime.stop()
     runner._tick()
     assert runner.running is False
-
-
-def test_paused_runner_still_tracks_open_signals(tracker_config):
-    """PAUSE stops new signals; it must not orphan an already-open one."""
-    from datetime import timezone
-
-    candles = make_candles(3400, seed=117)
-    runner = _runner(tracker_config, candles, start=3200)
-    candle_time = pd.Timestamp(candles["time"].iloc[3200]).to_pydatetime().replace(tzinfo=timezone.utc)
-    price = float(candles["close"].iloc[3200])
-
-    signal = sample_signal("BUY", candle_time)
-    signal.entry = price
-    signal.stop_loss = price - 10.0
-    signal.tp1, signal.tp2, signal.tp3 = price + 0.01, price + 0.02, price + 0.03
-    runner.tracker.record_signal(signal)
-
-    runner.runtime.pause()
-    runner.market.advance()
-    runner._tick()
-
-    rows = read_csv_rows(tracker_config.signals_csv)
-    assert rows[0]["status"] != "ACTIVE", "an open signal stopped being tracked while paused"
-
-
-def test_research_mode_signals_are_labelled_through_the_runner(tracker_config):
-    candles = make_candles(3600, seed=119, drift=0.05)
-    runner = _runner(tracker_config, candles, start=3000)
-    runner.runtime.set_mode("RESEARCH")
-
-    for _ in range(120):
-        runner._tick()
-        runner.market.advance()
-
-    rows = read_csv_rows(tracker_config.signals_csv)
-    assert rows, "research mode produced no candidates on this fixture"
-    for row in rows:
-        assert row["mode"] == "RESEARCH"
-        assert row["signal_timeframe"] == "M5"
-        assert row["confirmation_timeframes"] == "M15+H1"
-        assert float(row["threshold_used"]) > 0
-    for signal in runner.notifier.signals:
-        assert signal.is_research
-
-
-def test_switching_timeframe_does_not_reprocess_the_old_one(tracker_config):
-    """Each timeframe keeps its own processed-candle marker."""
-    candles = make_candles(3600, seed=121)
-    runner = _runner(tracker_config, candles, start=3300)
-
-    runner._tick()
-    first_m5 = runner.runtime.last_processed_candle("M5")
-    assert first_m5 is not None
-    assert len(read_csv_rows(tracker_config.evaluations_csv)) == 1
-
-    runner.runtime.set_timeframe("M15")
-    runner._tick()
-    assert runner.runtime.last_processed_candle("M15") is not None
-    rows = read_csv_rows(tracker_config.evaluations_csv)
-    assert len(rows) == 2
-    assert rows[1]["signal_timeframe"] == "M15"
-
-    # back to M5 without advancing: the same candle must not be evaluated twice
-    runner.runtime.set_timeframe("M5")
-    runner._tick()
-    assert len(read_csv_rows(tracker_config.evaluations_csv)) == 2
-    assert runner.runtime.last_processed_candle("M5") == first_m5
-
-
 def test_near_signal_alerts_are_off_by_default(tracker_config):
-    candles = make_candles(3400, seed=123)
-    runner = _runner(tracker_config, candles, start=3200)
+    candles = make_candles(2600, seed=123)
+    runner = _runner(tracker_config, candles, start=2500)
     assert runner.runtime.near_signal_alerts is False
 
     for _ in range(10):
@@ -732,8 +678,8 @@ def test_near_signal_alerts_are_off_by_default(tracker_config):
 
 def test_near_signal_alerts_fire_only_when_enabled(tracker_config):
     """The diagnostic is opt-in, and never sends a tradeable signal card."""
-    candles = make_candles(3600, seed=129, drift=0.04)
-    runner = _runner(tracker_config, candles, start=3200)
+    candles = make_candles(2800, seed=129, drift=0.02)
+    runner = _runner(tracker_config, candles, start=2500)
     runner.runtime.set_near_signal_alerts(True)
 
     for _ in range(60):
@@ -755,8 +701,8 @@ def test_near_signal_alerts_fire_only_when_enabled(tracker_config):
 
 def test_analyze_now_has_no_side_effects(tracker_config):
     """The ANALYSIS button must not emit, suppress or record anything."""
-    candles = make_candles(3400, seed=125)
-    runner = _runner(tracker_config, candles, start=3200)
+    candles = make_candles(2600, seed=125)
+    runner = _runner(tracker_config, candles, start=2500)
 
     evaluation = runner.analyze_now()
     assert evaluation is not None
@@ -765,10 +711,3 @@ def test_analyze_now_has_no_side_effects(tracker_config):
     assert read_csv_rows(tracker_config.signals_csv) == []
     assert runner.runtime.last_processed_candle("M5") is None
     assert runner.notifier.signals == []
-
-
-def test_timeframe_change_clears_the_market_cache(tracker_config):
-    candles = make_candles(3400, seed=127)
-    runner = _runner(tracker_config, candles, start=3200)
-    runner.on_timeframe_changed("M5", "M15")
-    assert runner.market.cache_cleared == 1

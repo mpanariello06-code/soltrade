@@ -40,39 +40,67 @@ def button_text(keyboard):
 # --------------------------------------------------------------------------- #
 # panel rendering
 # --------------------------------------------------------------------------- #
-def test_main_panel_shows_the_required_fields(controller):
+def test_main_panel_matches_the_specified_layout(controller):
     text = controller.render_panel()
-    for expected in ("XAUUSD SIGNAL ENGINE", "Status:", "Mode:", "Signal TF:",
-                     "Threshold:", "Signals today:"):
+    for expected in ("⚡ XAUUSD SCALPER", "Status:", "Mode: SCALPING", "Timeframe: M1",
+                     "Threshold:", "Signals today:", "Open signals:", "Paper Net R:"):
         assert expected in text, expected
 
 
-def test_main_keyboard_offers_every_documented_control(controller):
+def test_main_keyboard_has_only_the_scalping_controls(controller):
     data = button_data(controller.main_keyboard())
-    for expected in (
-        "run:start", "run:pause", "run:stop",
-        "mode:RESEARCH", "mode:STANDARD", "mode:CONSERVATIVE",
-        "tf:M1", "tf:M5", "tf:M15", "tf:M30", "tf:H1", "tf:H4",
-        "menu:threshold", "view:analysis", "view:performance",
-        "menu:settings", "panel:refresh",
-    ):
-        assert expected in data, expected
+    assert data == [
+        "run:start", "run:pause",
+        "view:analysis", "view:performance", "menu:settings", "panel:refresh",
+    ]
 
 
-def test_active_mode_and_timeframe_are_marked_in_the_keyboard(controller, runtime):
-    runtime.set_mode("RESEARCH")
-    runtime.set_timeframe("M15")
-    labels = button_text(controller.main_keyboard())
-    assert any(label.startswith("●") and "RESEARCH" in label for label in labels)
-    assert "●M15" in labels
-    assert "●M5" not in labels
+def test_no_mode_or_timeframe_buttons_remain(controller):
+    """The selector was removed: this build is M1 SCALPING only."""
+    keyboards = [
+        controller.main_keyboard(),
+        controller.threshold_keyboard(),
+        controller.settings_keyboard(),
+        controller.performance_keyboard(),
+    ]
+    for keyboard in keyboards:
+        for data in button_data(keyboard):
+            assert not data.startswith("mode:"), data
+            assert not data.startswith("tf:"), data
 
 
-def test_research_mode_panel_carries_the_disclaimer(controller, runtime):
-    runtime.set_mode("RESEARCH")
-    assert "RESEARCH MODE" in controller.render_panel()
-    runtime.set_mode("STANDARD")
-    assert "RESEARCH MODE" not in controller.render_panel()
+def test_panel_carries_the_paper_disclaimer(controller):
+    assert "PAPER TEST ONLY" in controller.render_panel()
+
+
+def test_panel_reports_open_signals_and_net_r(isolated_config, runtime, notifier):
+    from performance import build_report
+
+    signals = pd.DataFrame(
+        [{"signal_id": "a", "direction": "BUY", "timestamp": "2024-05-01T10:00:00+00:00",
+          "status": "TP3_HIT", "mode": "SCALPING", "timeframe": "M1", "score": 71,
+          "confidence": 71, "regime": "WEAK_TREND", "session": "LONDON"}]
+    )
+    outcomes = pd.DataFrame(
+        [{"signal_id": "a", "R_multiple": 1.74, "net_r": 1.14, "cost_r": 0.6,
+          "tp_hits": 3, "result": "TP3_HIT", "duration": 5}]
+    )
+
+    class Engine:
+        def open_signals(self):
+            return 2
+
+        def signals_today(self):
+            return 7
+
+    controller = TelegramController(
+        isolated_config, runtime, notifier, engine=Engine(),
+        report_loader=lambda: build_report(signals, outcomes, isolated_config),
+    )
+    text = controller.render_panel()
+    assert "Signals today: 7" in text
+    assert "Open signals: 2" in text
+    assert "Paper Net R: +1.14" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -90,75 +118,6 @@ def test_start_pause_stop_change_the_run_state(controller, runtime):
     controller.handle_callback("run:stop")
     assert runtime.describe()["status"] == STATUS_STOPPED
     assert runtime.is_stopped
-
-
-def test_run_state_survives_a_restart(isolated_config, controller, runtime):
-    controller.handle_callback("run:pause")
-    restored = RuntimeState.load(isolated_config, JsonStateStore(isolated_config.state_file))
-    assert restored.describe()["status"] == STATUS_PAUSED
-
-
-def test_pause_does_not_disconnect_or_reset_anything(controller, runtime):
-    runtime.set_mode("RESEARCH")
-    runtime.set_timeframe("M15")
-    controller.handle_callback("run:pause")
-    state = runtime.describe()
-    assert state["status"] == STATUS_PAUSED
-    assert state["mode"] == "RESEARCH"
-    assert state["signal_timeframe"] == "M15"
-
-
-# --------------------------------------------------------------------------- #
-# mode / timeframe buttons
-# --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("mode", ["RESEARCH", "STANDARD", "CONSERVATIVE"])
-def test_mode_buttons_switch_mode_and_threshold(controller, runtime, mode):
-    _text, _keyboard, toast = controller.handle_callback(f"mode:{mode}")
-    assert runtime.describe()["mode"] == mode
-    assert mode in toast
-    assert runtime.active_threshold() == controller.config.threshold_for(mode, "M5")
-
-
-@pytest.mark.parametrize(
-    "timeframe,confirmation",
-    [("M1", "M5+M15"), ("M5", "M15+H1"), ("M15", "M30+H1"),
-     ("M30", "H1+H4"), ("H1", "H4"), ("H4", "NONE")],
-)
-def test_timeframe_buttons_move_the_whole_hierarchy(controller, runtime, timeframe, confirmation):
-    controller.handle_callback(f"tf:{timeframe}")
-    assert runtime.describe()["signal_timeframe"] == timeframe
-    assert runtime.confirmation_label() == confirmation
-
-
-def test_timeframe_change_clears_the_candle_cache(isolated_config, runtime, notifier):
-    class Engine:
-        def __init__(self):
-            self.calls = []
-
-        def on_timeframe_changed(self, previous, current):
-            self.calls.append((previous, current))
-
-    engine = Engine()
-    controller = TelegramController(isolated_config, runtime, notifier, engine=engine)
-    controller.handle_callback("tf:M15")
-    assert engine.calls == [("M5", "M15")]
-
-    controller.handle_callback("tf:M15")  # same timeframe again
-    assert engine.calls == [("M5", "M15")], "no cache flush when nothing changed"
-
-
-def test_timeframe_and_mode_survive_a_restart(isolated_config, controller):
-    controller.handle_callback("mode:RESEARCH")
-    controller.handle_callback("tf:M30")
-    restored = RuntimeState.load(isolated_config, JsonStateStore(isolated_config.state_file))
-    assert restored.describe()["mode"] == "RESEARCH"
-    assert restored.describe()["signal_timeframe"] == "M30"
-    assert restored.confirmation_label() == "H1+H4"
-
-
-# --------------------------------------------------------------------------- #
-# threshold controls
-# --------------------------------------------------------------------------- #
 def test_threshold_menu_offers_the_documented_steps(controller):
     _text, keyboard, _toast = controller.handle_callback("menu:threshold")
     data = button_data(keyboard)
@@ -167,14 +126,14 @@ def test_threshold_menu_offers_the_documented_steps(controller):
 
 
 def test_threshold_buttons_adjust_and_report_the_new_value(controller, runtime):
-    runtime.set_mode("RESEARCH")
+    base = runtime.active_threshold()
     text, _keyboard, toast = controller.handle_callback("thr:5")
-    assert runtime.active_threshold() == 55.0
-    assert "55" in toast
-    assert "Current threshold: 55" in text
+    assert runtime.active_threshold() == base + 5
+    assert f"{base + 5:.0f}" in toast
+    assert f"Current threshold: {base + 5:.0f}" in text
 
     controller.handle_callback("thr:-1")
-    assert runtime.active_threshold() == 54.0
+    assert runtime.active_threshold() == base + 4
 
 
 def test_threshold_buttons_respect_the_limits(controller, runtime, isolated_config):
@@ -186,17 +145,17 @@ def test_threshold_buttons_respect_the_limits(controller, runtime, isolated_conf
     assert runtime.active_threshold() == isolated_config.min_threshold
 
 
-def test_threshold_reset_button_restores_the_default(controller, runtime):
+def test_threshold_reset_button_restores_the_default(controller, runtime, isolated_config):
     controller.handle_callback("thr:5")
     controller.handle_callback("thr:reset")
-    assert runtime.active_threshold() == 72.0
+    assert runtime.active_threshold() == isolated_config.base_threshold
     assert not runtime.has_threshold_override()
 
 
 def test_threshold_change_persists(isolated_config, controller):
     controller.handle_callback("thr:-5")
     restored = RuntimeState.load(isolated_config, JsonStateStore(isolated_config.state_file))
-    assert restored.active_threshold() == 67.0
+    assert restored.active_threshold() == isolated_config.base_threshold - 5
 
 
 # --------------------------------------------------------------------------- #
@@ -204,12 +163,22 @@ def test_threshold_change_persists(isolated_config, controller):
 # --------------------------------------------------------------------------- #
 def test_settings_menu_lists_the_editable_settings(controller):
     text, keyboard, _toast = controller.handle_callback("menu:settings")
-    for expected in ("Mode:", "Signal timeframe:", "Threshold:", "Cooldown:",
-                     "Minimum R:R", "Session filter:", "Near-signal alerts:"):
+    for expected in ("Mode: SCALPING", "Timeframe: M1", "Threshold:",
+                     "Max holding period:", "Cooldown:", "Minimum R:R",
+                     "Session filter:", "Near-signal alerts:", "Costs assumed"):
         assert expected in text, expected
     data = button_data(keyboard)
-    for expected in ("set:cooldown", "set:rr", "set:session", "set:near", "nav:main"):
+    for expected in ("set:cooldown", "set:rr", "set:hold", "set:session", "set:near", "nav:main"):
         assert expected in data, expected
+
+
+def test_max_holding_can_be_changed_from_settings(controller, runtime, isolated_config):
+    before = runtime.describe()["max_holding_candles"]
+    controller.handle_callback("set:hold")
+    after = runtime.describe()["max_holding_candles"]
+    assert after != before
+    assert after in isolated_config.holding_choices
+    assert effective_config(isolated_config, runtime).max_holding_candles == after
 
 
 def test_settings_buttons_cycle_their_values(controller, runtime, isolated_config):
@@ -275,7 +244,7 @@ def test_credentials_are_never_rendered_into_a_message(isolated_config, runtime,
 
 def test_unknown_callback_falls_back_to_the_main_panel(controller):
     text, keyboard, _toast = controller.handle_callback("danger:rm-rf")
-    assert "XAUUSD SIGNAL ENGINE" in text
+    assert "XAUUSD SCALPER" in text
     assert "panel:refresh" in button_data(keyboard)
 
 
@@ -284,12 +253,12 @@ def test_updates_from_another_chat_are_ignored(controller, runtime):
         {
             "callback_query": {
                 "id": "1",
-                "data": "mode:RESEARCH",
+                "data": "run:pause",
                 "message": {"message_id": 5, "chat": {"id": 999999}},
             }
         }
     )
-    assert runtime.describe()["mode"] == "STANDARD", "an unauthorised chat changed the mode"
+    assert runtime.describe()["status"] == STATUS_RUNNING, "an unauthorised chat paused the engine"
 
 
 def test_updates_from_the_configured_chat_are_applied(controller, runtime, notifier):
@@ -297,12 +266,12 @@ def test_updates_from_the_configured_chat_are_applied(controller, runtime, notif
         {
             "callback_query": {
                 "id": "1",
-                "data": "mode:RESEARCH",
+                "data": "run:pause",
                 "message": {"message_id": 5, "chat": {"id": 4242}},
             }
         }
     )
-    assert runtime.describe()["mode"] == "RESEARCH"
+    assert runtime.describe()["status"] == STATUS_PAUSED
     assert notifier.answers, "the button press was not acknowledged"
     assert notifier.edits[-1]["id"] == 5, "the panel was not edited in place"
 
@@ -310,7 +279,7 @@ def test_updates_from_the_configured_chat_are_applied(controller, runtime, notif
 def test_slash_command_summons_the_panel(controller, notifier):
     controller.process_update({"message": {"chat": {"id": 4242}, "text": "/panel"}})
     assert notifier.messages
-    assert "XAUUSD SIGNAL ENGINE" in notifier.messages[-1]["text"]
+    assert "XAUUSD SCALPER" in notifier.messages[-1]["text"]
 
 
 def test_slash_command_from_another_chat_is_ignored(controller, notifier):
@@ -330,7 +299,7 @@ def test_analysis_view_reports_missing_data_gracefully(controller):
 def test_analysis_view_renders_the_component_breakdown(isolated_config, runtime, notifier):
     from src.signal_engine import SignalEngine
 
-    candles = make_candles(4200, seed=101, drift=0.05)
+    candles = make_candles(2500, seed=101, drift=0.02)
     market = FakeMarket(isolated_config, candles, start=len(candles) - 1)
     engine = SignalEngine(isolated_config)
 
@@ -349,35 +318,12 @@ def test_analysis_view_renders_the_component_breakdown(isolated_config, runtime,
     controller = TelegramController(isolated_config, runtime, notifier, engine=Runner())
     text = controller.render_analysis()
     for expected in ("ANALYSIS", "Bullish Score:", "Bearish Score:", "Regime:",
-                     "Trend:", "HTF:", "Momentum:", "Structure:", "Liquidity:",
-                     "S/R:", "Volume:", "Volatility:", "Price Action:",
-                     "Threshold:", "Decision:"):
+                     "Momentum:", "Price Action:", "Liquidity:", "Structure:",
+                     "S/R:", "Trend:", "Context:", "Volatility:", "Volume:",
+                     "Threshold:", "ATR:", "Spread:", "Cost:", "Decision:"):
         assert expected in text, expected
-    assert "Closed candles only" in text
+    assert "Closed M1 candles only" in text
     assert "Signals today: 3" in controller.render_panel()
-
-
-def test_analysis_marks_a_non_applicable_component(isolated_config, runtime, notifier):
-    """On H4 there is no confirmation timeframe, so HTF must read n/a."""
-    from src.signal_engine import SignalEngine
-
-    runtime.set_timeframe("H4")
-    candles = make_candles(30000, seed=103)
-    market = FakeMarket(isolated_config, candles, start=len(candles) - 1)
-    engine = SignalEngine(isolated_config)
-
-    class Runner:
-        def analyze_now(self):
-            view = effective_config(isolated_config, runtime)
-            snapshot, reason = market.build_snapshot(view)
-            return engine.evaluate(snapshot, config=view) if snapshot else None
-
-    controller = TelegramController(isolated_config, runtime, notifier, engine=Runner())
-    text = controller.render_analysis()
-    assert "HTF:" in text
-    assert "n/a" in text
-
-
 def test_performance_view_reports_no_data_without_csvs(controller):
     assert "No signals recorded yet" in controller.render_performance()
 
@@ -388,17 +334,19 @@ def test_performance_views_come_from_the_csv_data(isolated_config, runtime, noti
     signals = pd.DataFrame(
         [
             {"signal_id": "a", "direction": "BUY", "timestamp": "2024-05-01T10:00:00+00:00",
-             "status": "TP3_HIT", "mode": "RESEARCH", "timeframe": "M5", "score": 56,
+             "status": "TP3_HIT", "mode": "SCALPING", "timeframe": "M1", "score": 56,
              "confidence": 56, "regime": "WEAK_TREND", "session": "LONDON"},
             {"signal_id": "b", "direction": "SELL", "timestamp": "2024-05-01T11:00:00+00:00",
-             "status": "SL_HIT", "mode": "RESEARCH", "timeframe": "M15", "score": 61,
+             "status": "SL_HIT", "mode": "SCALPING", "timeframe": "M1", "score": 61,
              "confidence": 61, "regime": "RANGE", "session": "ASIAN"},
         ]
     )
     outcomes = pd.DataFrame(
         [
-            {"signal_id": "a", "R_multiple": 1.87, "tp_hits": 3, "result": "TP3_HIT", "duration": 90},
-            {"signal_id": "b", "R_multiple": -1.0, "tp_hits": 0, "result": "SL_HIT", "duration": 45},
+            {"signal_id": "a", "R_multiple": 1.87, "net_r": 1.27, "cost_r": 0.6,
+             "tp_hits": 3, "result": "TP3_HIT", "duration": 6},
+            {"signal_id": "b", "R_multiple": -1.0, "net_r": -1.6, "cost_r": 0.6,
+             "tp_hits": 0, "result": "SL_HIT", "duration": 4},
         ]
     )
     controller = TelegramController(
@@ -407,17 +355,18 @@ def test_performance_views_come_from_the_csv_data(isolated_config, runtime, noti
     )
     summary = controller.render_performance()
     assert "Signals: 2" in summary
-    assert "Win Rate: 50.0%" in summary
+    assert "Avg NET R" in summary and "Avg RAW R" in summary
+    assert "Timed out:" in summary
     assert "Best Regime:" in summary and "WEAK_TREND" in summary
     assert "RANGE" in summary
 
-    assert "BY TIMEFRAME" in controller.render_performance("timeframe")
     assert "BY SCORE BAND" in controller.render_performance("score")
     assert "BY REGIME" in controller.render_performance("regime")
-    assert "BY MODE" in controller.render_performance("mode")
+    assert "BY SESSION" in controller.render_performance("session")
+    assert "BY OUTCOME" in controller.render_performance("outcome")
 
     data = button_data(controller.performance_keyboard())
-    for expected in ("perf:timeframe", "perf:score", "perf:regime", "perf:mode"):
+    for expected in ("perf:score", "perf:regime", "perf:session", "perf:outcome"):
         assert expected in data
 
 
@@ -432,22 +381,18 @@ def test_a_failing_report_loader_does_not_break_the_panel(isolated_config, runti
 # --------------------------------------------------------------------------- #
 # duplicate prevention across timeframes and restarts
 # --------------------------------------------------------------------------- #
-def test_processed_candles_are_tracked_per_timeframe(isolated_config, runtime):
-    runtime.mark_candle_processed("M5", "2024-05-01T12:00:00+00:00")
-    runtime.mark_candle_processed("M15", "2024-05-01T11:45:00+00:00")
-
-    assert runtime.last_processed_candle("M5").hour == 12
-    assert runtime.last_processed_candle("M15").minute == 45
-    assert runtime.last_processed_candle("H1") is None
-
+def test_processed_candle_is_tracked_for_m1(isolated_config, runtime):
+    runtime.mark_candle_processed("M1", "2024-05-01T12:00:00+00:00")
+    assert runtime.last_processed_candle().hour == 12
+    assert runtime.last_processed_candle("M5") is None
     stored = read_json(isolated_config.state_file)["last_processed_candles"]
-    assert set(stored) == {"M5", "M15"}
+    assert set(stored) == {"M1"}
 
 
 def test_processed_candles_survive_a_restart(isolated_config, runtime):
-    runtime.mark_candle_processed("M5", "2024-05-01T12:00:00+00:00")
+    runtime.mark_candle_processed("M1", "2024-05-01T12:00:00+00:00")
     restored = RuntimeState.load(isolated_config, JsonStateStore(isolated_config.state_file))
-    assert restored.last_processed_candle("M5") is not None
+    assert restored.last_processed_candle("M1") is not None
 
 
 def test_legacy_single_candle_marker_is_migrated(isolated_config):
@@ -455,7 +400,7 @@ def test_legacy_single_candle_marker_is_migrated(isolated_config):
     store = JsonStateStore(isolated_config.state_file)
     store.update(last_processed_candle="2024-05-01T12:00:00+00:00")
     runtime = RuntimeState.load(isolated_config, store)
-    assert runtime.last_processed_candle("M5") is not None
+    assert runtime.last_processed_candle("M1") is not None
 
 
 def test_state_store_is_shared_without_clobbering(isolated_config):
@@ -468,13 +413,13 @@ def test_state_store_is_shared_without_clobbering(isolated_config):
     tracker.load()
 
     tracker.save_state(last_signal_id="sig-1")
-    runtime.set_mode("RESEARCH")
-    runtime.mark_candle_processed("M5", "2024-05-01T12:00:00+00:00")
+    runtime.set_threshold(77)
+    runtime.mark_candle_processed("M1", "2024-05-01T12:00:00+00:00")
 
     saved = read_json(isolated_config.state_file)
     assert saved["last_signal_id"] == "sig-1"
-    assert saved["runtime"]["mode"] == "RESEARCH"
-    assert saved["last_processed_candles"]["M5"] == "2024-05-01T12:00:00+00:00"
+    assert saved["runtime"]["threshold_override"] == 77.0
+    assert saved["last_processed_candles"]["M1"] == "2024-05-01T12:00:00+00:00"
 
 
 def test_poller_skips_updates_queued_before_startup(isolated_config, runtime, notifier):

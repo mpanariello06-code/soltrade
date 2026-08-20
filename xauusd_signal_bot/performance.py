@@ -73,22 +73,34 @@ class Stats:
     tp2_rate: float = 0.0
     tp3_rate: float = 0.0
     sl_rate: float = 0.0
-    expired_rate: float = 0.0
+    timeout_rate: float = 0.0
     average_duration_min: float = 0.0
 
+    # -- after costs.  These are the numbers that matter for a scalp: a raw
+    # -- edge smaller than the spread is not an edge.
+    total_net_r: float = 0.0
+    average_net_r: float = 0.0
+    net_win_rate: float = 0.0
+    average_cost_r: float = 0.0
+    net_profit_factor: float = 0.0
+    average_mfe_r: float = 0.0
+    average_mae_r: float = 0.0
+    median_minutes_to_tp1: float = 0.0
+
     def as_row(self) -> Dict[str, Any]:
+        """Compact row for the console tables - NET first, deliberately."""
         return {
             "group": self.label,
-            "closed": self.closed,
-            "win%": round(self.win_rate, 1),
-            "avgR": round(self.average_r, 3),
-            "totalR": round(self.total_r, 2),
-            "PF": round(self.profit_factor, 2),
-            "maxDD_R": round(self.max_drawdown_r, 2),
+            "n": self.closed,
+            "netWin%": round(self.net_win_rate, 1),
+            "avgNetR": round(self.average_net_r, 3),
+            "totNetR": round(self.total_net_r, 2),
+            "netPF": round(self.net_profit_factor, 2),
+            "avgRawR": round(self.average_r, 3),
+            "cost R": round(self.average_cost_r, 2),
             "TP1%": round(self.tp1_rate, 1),
-            "TP2%": round(self.tp2_rate, 1),
-            "TP3%": round(self.tp3_rate, 1),
             "SL%": round(self.sl_rate, 1),
+            "TO%": round(self.timeout_rate, 1),
         }
 
 
@@ -108,26 +120,18 @@ class Report:
     by_session: List[Stats] = field(default_factory=list)
     by_regime: List[Stats] = field(default_factory=list)
     by_confidence: List[Stats] = field(default_factory=list)
-    by_mode: List[Stats] = field(default_factory=list)
-    by_timeframe: List[Stats] = field(default_factory=list)
     by_score_band: List[Stats] = field(default_factory=list)
+    by_result: List[Stats] = field(default_factory=list)
 
     def best_regime(self) -> str:
-        """Regime with the highest average R (needs at least one closed signal)."""
+        """Regime with the highest average NET R (at least one closed signal)."""
         ranked = [s for s in self.by_regime if s.closed > 0]
-        return max(ranked, key=lambda s: s.average_r).label if ranked else "-"
+        return max(ranked, key=lambda s: s.average_net_r).label if ranked else "-"
 
     def worst_regime(self) -> str:
-        """Regime with the lowest average R."""
+        """Regime with the lowest average NET R."""
         ranked = [s for s in self.by_regime if s.closed > 0]
-        return min(ranked, key=lambda s: s.average_r).label if ranked else "-"
-
-    def stats_for_mode(self, mode: str) -> Optional[Stats]:
-        """Stats for one operating mode, or ``None`` when it has no signals."""
-        for stats in self.by_mode:
-            if stats.label.upper() == str(mode).upper():
-                return stats
-        return None
+        return min(ranked, key=lambda s: s.average_net_r).label if ranked else "-"
 
 
 # --------------------------------------------------------------------------- #
@@ -182,9 +186,21 @@ def merge_outcomes(signals: pd.DataFrame, outcomes: pd.DataFrame) -> pd.DataFram
         merged["score"] = merged["confidence"]
     if "mode" not in merged.columns:
         merged["mode"] = ""
-    merged["mode"] = merged["mode"].fillna("").replace("", "STANDARD")
+    merged["mode"] = merged["mode"].fillna("").replace("", "SCALPING")
     if "timeframe" not in merged.columns:
-        merged["timeframe"] = ""
+        merged["timeframe"] = "M1"
+
+    # NET R is the headline for a scalp.  Rows written by an older build have no
+    # net column; fall back to raw so they still aggregate, and to a zero cost.
+    if "net_r" in merged.columns:
+        merged["net_r"] = pd.to_numeric(merged["net_r"], errors="coerce")
+        merged["net_r"] = merged["net_r"].fillna(merged["R_multiple"])
+    else:
+        merged["net_r"] = merged["R_multiple"]
+    if "cost_r" in merged.columns:
+        merged["cost_r"] = pd.to_numeric(merged["cost_r"], errors="coerce").fillna(0.0)
+    else:
+        merged["cost_r"] = 0.0
     return merged.dropna(subset=["R_multiple"])
 
 
@@ -204,12 +220,13 @@ def max_drawdown(r_series: Sequence[float]) -> float:
 
 
 def compute_stats(frame: pd.DataFrame, label: str = "ALL") -> Stats:
-    """Compute expectancy statistics for one group of closed signals."""
+    """Compute expectancy statistics, raw and after costs, for one group."""
     stats = Stats(label=label)
     if frame is None or frame.empty:
         return stats
 
     r_values = frame["R_multiple"].astype(float)
+    net_values = frame["net_r"].astype(float)
     stats.closed = int(len(frame))
     stats.wins = int((r_values > 0).sum())
     stats.losses = int((r_values < 0).sum())
@@ -222,7 +239,19 @@ def compute_stats(frame: pd.DataFrame, label: str = "ALL") -> Stats:
     gross_profit = float(r_values[r_values > 0].sum())
     gross_loss = abs(float(r_values[r_values < 0].sum()))
     stats.profit_factor = safe_div(gross_profit, gross_loss, float("inf") if gross_profit > 0 else 0.0)
-    stats.max_drawdown_r = max_drawdown(r_values.tolist())
+    stats.max_drawdown_r = max_drawdown(net_values.tolist())
+
+    # -- after costs -------------------------------------------------------- #
+    stats.total_net_r = float(net_values.sum())
+    stats.average_net_r = float(net_values.mean())
+    stats.net_win_rate = 100.0 * safe_div(int((net_values > 0).sum()), stats.closed)
+    net_profit = float(net_values[net_values > 0].sum())
+    net_loss = abs(float(net_values[net_values < 0].sum()))
+    stats.net_profit_factor = safe_div(
+        net_profit, net_loss, float("inf") if net_profit > 0 else 0.0
+    )
+    if "cost_r" in frame.columns:
+        stats.average_cost_r = float(pd.to_numeric(frame["cost_r"], errors="coerce").mean() or 0.0)
 
     hits = frame["tp_hits"].astype(int)
     stats.tp1_rate = 100.0 * safe_div(int((hits >= 1).sum()), stats.closed)
@@ -232,9 +261,20 @@ def compute_stats(frame: pd.DataFrame, label: str = "ALL") -> Stats:
     if "result" in frame.columns:
         results = frame["result"].astype(str)
         stats.sl_rate = 100.0 * safe_div(int((results == "SL_HIT").sum()), stats.closed)
-        stats.expired_rate = 100.0 * safe_div(int((results == "EXPIRED").sum()), stats.closed)
+        stats.timeout_rate = 100.0 * safe_div(int((results == "TIMEOUT").sum()), stats.closed)
     if "duration" in frame.columns:
-        stats.average_duration_min = float(pd.to_numeric(frame["duration"], errors="coerce").mean() or 0.0)
+        stats.average_duration_min = float(
+            pd.to_numeric(frame["duration"], errors="coerce").mean() or 0.0
+        )
+    for column, attribute in (("mfe_r", "average_mfe_r"), ("mae_r", "average_mae_r")):
+        if column in frame.columns:
+            setattr(
+                stats, attribute,
+                float(pd.to_numeric(frame[column], errors="coerce").mean() or 0.0),
+            )
+    if "minutes_to_tp1" in frame.columns:
+        reached = pd.to_numeric(frame["minutes_to_tp1"], errors="coerce").dropna()
+        stats.median_minutes_to_tp1 = float(reached.median()) if len(reached) else 0.0
     return stats
 
 
@@ -297,9 +337,8 @@ def build_report(signals: pd.DataFrame, outcomes: pd.DataFrame, config=None) -> 
     report.by_session = _group_stats(merged, "session")
     report.by_regime = _group_stats(merged, "regime")
     report.by_confidence = _confidence_stats(merged, config)
-    report.by_mode = _group_stats(merged, "mode")
-    report.by_timeframe = _group_stats(merged, "timeframe")
     report.by_score_band = _score_band_stats(merged)
+    report.by_result = _group_stats(merged, "result")
     return report
 
 
@@ -320,13 +359,18 @@ def _table(rows: List[Dict[str, Any]]) -> str:
 
 
 def render_report(report: Report) -> str:
-    """Format the report for the console."""
+    """Format the report for the console.
+
+    NET figures lead throughout.  On a scalp the spread is a large fraction of
+    the target, so a raw-R headline would be actively misleading.
+    """
     overall = report.overall
-    profit_factor = "inf" if overall.profit_factor == float("inf") else f"{overall.profit_factor:.2f}"
+    net_pf = "inf" if overall.net_profit_factor == float("inf") else f"{overall.net_profit_factor:.2f}"
+    raw_pf = "inf" if overall.profit_factor == float("inf") else f"{overall.profit_factor:.2f}"
     lines = [
-        "=" * 72,
-        "XAUUSD SIGNAL ENGINE - PAPER PERFORMANCE",
-        "=" * 72,
+        "=" * 76,
+        "XAUUSD M1 SCALPER - PAPER PERFORMANCE",
+        "=" * 76,
         f"Total signals      : {report.total_signals}",
         f"  BUY / SELL       : {report.buy_signals} / {report.sell_signals}",
         f"  still open       : {report.active_signals}",
@@ -334,48 +378,52 @@ def render_report(report: Report) -> str:
         f"Average per day    : {report.average_signals_per_day:.2f}",
         f"Period             : {report.first_signal or '-'}  ->  {report.last_signal or '-'}",
         "",
-        "--- EXPECTANCY " + "-" * 57,
-        f"Win rate           : {overall.win_rate:.1f}%   ({overall.wins} wins)",
-        f"Loss rate          : {overall.loss_rate:.1f}%   ({overall.losses} losses)",
-        f"Breakeven          : {overall.breakeven}",
-        f"Average R          : {overall.average_r:+.3f}R   <- expectancy per signal",
-        f"Total R            : {overall.total_r:+.2f}R",
-        f"Profit factor      : {profit_factor}",
-        f"Max drawdown       : {overall.max_drawdown_r:.2f}R",
-        f"Average duration   : {overall.average_duration_min:.0f} min",
+        "--- AFTER COSTS (the numbers that matter) " + "-" * 33,
+        f"Net win rate       : {overall.net_win_rate:.1f}%",
+        f"Average NET R      : {overall.average_net_r:+.3f}R   <- expectancy per scalp",
+        f"Total NET R        : {overall.total_net_r:+.2f}R",
+        f"Net profit factor  : {net_pf}",
+        f"Average cost       : {overall.average_cost_r:.2f}R per trade",
+        f"Max drawdown (net) : {overall.max_drawdown_r:.2f}R",
         "",
-        "--- TARGET HIT RATES " + "-" * 51,
+        "--- BEFORE COSTS (for reference only) " + "-" * 37,
+        f"Raw win rate       : {overall.win_rate:.1f}%   ({overall.wins} wins)",
+        f"Average RAW R      : {overall.average_r:+.3f}R",
+        f"Total RAW R        : {overall.total_r:+.2f}R",
+        f"Raw profit factor  : {raw_pf}",
+        "",
+        "--- SCALP BEHAVIOUR " + "-" * 55,
         f"TP1 reached        : {overall.tp1_rate:.1f}%",
         f"TP2 reached        : {overall.tp2_rate:.1f}%",
         f"TP3 reached        : {overall.tp3_rate:.1f}%",
         f"Closed at SL       : {overall.sl_rate:.1f}%",
-        f"Expired            : {overall.expired_rate:.1f}%",
+        f"Timed out          : {overall.timeout_rate:.1f}%",
+        f"Average hold       : {overall.average_duration_min:.1f} min",
+        f"Median mins to TP1 : {overall.median_minutes_to_tp1:.1f}",
+        f"Average MFE / MAE  : {overall.average_mfe_r:+.2f}R / {overall.average_mae_r:+.2f}R",
         "",
-        "--- BY MODE " + "-" * 60,
-        _table([s.as_row() for s in report.by_mode]),
-        "",
-        "--- BY TIMEFRAME " + "-" * 55,
-        _table([s.as_row() for s in report.by_timeframe]),
-        "",
-        "--- BY SCORE BAND " + "-" * 54,
+        "--- BY SCORE BAND " + "-" * 56,
         "  Does a higher score actually mean a better outcome?  Measure, do not assume.",
         _table([s.as_row() for s in report.by_score_band]),
         "",
-        "--- BY DIRECTION " + "-" * 55,
+        "--- BY OUTCOME " + "-" * 59,
+        _table([s.as_row() for s in report.by_result]),
+        "",
+        "--- BY DIRECTION " + "-" * 57,
         _table([s.as_row() for s in report.by_direction]),
         "",
-        "--- BY SESSION " + "-" * 57,
+        "--- BY SESSION " + "-" * 59,
         _table([s.as_row() for s in report.by_session]),
         "",
-        "--- BY REGIME " + "-" * 58,
+        "--- BY REGIME " + "-" * 60,
         _table([s.as_row() for s in report.by_regime]),
         "",
-        "--- BY CONFIDENCE " + "-" * 54,
+        "--- BY CONFIDENCE " + "-" * 56,
         _table([s.as_row() for s in report.by_confidence]),
         "",
-        "=" * 72,
+        "=" * 76,
         "Paper results only. Past performance does not imply future results.",
-        "=" * 72,
+        "=" * 76,
     ]
     return "\n".join(lines)
 
@@ -388,7 +436,7 @@ def analyse(signals_path: Path, outcomes_path: Path, config=None) -> Report:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
     config = load_config()
-    parser = argparse.ArgumentParser(description="XAUUSD signal engine performance report")
+    parser = argparse.ArgumentParser(description="XAUUSD M1 scalper performance report")
     parser.add_argument("--signals", type=Path, default=config.signals_csv)
     parser.add_argument("--outcomes", type=Path, default=config.outcomes_csv)
     args = parser.parse_args(argv)

@@ -1,323 +1,318 @@
-# Build Report — Research Mode & Telegram Control Upgrade
+# Build Report — M1 Micro-Scalping Simplification
 
-Upgrade of the existing `xauusd_signal_bot` project. **The project was not
-rebuilt.** The scoring architecture, the nine analysis engines, their weights
-and the anti-lookahead machinery are unchanged; the work added an operating-mode
-layer, live Telegram control, multi-timeframe support and richer data capture
-on top of them.
+Third iteration of `xauusd_signal_bot`. **The project was not rebuilt.** The
+nine analysis engines, the scoring architecture, the CSV/state layer and the
+anti-lookahead machinery were kept and adapted; the multi-mode and
+multi-timeframe layers were removed, and a micro-scalping target model, a cost
+model and detailed outcome tracking were added.
 
-* **Tests:** 252 passing (was 151), ~90 s
-* **Static analysis:** `pyflakes` clean across all modules
-* **Order execution:** still none — verified by grep, see [Verification](#verification-performed)
-
----
-
-## 1. What changed, and why
-
-### The one architectural seam
-
-Rather than thread a settings object through every engine, all live settings are
-folded into a **copy of the config** by `src/runtime_state.py::config_view()`.
-Every analysis engine still reads plain config attributes (`signal_timeframe`,
-`base_threshold`, …) exactly as before — they simply now reflect whatever the
-Telegram panel last set. This is why a fairly large feature set landed without
-touching `trend.py`, `momentum.py`, `structure.py`, `liquidity.py`,
-`support_resistance.py`, `volume.py`, `volatility.py`, `price_action.py` or
-`regime.py` at all.
-
-The same function backs the backtester, so an offline run reproduces exactly
-what live mode would do for a given mode/timeframe.
-
-### Threshold model
-
-The old model stored one **absolute** threshold per regime. That could not
-express "mode × timeframe × regime". It is now compositional:
-
-```
-effective threshold = base(mode, signal timeframe)
-                    + regime offset
-                    + counter-trend extra
-                    → clamped to [min_threshold, max_threshold]
-```
-
-The regime offsets were derived from the previous absolute values, so
-**STANDARD/M5 behaviour is numerically identical to before** (68 / 72 / 77 for
-strong-trend / weak-trend / range).
-
-### Scoring: weight renormalisation
-
-H4 has no confirmation timeframe, so the HTF component (15 points) cannot apply.
-Scoring it as a flat zero would silently cap every H4 score at 85 and make the
-thresholds meaningless. `ComponentScore` gained an `applicable` flag; a component
-that is *present and explicitly inapplicable* releases its weight, which is
-redistributed proportionally across the rest.
-
-This is deliberately narrow: a component merely **absent** from the mapping does
-*not* trigger redistribution, so passing a partial component set (as unit tests
-do) behaves exactly as before.
+* **Tests:** 216 passing (was 252 — the mode/timeframe suites were deleted, not
+  weakened; scalping-specific ones replaced them), ~100 s
+* **Static analysis:** `pyflakes` clean across every module
+* **Order execution:** still none anywhere
+* **Headline finding:** after costs the strategy is **negative** on the test
+  data — see [§9](#9-measured-results-and-what-they-mean)
 
 ---
 
-## 2. Files
+## 1. What was removed
 
-### New
-
-| File | Purpose |
+| Removed | Why |
 |---|---|
-| `src/timeframes.py` | Supported timeframes, confirmation hierarchy, micro-timeframe map, mode constants |
-| `src/runtime_state.py` | `JsonStateStore` (single-writer state.json), `RuntimeState` (live settings), `config_view` / `effective_config` |
-| `src/telegram_control.py` | Inline-button panel, callback routing, long-poll thread |
-| `tests/test_research_mode.py` | 47 tests — modes, thresholds, near-signal, research data capture, score bands |
-| `tests/test_telegram_control.py` | 44 tests — panel, buttons, run state, safety, duplicate prevention |
-| `BUILD_REPORT.md` | This document |
+| RESEARCH / STANDARD / CONSERVATIVE modes | Replaced by a single `SCALPING` mode |
+| `mode_timeframe_thresholds` matrix | Replaced by one `SCALP_THRESHOLD` |
+| M5 / M15 / M30 / H1 / H4 as signal timeframes | M1 only, enforced by `config.validate()` |
+| The confirmation *hierarchy* (`M1→M5+M15`, `M5→M15+H1`, …) | Replaced by one optional M5 context timeframe |
+| Telegram mode buttons and timeframe buttons | Nothing left to switch |
+| `set_mode` / `set_timeframe` / `config_view` | Runtime state no longer carries either |
+| `--mode` / `--timeframe` / `--source-timeframe` backtest flags | M1-only |
+| Per-timeframe cooldown scoping, per-timeframe outcome tracking | Only one timeframe exists |
 
-### Modified
+The `htf` component **key** was kept (weight, scorecard key, CSV column) so
+stored data stays readable; it now means "M5 context" and the engine is
+`analyze_context`.
 
-| File | Change |
-|---|---|
-| `config.py` | Mode/timeframe threshold matrix, regime **offsets**, min/max limits, near-signal settings, Telegram control settings, editable-settings whitelist, `threshold_for()` / `clamp_threshold()` |
-| `src/market_data.py` | Timeframe-driven `build_snapshot`, optional confirmation frames, candle cache with per-timeframe TTL, `latest_closed_candle_time` probe, `_MT5_LOCK` around every terminal call |
-| `src/scoring.py` | Weight renormalisation for inapplicable components; `weight_scale` / `excluded_components` on the scorecard |
-| `src/trend.py` | `analyze_htf` handles two / one / zero confirmation timeframes |
-| `src/filters.py` | Compositional `adaptive_threshold`, new `is_near_signal` |
-| `src/signal_engine.py` | Per-call config, `NEAR_SIGNAL` decision, mode/timeframe/threshold on `Signal` and `Evaluation`, extended `EVALUATION_COLUMNS` |
-| `src/signal_tracker.py` | Shared state store, per-timeframe `update()` and cooldown scoping, `active_timeframes()`, new CSV columns |
-| `src/telegram_bot.py` | Inline keyboards, `edit_message`, `answer_callback`, `get_updates`, research + near-signal formats |
-| `src/utils.py` | `ComponentScore.applicable` |
-| `main.py` | Runtime state, control-panel wiring, PAUSE/STOP, per-timeframe tracking, cheap new-candle probe, `analyze_now()` |
-| `performance.py` | By mode, by timeframe, by score band; `best_regime` / `worst_regime` / `stats_for_mode` |
-| `backtest.py` | `--mode`, `--timeframe`, `--source-timeframe`; resamples to the active hierarchy; optional confirmation frames |
-| `tests/conftest.py` | Shared `FakeNotifier`, `FakeMarket`, `isolated_config` |
-| `tests/test_*.py` | Updated for the new threshold model and CSV schemas |
-| `README.md`, `.env.example` | Documented the new features |
+### Why M15/H1/H4 context went too
+
+The spec removed higher-timeframe *selection*. I also dropped higher-timeframe
+*confirmation* beyond M5, and that is a judgement call worth flagging: a
+one-hour trend has almost no bearing on a position held for three minutes, and
+keeping it made the engine reject good scalps for disagreeing with a timeframe
+that would not resolve inside the holding window. M5 context is retained at a
+reduced weight (15 → 6) and can be switched off entirely.
 
 ---
 
-## 3. New Telegram controls
+## 2. What was added
 
-Send `/panel` (or `/start`, `/menu`) to summon it. Buttons are the interface;
-those commands exist only to bring the panel up.
-
-| Button | Callback | Effect |
-|---|---|---|
-| ▶️ START / ⏸ PAUSE / ⏹ STOP | `run:*` | PAUSE keeps MT5 connected and keeps tracking open signals but generates none; STOP exits the loop cleanly |
-| 🔬 / 📊 / 🛡 | `mode:*` | Switch mode; the threshold follows |
-| M1…H4 | `tf:*` | Switch signal timeframe; the confirmation hierarchy follows and the candle cache is cleared |
-| 🎯 THRESHOLD | `menu:threshold`, `thr:±1`, `thr:±5`, `thr:reset` | Adjust the base threshold, clamped to 40–95 |
-| 📊 ANALYSIS | `view:analysis` | On-demand evaluation of the latest **closed** candle. Read-only |
-| 📈 PERFORMANCE | `view:performance`, `perf:{timeframe,score,regime,mode}` | Straight from the CSVs |
-| ⚙️ SETTINGS | `menu:settings`, `set:{cooldown,rr,session,near}` | Cycle each editable value |
-| 🔄 REFRESH | `panel:refresh` | Redraw |
-
-The active mode and timeframe are marked `●` in the keyboard. The panel is
-edited **in place** rather than re-posted.
-
-**Safety.** Updates from any chat other than `TELEGRAM_CHAT_ID` are dropped. Only
-settings listed in `Config.telegram_editable_settings` have handlers —
-credentials, tokens, symbol and file paths are unreachable and are never
-rendered into a message (asserted by test). On startup the poller discards
-updates queued while the engine was down, so a restart never replays stale
-presses.
-
----
-
-## 4. Supported timeframes
-
-| Signal TF | Intermediate | Higher | Micro (TP/SL ordering) | STANDARD | RESEARCH | CONSERVATIVE |
-|---|---|---|---|---|---|---|
-| M1 | M5 | M15 | — | 80 | 55 | 88 |
-| M5 | M15 | H1 | M1 | 72 | 50 | 80 |
-| M15 | M30 | H1 | M1 | 70 | 50 | 78 |
-| M30 | H1 | H4 | M5 | 68 | 50 | 76 |
-| H1 | H4 | — | M5 | 65 | 50 | 73 |
-| H4 | — | — | M15 | 65 | 50 | 73 |
-
-CONSERVATIVE is derived as STANDARD + 8, which puts M5 at the specified 80.
-
-**None of these values are claimed to be optimal or profitable.** They are
-starting points chosen so faster (noisier) timeframes demand more confirmation.
-
----
-
-## 5. Threshold behaviour
+### Cost model (`config.round_trip_cost`)
 
 ```
-effective = base(mode, timeframe) + regime offset + counter-trend extra
-            clamped to [40, 95]
+spread + entry slippage + exit slippage + commission (both sides)
 ```
 
-Regime offsets: strong trend −4, weak trend / breakout 0, low volatility +3,
-range / high volatility +5. Extreme volatility blocks signalling entirely
-(configurable). Counter-trend setups add +5.
+Defaults: 20-point spread + 2+2 points slippage = **2.4 pips per round trip**.
+When the live spread is unknown (backtests) `ASSUMED_SPREAD_POINTS` is charged,
+so a backtest never trades for free.
 
-Threshold overrides set from Telegram are stored **per mode and per timeframe**,
-so raising the RESEARCH/M5 bar does not affect STANDARD/M5 or RESEARCH/M15.
-`RESET` drops the override and returns to the configured default.
+Everything downstream reports **RAW R and NET R**. `cost_r` is fixed at signal
+time and carried into the outcome, so NET R never depends on the spread at
+close.
+
+### Micro-scalping target model (`src/targets.py`, rewritten)
+
+Distances come from the live M1 ATR, then three floors apply:
+
+1. `tp_atr_multiples × ATR` — market conditions
+2. `min_tp_pips` — the tick grid
+3. TP1 only: `MIN_TP1_COST_MULTIPLE × cost` — worth taking at all
+
+If the cost floor lifts TP1, **the whole ladder lifts proportionally**. Merely
+re-spacing TP2/TP3 by a minimum gap would collapse them onto TP1 and silently
+turn a 1:2 setup into a 1:1 one; the geometry has to say honestly that a wider
+spread demands a bigger move.
+
+Rejections: TP1 that cannot clear costs, and a cost-adjusted TP3 beyond
+`MAX_TP3_PIPS` (a "scalp" needing 20 pips is not a scalp).
+
+### Timeout
+
+`MAX_HOLDING_CANDLES` (default 15 minutes). A scalp that has not resolved is
+marked to market and recorded as `TIMEOUT`. `STATUS_EXPIRED` was renamed
+throughout. Nothing sits active indefinitely.
+
+### Detailed outcome record
+
+`outcomes.csv` gained: `raw_r`, `net_r`, `cost_r`, `spread_points`,
+`minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_price`, `mae_price`,
+`mfe_pips`, `mae_pips`, `timeout`, `ambiguous_bars`.
+
+### Tick-based ambiguity resolution
+
+`MarketData.refresh_tick_buffer` keeps a rolling, incrementally-fetched tick
+buffer; the tracker replays it to decide whether the target or the stop came
+first inside a candle that traded through both. Without ticks the pessimistic
+assumption applies. At scalping distances this is a large systematic penalty,
+which is why the live path bothers.
+
+### M1 microstructure features
+
+`evaluations.csv` grew from 23 to **41** `f_*` columns, adding `atr_pips`,
+`spread_pips`, `cost_pips`, `atr_to_cost`, `range_pips`, `body_pips`,
+`upper/lower_wick_pips`, `close_location`, `displacement_atr`,
+`velocity_pips_per_min`, `acceleration`, `micro_range_pips_5/15`,
+`dist_to_high/low_5_pips`, `minute_of_hour`, `hour_of_day`.
 
 ---
 
-## 6. Data collection for future ML
+## 3. Re-weighting for M1 (documented, not optimised)
 
-No ML is implemented. The dataset needed to train one later is now complete:
+| Component | Was | Now | Reason |
+|---|---|---|---|
+| Momentum | 15 | **22** | Short-term momentum and acceleration drive a 3-minute move |
+| Price action | 5 | **18** | Displacement and candle shape are the M1 signal |
+| Liquidity | 10 | **14** | Sweeps of the immediate highs/lows |
+| Structure | 15 | **12** | Micro BOS/CHoCH still useful |
+| Support/Resistance | 10 | 10 | The levels the next few pips must clear |
+| Trend | 20 | **10** | A slow trend matters far less at this horizon |
+| Context (`htf`) | 15 | **6** | M5 only, secondary |
+| Volatility | 5 | 5 | Is the move big relative to noise |
+| Volume | 5 | **3** | Weakest signal on M1 |
 
-* `evaluations.csv` — **one row per evaluated candle, signal or not**, now
-  including `mode`, `signal_timeframe`, `confirmation_timeframes`,
-  `threshold_used`, `near_signal`, the nine component sub-scores, regime,
-  session, spread, decision, rejection reason, and 23 raw `f_*` features.
-  In the verification run: 400 evaluations, of which 328 `NO_SIGNAL`, 66
-  `NEAR_SIGNAL` and 8 signals — losers and non-events are kept, not just winners.
-* `signals.csv` — adds `mode`, `signal_timeframe`, `confirmation_timeframes`,
-  `threshold_used`, `score`.
-* `outcomes.csv` — adds `mode`, `timeframe`, `score`, `threshold_used`, so
-  outcomes group by mode/timeframe/score band without a join.
+Indicator periods shortened: EMA 9/21/50/200 → **5/13/34/100**, RSI 14 → 9,
+MACD 12/26/9 → 6/13/5, structure fractal 2-bar → **1-bar**, ATR history 100 →
+120 minutes.
 
-Research signals are tracked to TP1/TP2/TP3/SL/expiry exactly like standard
-ones, as paper simulations.
+**None of this was tuned against results.** It was chosen by reasoning about the
+holding period, and the report below shows it does not rescue the economics.
 
 ---
 
-## 7. Verification performed
+## 4. Files
 
-All checks run on this machine. Live MT5 mode needs Windows, so the live loop was
-exercised through the real `SignalRunner` and `TelegramController` with a fake
-market feed and a fake Telegram transport.
+**New:** `tests/test_scalping.py` (47 tests).
+**Deleted:** `tests/test_research_mode.py`, `tests/test_targets.py` (superseded).
+
+**Rewritten:** `src/targets.py`, `src/timeframes.py`, `main.py` docstring/loop,
+`backtest.py`, large parts of `src/telegram_control.py` and `performance.py`.
+
+**Modified:** `config.py` (weights, indicator periods, threshold, cost model,
+targets, timeout, limits, validation), `src/market_data.py` (M1+context
+snapshot, tick buffer), `src/signal_tracker.py` (timeout, milestone timing, net
+R, schemas), `src/signal_engine.py` (M1 evaluation, microstructure features),
+`src/trend.py` (`analyze_htf` → `analyze_context`), `src/filters.py` (spread and
+net R:R gates), `src/runtime_state.py` (mode/timeframe removed), `src/telegram_bot.py`
+(scalp card), `src/scoring.py`, `walkforward.py`, `make_synthetic_history.py`,
+`README.md`, `.env.example`, `tests/conftest.py`, remaining test modules.
+
+---
+
+## 5. Telegram
+
+Main panel is exactly the specified layout:
+
+```
+⚡ XAUUSD SCALPER
+Status / Mode: SCALPING / Timeframe: M1 / Threshold
+Signals today / Open signals / Paper Net R
+[START] [PAUSE]
+[CURRENT ANALYSIS]
+[PERFORMANCE]
+[SETTINGS]
+[REFRESH]
+```
+
+STOP moved into Settings so it cannot be hit while reaching for PAUSE.
+Performance views are BY SCORE / BY REGIME / BY SESSION / BY OUTCOME, all
+leading with NET R. The signal card matches the specified scalp format and adds
+an "After costs" block — quoting raw R alone on a few-pip target would be
+misleading.
+
+Safety is unchanged: foreign chats ignored, only whitelisted settings reachable,
+credentials never rendered (asserted by test), startup backlog discarded.
+
+---
+
+## 6. Tests
+
+216 passing. New coverage for: M1/SCALPING invariants (including that
+`set_mode`/`set_timeframe` are gone), cost-model arithmetic and fallbacks, pip
+conversion, ATR-scaled targets, all three target floors, proportional ladder
+lifting, exact-rounded-price R:R, net-below-raw, wider-spread-worse-net,
+cost-based rejection, scalp-range rejection, stop noise floor and ATR ceiling,
+spread-vs-holding-window gate, net R:R gate rejecting a raw winner, timeout at
+the limit / mark-to-market / never-indefinitely / configurable, milestone
+timing, excursions in R and price, full outcome row, cost_r derivation,
+pessimistic ambiguity, tick-resolved target-first and stop-first, ticks outside
+the bar ignored, and ticks that are themselves ambiguous.
+
+---
+
+## 7. Bugs found and fixed
+
+1. **Target geometry was structurally incoherent.** I first set TP2 at 0.90×ATR
+   with the stop also at 0.90×ATR, so R:R was ~1.0 by construction while
+   `MIN_TP2_RR` demanded 1.2 — the gate rejected essentially everything. Fixed
+   by separating the multiples (TP 0.45/1.00/1.70, SL 0.70) and adding a
+   `validate()` check that TP2 must exceed the stop.
+
+2. **The stop ceiling let HYBRID break the ladder.** The structure branch takes
+   the *wider* distance, which on M1 routinely put the stop at the old 1.80×ATR
+   cap while targets stayed put — R:R below 1 again. Capped at 0.80×ATR, with a
+   second `validate()` check that the widest allowed stop still permits
+   `MIN_TP2_RR`. Without these two fixes the engine emitted **zero** signals.
+
+3. **The spread filter was calibrated for M5.** It compared the spread with a
+   single candle's ATR; on M1 those are nearly the same size, so it rejected
+   every candle. Replaced with spread vs the move available over the holding
+   window (ATR × √candles).
+
+4. **`FakeMarket` ignored `candles_signal`**, feeding the engine 4,601 candles
+   where live feeds 900. A longer window changes which reference levels exist
+   (a previous *day* only appears once the window spans one), so the double was
+   not reproducing live behaviour.
+
+5. **`FakeNotifier.send_outcome` had a stale signature** after `net_r` was
+   added, which silently routed every outcome alert into the tracker's
+   exception handler. Caught because the handler logged rather than swallowing —
+   worth noting the handler did its job.
+
+6. **`MAX_SIGNALS_PER_DAY=8` was an M5-era cap** and bound long before the
+   engine's own filters on M1 (1,440 candles/day). Raised to 30; it exists to
+   keep Telegram usable, not as quality control.
+
+---
+
+## 8. Verification performed
+
+Live MT5 mode needs Windows, so the loop was exercised through the real
+`SignalRunner` and `TelegramController` with fake market and Telegram feeds.
 
 | # | Check | Result |
 |---|---|---|
-| 1 | Full test suite | **252 passed**, 0 failed, 0 skipped |
-| 2 | `pyflakes` on every module and test | clean |
-| 3 | Research backtest, 6,361 M5 bars | 105 signals vs 49 in STANDARD — more candidates, same engine |
-| 4 | Timeframe backtests | M5 ✓, M15 ✓ (38 signals), H1 ✓ (77), H4 ✓ (28) |
-| 5 | M1 from M5 history | rejected with a clear message, as it must be |
-| 6 | H4 weight renormalisation | HTF excluded, `weight_scale` 1.176, score still reaches 100 |
-| 7 | Telegram buttons | every callback exercised: mode, timeframe, run state, threshold, settings, analysis, performance |
-| 8 | Pause / resume | 20 polls while paused → **0** evaluations; 5 polls after resume → **5** |
-| 9 | Threshold clamping | pinned at 95 and 40 under repeated presses |
-| 10 | Duplicate prevention | 8 further polls on the same candle → **0** new rows; no duplicate timestamps, signal ids or outcome ids |
-| 11 | Restart safety | mode/timeframe/status/threshold restored; first tick after restart evaluated **0** candles |
-| 12 | ANALYSIS side effects | 0 evaluations written, 0 signals recorded, marker unmoved |
-| 13 | CSV schemas | signals / outcomes / evaluations headers all match their column tuples |
-| 14 | Order execution | `grep -riE "order_send\|order_check\|positions_get\|TRADE_ACTION"` → only the doc comment saying there is none |
-| 15 | Credentials | no hard-coded secrets; panel rendering asserted not to leak password, token or login |
-| 16 | Lookahead review | all guarantees re-verified after the refactor (below) |
-
-### Lookahead review after the refactor
-
-* Forming candle still dropped in `get_candles`; `MarketSnapshot` still has no
-  field that could carry one.
-* Swing pivots still hidden until their confirmation bar closes
-  (`confirmed_at <= as_of`).
-* Backtester still cuts confirmation frames by **close time**, now for a
-  variable number of them.
-* Cooldown context still ignores signals dated after the evaluated bar, and is
-  now additionally scoped by timeframe.
-* Outcome tracking still starts on the candle *after* the signal candle.
-* **Candle cache:** the signal-timeframe frame is fetched fresh whenever a new
-  candle is being evaluated (`use_cache=False`); the cache is only consulted for
-  confirmation frames on idle polls and for the read-only ANALYSIS button.
+| 1 | Full test suite | **216 passed**, 0 failed |
+| 2 | `pyflakes`, all modules | clean |
+| 3 | M1-only enforcement | `signal_timeframe != "M1"` raises; no mode/TF setters remain |
+| 4 | Backtest, 29k M1 bars, spread 6 | 348 signals, 17/day |
+| 5 | Backtest, spread 20 | targets lift to 3.6/6.5/10.9 pips; 64% time out |
+| 6 | Cost gating | rejections dominated by R:R and scalp-range at wide spreads |
+| 7 | Telegram panel | all six controls exercised; layout matches spec |
+| 8 | Pause / resume | 20 polls paused → **0** evaluations; resumed → 5 in 5 |
+| 9 | Threshold controls | ±1/±5/reset, clamped at 40 and 95 |
+| 10 | Duplicate prevention | 8 polls on one candle → **0** new rows; unique signal/outcome ids; no duplicate timestamps |
+| 11 | Restart safety | threshold/status/hold restored; first tick after restart evaluated 0 candles |
+| 12 | ANALYSIS side effects | 0 evaluations written, 0 signals, marker unmoved |
+| 13 | CSV schemas | signals / outcomes / evaluations headers all match |
+| 14 | Order execution | grep for `order_send`/`order_check`/`positions_get`/`TRADE_ACTION` → only the doc comment saying there is none |
+| 15 | Lookahead review | all guarantees re-verified; ticks filtered to the bar's own minute |
 
 ---
 
-## 8. Bugs found and fixed during the work
+## 9. Measured results, and what they mean
 
-1. **Fake-market spread made several live-loop tests pass vacuously.** The test
-   double returned a hard-coded 20-point spread; on the low-volatility test
-   fixture that exceeds `MAX_SPREAD_ATR_RATIO`, so *every* candle was rejected
-   before scoring and the pre-existing
-   `test_live_loop_records_signals_and_never_duplicates_them` was asserting over
-   an empty list. Fixed by defaulting the fake spread to "unknown" (as the
-   backtester does). Several tests became meaningful as a result.
+30,000 synthetic M1 candles (~20 trading days). **Synthetic data — this proves
+the machinery measures what it claims, nothing more.**
 
-2. **Weight renormalisation initially over-triggered.** The first version
-   renormalised over whatever components were present, so a partial component
-   dict silently rescaled the score (a trend-only card jumped from 20 to 85).
-   Narrowed to components that are present *and* explicitly inapplicable.
+| | spread 6 pts | spread 20 pts |
+|---|---|---|
+| Round-trip cost | 1.0 pip | 2.4 pips |
+| Signals | 348 | 42 (shorter slice) |
+| Median TP ladder | 1.6 / 3.6 / 6.0 pips | 3.6 / 6.5 / 10.9 pips |
+| Median stop | 2.9 pips | 4.0 pips |
+| Median TP2 | 1.26R raw → **0.94R net** | 1.62R raw → **1.02R net** |
+| **Raw** win rate | 58.0% | 52.4% |
+| **Raw** expectancy | −0.090R | **+0.033R** |
+| **Net** win rate | 24.4% | 23.8% |
+| **Net** expectancy | **−0.518R** | **−0.567R** |
+| Outcomes | 87% SL, 12% TP3 | 64% TIMEOUT, 36% SL |
+| Median hold | 2 min | 15 min |
 
-3. **Cooldown was not timeframe-aware.** A cooldown counts candles, and an M5
-   candle is not an H4 candle. Before the fix, an old H4 signal could mute a
-   fresh M5 one. `build_gate_state` now scopes the cooldown by timeframe while
-   keeping the daily and concurrency caps global.
+Three things worth reading carefully:
 
-4. **Outcome tracking would have used the wrong candles after a timeframe
-   switch.** Signals raised on a previous timeframe were being advanced with the
-   *new* timeframe's candles, mis-counting expiry and mis-reading stops.
-   `SignalTracker.update()` now takes a `timeframe` argument and `main.py`
-   fetches each open signal's own timeframe.
+* **At a 20-point spread the strategy has a positive raw expectancy and still
+  loses 0.567R per trade.** That single row is the argument for the cost model.
+* **The mechanism is the breakeven stop.** At the tighter spread 58% of scalps
+  touch TP1, but moving the stop to breakeven then converts most of them into
+  ~0R while losers pay −1R plus costs. Small-target scalping dies on that
+  asymmetry, not on signal quality.
+* **The 1–3 pip concept mostly does not survive costs.** At a 20-point spread
+  the cost floor lifts TP1 to 3.6 pips — four times the original concept — and
+  the holding window then stretches until 64% time out. Only on a raw/ECN
+  spread does a 1.6-pip first target exist at all.
 
-5. **A 3-candle probe evicted the full cached frame.** `latest_closed_candle_time`
-   stored its tiny result under the same cache key; added `cache_result=False`.
-
-6. **Two writers to `state.json`.** The tracker and the runtime state each held
-   their own copy of the document and would have clobbered each other's keys.
-   Both now share a single lock-guarded `JsonStateStore`.
-
-7. **Stale button presses replayed on startup.** Telegram queues updates while a
-   bot is offline; without draining them, a restart would immediately re-apply
-   whatever was last pressed (including STOP). The poller now discards the
-   backlog.
-
----
-
-## 9. Results observed (and why they are not evidence)
-
-From the 6,361-bar RESEARCH backtest on **synthetic** data, the score-band table:
-
-```
-group  closed   win%   avgR  totalR    PF
-40-49       3  100.0  0.613    1.84   inf
-50-59      27   48.1  0.115    3.12  1.24
-60-69      40   52.5  0.197    7.88  1.42
-70-79      28   67.9  0.317    8.87  2.13
-80-89       5   60.0  0.005    0.02  1.01
-```
-
-This is exactly the table the score-band analysis exists to produce, and it
-already shows the assumption "higher score ⇒ better outcome" **failing** at the
-top: the 80-89 band underperforms 70-79. With 5 signals in that band it is
-noise, not a finding — which is the point. The numbers come from a
-regime-switching random walk and say nothing about real gold.
-
-The end-to-end verification run reported "Win Rate: 100.0%" over 8 signals on an
-upward-drifting synthetic series. That is an artifact of the fixture and must not
-be read as performance.
-
-**No profitability claim is made for any mode, timeframe or threshold.**
+**No profitability is claimed for any setting.** The negative result is the
+research output, and the system is built to keep producing that number honestly
+rather than to make it look better.
 
 ---
 
 ## 10. Known limitations
 
-* **Live mode is Windows-only** (`MetaTrader5` has no Linux/macOS build). The
-  control panel, engine and backtester were verified here with fake feeds; the
-  Telegram HTTP calls themselves were exercised against a fake transport, not
-  against the real Bot API.
-* **M1 signal timeframe cannot be backtested from M5 history** — it needs an M1
-  data file (`--source-timeframe M1`). The error message says so.
-* **H1/H4 backtests need a lot of history**: H1 needs ~10,500 M5 candles of
-  warm-up (220 closed H4 candles), H4 needs ~12,500.
-* **The candle cache can serve confirmation frames up to ~2 minutes stale** on
-  idle polls and for the ANALYSIS button. The signal timeframe is always fresh
-  when a candle is actually evaluated.
-* **Settings buttons cycle through fixed lists** rather than accepting free
-  numeric entry, because text input is not the interface here.
-* **PAUSE still fetches data** each poll so open signals keep being tracked. It
-  reduces MT5 traffic but does not eliminate it.
-* **Score bands below 40 are not reported** — the minimum threshold is 40, so
-  nothing below it can become a signal.
-* **Research mode raises signal frequency substantially** (~2× on the test data,
-  4.8/day vs 2.3/day). With `MAX_SIGNALS_PER_DAY` at 8 this can bind on busy
-  days; raise it if you want the full research stream.
-* Everything in the original build report's limitations still applies: tick
-  volume rather than real volume, no spread/slippage modelling in backtests,
-  pessimistic intrabar assumptions, fixed UTC session windows, no news awareness.
+* Live mode is Windows-only (`MetaTrader5` has no Linux/macOS build).
+* Backtests have no ticks, so every ambiguous candle is scored as a stop — live
+  and backtested outcomes are **not directly comparable**.
+* Slippage is an assumption (2+2 points), plausible in liquid hours and
+  optimistic around news.
+* **Cost is deducted once per trade, not per partial.** With three partials the
+  true cost is higher, so NET R here is mildly optimistic.
+* `assumed_spread_points` is a single number; real spreads vary by hour and
+  widen exactly when setups look attractive.
+* Tick fetching adds MT5 load; disable with `USE_TICKS_FOR_AMBIGUOUS_CANDLES=false`.
+* No news/economic-calendar awareness.
+* Session windows are fixed UTC and do not follow DST.
+* Backtest speed ~50 bars/s; a month of M1 is ~43,000 bars.
+* The M5 context is fetched on every poll (cached up to 2 minutes); with context
+  disabled the system is pure M1.
 
 ---
 
 ## 11. What was deliberately not done
 
-* **No ML.** V1 stays deterministic and transparent; only the dataset was
-  prepared.
-* **No new indicators**, no scoring-weight changes, no re-tuning for historical
-  win rate. RESEARCH mode moves *only* the threshold — if it changed the scoring,
-  research candidates could not be compared with standard ones.
-* **No web dashboard.**
+* **No ML** — only the dataset was prepared. The label (`net_r`) is already
+  cost-adjusted, which is the part that matters.
+* **No threshold tuning against the evaluation data.** `SCALP_THRESHOLD=68` was
+  set from the score distribution (99th percentile ≈ 71), not from P&L.
+* **No re-tuning to make the results positive.** Two geometry bugs were fixed
+  because the ladder was mathematically incoherent, not because signals were
+  scarce; the economics were left to say what they say.
+* **No new indicators** were added to generate more signals.

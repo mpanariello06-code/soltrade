@@ -29,8 +29,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .logger import get_logger
 from .runtime_state import RuntimeState
 from .timeframes import (
-    MODE_ICONS,
-    MODES,
+    MODE_SCALPING,
+    SIGNAL_TIMEFRAME,
     STATUS_PAUSED,
     STATUS_RUNNING,
     STATUS_STOPPED,
@@ -42,17 +42,19 @@ DIVIDER = "━━━━━━━━━━━━━━━━━━"
 
 STATUS_ICONS = {STATUS_RUNNING: "🟢", STATUS_PAUSED: "⏸", STATUS_STOPPED: "🔴"}
 
-#: Component key -> label and maximum, for the ANALYSIS breakdown
-ANALYSIS_ROWS: Tuple[Tuple[str, str, int], ...] = (
-    ("trend", "Trend", 20),
-    ("htf", "HTF", 15),
-    ("momentum", "Momentum", 15),
-    ("structure", "Structure", 15),
-    ("liquidity", "Liquidity", 10),
-    ("support_resistance", "S/R", 10),
-    ("volume", "Volume", 5),
-    ("volatility", "Volatility", 5),
-    ("price_action", "Price Action", 5),
+#: Component key -> label, in the order shown in the ANALYSIS breakdown.
+#: The maximum for each row is read from the configured weights, so retuning
+#: them for M1 cannot leave the panel quoting stale denominators.
+ANALYSIS_ROWS: Tuple[Tuple[str, str], ...] = (
+    ("momentum", "Momentum"),
+    ("price_action", "Price Action"),
+    ("liquidity", "Liquidity"),
+    ("structure", "Structure"),
+    ("support_resistance", "S/R"),
+    ("trend", "Trend"),
+    ("htf", "Context"),
+    ("volatility", "Volatility"),
+    ("volume", "Volume"),
 )
 
 COMMAND_WORDS = ("/start", "/panel", "/menu", "/status")
@@ -95,31 +97,18 @@ class TelegramController:
     # keyboards
     # ------------------------------------------------------------------ #
     def main_keyboard(self) -> List[List[Dict[str, str]]]:
-        """The main control panel keyboard."""
-        state = self.runtime.describe()
-        active_mode = state["mode"]
-        active_tf = state["signal_timeframe"]
+        """The main control panel keyboard.
 
-        def mode_button(mode: str) -> Dict[str, str]:
-            mark = "●" if mode == active_mode else "○"
-            return _button(f"{mark} {MODE_ICONS[mode]} {mode}", f"mode:{mode}")
-
-        def tf_button(timeframe: str) -> Dict[str, str]:
-            mark = "●" if timeframe == active_tf else " "
-            return _button(f"{mark}{timeframe}", f"tf:{timeframe}")
-
+        No mode or timeframe buttons: this build is M1 SCALPING only.  STOP
+        lives in Settings rather than the main panel so it cannot be hit by
+        accident while reaching for PAUSE.
+        """
         return [
-            [_button("▶️ START", "run:start"), _button("⏸ PAUSE", "run:pause"),
-             _button("⏹ STOP", "run:stop")],
-            [mode_button(MODES[0])],
-            [mode_button(MODES[1])],
-            [mode_button(MODES[2])],
-            [tf_button("M1"), tf_button("M5"), tf_button("M15")],
-            [tf_button("M30"), tf_button("H1"), tf_button("H4")],
-            [_button(f"🎯 THRESHOLD ({state['threshold']:.0f})", "menu:threshold")],
-            [_button("📊 ANALYSIS", "view:analysis")],
+            [_button("▶️ START", "run:start"), _button("⏸ PAUSE", "run:pause")],
+            [_button("📊 CURRENT ANALYSIS", "view:analysis")],
             [_button("📈 PERFORMANCE", "view:performance")],
-            [_button("⚙️ SETTINGS", "menu:settings"), _button("🔄 REFRESH", "panel:refresh")],
+            [_button("⚙️ SETTINGS", "menu:settings")],
+            [_button("🔄 REFRESH", "panel:refresh")],
         ]
 
     def threshold_keyboard(self) -> List[List[Dict[str, str]]]:
@@ -134,20 +123,20 @@ class TelegramController:
         state = self.runtime.describe()
         near = "ON ✅" if state["near_signal_alerts"] else "OFF"
         return [
-            [_button(f"🔬 Mode: {state['mode']}", "menu:mode")],
-            [_button(f"⏱ Timeframe: {state['signal_timeframe']}", "menu:timeframe")],
             [_button(f"🎯 Threshold: {state['threshold']:.0f}", "menu:threshold")],
-            [_button(f"❄️ Cooldown: {state['cooldown_candles']}", "set:cooldown")],
+            [_button(f"⏳ Max hold: {state['max_holding_candles']} min", "set:hold")],
+            [_button(f"❄️ Cooldown: {state['cooldown_candles']} candles", "set:cooldown")],
             [_button(f"⚖️ Min R:R: {state['min_tp2_rr']:.1f}", "set:rr")],
             [_button(f"🕐 Sessions: {', '.join(state['allowed_sessions'])[:24]}", "set:session")],
             [_button(f"👀 Near-signal alerts: {near}", "set:near")],
+            [_button("⏹ STOP ENGINE", "run:stop")],
             [_button("⬅️ BACK", "nav:main")],
         ]
 
     def performance_keyboard(self) -> List[List[Dict[str, str]]]:
         return [
-            [_button("BY TIMEFRAME", "perf:timeframe"), _button("BY SCORE", "perf:score")],
-            [_button("BY REGIME", "perf:regime"), _button("BY MODE", "perf:mode")],
+            [_button("BY SCORE", "perf:score"), _button("BY REGIME", "perf:regime")],
+            [_button("BY SESSION", "perf:session"), _button("BY OUTCOME", "perf:outcome")],
             [_button("⬅️ BACK", "nav:main")],
         ]
 
@@ -162,31 +151,29 @@ class TelegramController:
         """The main control panel text."""
         state = self.runtime.describe()
         status = state["status"]
-        signals_today = self._signals_today()
-        connection = self._connection_state()
         custom = " (custom)" if state["threshold_is_custom"] else ""
+        net_r = self._paper_net_r()
 
         lines = [
             DIVIDER,
-            "🤖 XAUUSD SIGNAL ENGINE",
+            "⚡ XAUUSD SCALPER",
             DIVIDER,
             "",
             f"Status: {STATUS_ICONS.get(status, '❔')} {status}",
-            f"Mode: {MODE_ICONS.get(state['mode'], '')} {state['mode']}",
-            f"Signal TF: {state['signal_timeframe']}",
-            f"Confirmation: {state['confirmation']}",
-            "",
+            f"Mode: {MODE_SCALPING}",
+            f"Timeframe: {SIGNAL_TIMEFRAME}",
             f"Threshold: {state['threshold']:.0f}{custom}",
-            f"Cooldown: {state['cooldown_candles']} candles",
-            f"Min R:R (TP2): {state['min_tp2_rr']:.1f}",
             "",
-            f"Signals today: {signals_today}",
-            f"MT5: {connection}",
+            f"Signals today: {self._signals_today()}",
+            f"Open signals: {self._open_signals()}",
+            f"Paper Net R: {net_r:+.2f}" if net_r is not None else "Paper Net R: -",
+            "",
+            f"Max hold: {state['max_holding_candles']} min",
+            f"MT5: {self._connection_state()}",
+            "",
+            DIVIDER,
+            "🔬 PAPER TEST ONLY - no orders are placed.",
         ]
-        if state["mode"] == "RESEARCH":
-            lines += ["", "🔬 RESEARCH MODE - candidates are collected for",
-                      "paper testing, not validated trading signals."]
-        lines += ["", DIVIDER]
         return "\n".join(lines)
 
     def render_threshold_panel(self) -> str:
@@ -217,14 +204,20 @@ class TelegramController:
                 "⚙️ SETTINGS",
                 DIVIDER,
                 "",
-                f"Mode: {state['mode']}",
-                f"Signal timeframe: {state['signal_timeframe']}",
-                f"Confirmation: {state['confirmation']}",
+                f"Mode: {MODE_SCALPING}  (fixed)",
+                f"Timeframe: {SIGNAL_TIMEFRAME}  (fixed)",
+                f"Context: {state['context_timeframe']}",
                 f"Threshold: {state['threshold']:.0f}",
+                f"Max holding period: {state['max_holding_candles']} minutes",
                 f"Cooldown: {state['cooldown_candles']} candles",
                 f"Minimum R:R (TP2): {state['min_tp2_rr']:.1f}",
                 f"Session filter: {', '.join(state['allowed_sessions'])}",
                 f"Near-signal alerts: {'ON' if state['near_signal_alerts'] else 'OFF'}",
+                "",
+                "Costs assumed per round trip:",
+                f"  spread (fallback) {self.config.assumed_spread_points:.0f} pts",
+                f"  slippage {self.config.slippage_points_entry:.0f}+"
+                f"{self.config.slippage_points_exit:.0f} pts",
                 "",
                 "Credentials and file paths are not editable here.",
                 DIVIDER,
@@ -233,7 +226,6 @@ class TelegramController:
 
     def render_analysis(self) -> str:
         """Latest evaluation, computed on demand from closed candles only."""
-        state = self.runtime.describe()
         evaluation = self._analyze_now()
         if evaluation is None:
             return "\n".join(
@@ -251,7 +243,7 @@ class TelegramController:
         direction = "BUY" if card.bullish_score >= card.bearish_score else "SELL"
         lines = [
             DIVIDER,
-            f"📊 {evaluation.symbol} {evaluation.timeframe} ANALYSIS",
+            f"📊 {evaluation.symbol} M1 ANALYSIS",
             DIVIDER,
             "",
             f"Bullish Score: {card.bullish_score:.0f}",
@@ -261,26 +253,34 @@ class TelegramController:
             evaluation.regime.replace("_", " ") or "-",
             "",
         ]
-        for key, label, maximum in ANALYSIS_ROWS:
+        for key, label in ANALYSIS_ROWS:
+            maximum = getattr(self.config.weights, key, 0.0)
             value = card.component_score(key, direction)
             component = card.components.get(key)
             if component is not None and not component.applicable:
                 lines.append(f"{label + ':':<14}  n/a")
             else:
-                lines.append(f"{label + ':':<14}{value:5.1f}/{maximum}")
+                lines.append(f"{label + ':':<14}{value:5.1f}/{maximum:.0f}")
 
+        features = evaluation.features or {}
         lines += [
             "",
             f"Threshold: {evaluation.threshold:.0f}",
+            f"ATR: {features.get('atr_pips', 0):.1f}p   "
+            f"Spread: {features.get('spread_pips', 0):.1f}p   "
+            f"Cost: {features.get('cost_pips', 0):.1f}p",
             f"Candle: {evaluation.timestamp:%Y-%m-%d %H:%M} UTC",
             "",
             "Decision:",
         ]
         if evaluation.has_signal and evaluation.signal is not None:
-            if evaluation.signal.is_research:
-                lines.append(f"🔬 RESEARCH SIGNAL ({evaluation.signal.direction})")
-            else:
-                lines.append(f"✅ {evaluation.signal.direction} SIGNAL")
+            signal = evaluation.signal
+            lines += [
+                f"⚡ {signal.direction} SCALP",
+                f"TP {signal.tp_pips[0]:.1f}/{signal.tp_pips[1]:.1f}/{signal.tp_pips[2]:.1f}p"
+                f"  SL {signal.sl_pips:.1f}p",
+                f"Net R:R  {signal.net_rr1:.2f}/{signal.net_rr2:.2f}/{signal.net_rr3:.2f}",
+            ]
         elif evaluation.near_signal:
             best = max(card.bullish_score, card.bearish_score)
             lines += [
@@ -292,9 +292,7 @@ class TelegramController:
         else:
             lines += ["❌ NO SIGNAL", "", "Reason:", evaluation.rejection_reason or "-"]
 
-        if state["mode"] == "RESEARCH":
-            lines += ["", "🔬 Research mode - for observation only."]
-        lines += ["", DIVIDER, "Closed candles only. No forward-looking data."]
+        lines += ["", DIVIDER, "Closed M1 candles only. No forward-looking data."]
         return "\n".join(lines)
 
     # -- performance views -------------------------------------------------- #
@@ -329,27 +327,26 @@ class TelegramController:
                  "No signals recorded yet.", DIVIDER]
             )
 
-        state = self.runtime.describe()
         overall = report.overall
         header = [
             DIVIDER,
             "📈 PAPER PERFORMANCE",
             DIVIDER,
             "",
-            f"{state['signal_timeframe']} {state['mode']}  (all recorded signals)",
+            f"{SIGNAL_TIMEFRAME} {MODE_SCALPING}  (all recorded signals)",
             "",
         ]
 
-        if view == "timeframe":
-            body = self._stats_table("BY TIMEFRAME", report.by_timeframe)
-        elif view == "score":
+        if view == "score":
             body = self._stats_table("BY SCORE BAND", report.by_score_band)
             body.append("")
             body.append("Higher score = better outcome?  Check, do not assume.")
         elif view == "regime":
             body = self._stats_table("BY REGIME", report.by_regime)
-        elif view == "mode":
-            body = self._stats_table("BY MODE", report.by_mode)
+        elif view == "session":
+            body = self._stats_table("BY SESSION", report.by_session)
+        elif view == "outcome":
+            body = self._stats_table("BY OUTCOME", report.by_result)
         else:
             profit_factor = (
                 "inf" if overall.profit_factor == float("inf") else f"{overall.profit_factor:.2f}"
@@ -357,12 +354,17 @@ class TelegramController:
             body = [
                 f"Signals: {report.total_signals}",
                 f"Closed & scored: {overall.closed}",
-                f"Win Rate: {overall.win_rate:.1f}%",
-                f"Avg R: {overall.average_r:+.2f}",
-                f"Total R: {overall.total_r:+.2f}",
-                f"Profit Factor: {profit_factor}",
+                f"Win Rate (net): {overall.net_win_rate:.1f}%",
+                "",
+                f"Avg RAW R: {overall.average_r:+.3f}",
+                f"Avg NET R: {overall.average_net_r:+.3f}",
+                f"Total NET R: {overall.total_net_r:+.2f}",
+                f"Profit Factor (net): {profit_factor}",
                 f"Max drawdown: {overall.max_drawdown_r:.2f}R",
-                f"Avg duration: {overall.average_duration_min:.0f} min",
+                "",
+                f"Timed out: {overall.timeout_rate:.1f}%",
+                f"Avg hold: {overall.average_duration_min:.1f} min",
+                f"Avg cost: {overall.average_cost_r:.2f}R",
                 "",
                 "Best Regime:",
                 report.best_regime(),
@@ -387,11 +389,6 @@ class TelegramController:
         try:
             if action == "run":
                 return self._handle_run(argument)
-            if action == "mode":
-                mode = self.runtime.set_mode(argument)
-                return self.render_panel(), self.main_keyboard(), f"Mode: {mode}"
-            if action == "tf":
-                return self._handle_timeframe(argument)
             if action == "thr":
                 return self._handle_threshold(argument)
             if action == "menu":
@@ -426,21 +423,6 @@ class TelegramController:
         }.get(status, status)
         return self.render_panel(), self.main_keyboard(), toast
 
-    def _handle_timeframe(self, argument: str):
-        previous = self.runtime.describe()["signal_timeframe"]
-        timeframe = self.runtime.set_timeframe(argument)
-        if timeframe != previous and self.engine is not None:
-            # Drop cached candles from the previous hierarchy so nothing stale
-            # can reach the first evaluation on the new timeframe.
-            notify = getattr(self.engine, "on_timeframe_changed", None)
-            if callable(notify):
-                notify(previous, timeframe)
-        return (
-            self.render_panel(),
-            self.main_keyboard(),
-            f"{timeframe} (confirm {self.runtime.confirmation_label()})",
-        )
-
     def _handle_threshold(self, argument: str):
         if argument == "reset":
             value = self.runtime.reset_threshold()
@@ -463,23 +445,28 @@ class TelegramController:
     def _handle_setting(self, argument: str):
         """Cycle one editable setting to its next allowed value."""
         state = self.runtime.describe()
+
+        def cycle(choices, current):
+            choices = list(choices)
+            if current in choices:
+                return choices[(choices.index(current) + 1) % len(choices)]
+            return choices[0]
+
         if argument == "cooldown":
-            choices = list(self.config.cooldown_choices)
-            current = int(state["cooldown_candles"])
-            value = choices[(choices.index(current) + 1) % len(choices)] if current in choices else choices[0]
+            value = cycle(self.config.cooldown_choices, int(state["cooldown_candles"]))
             self.runtime.set_cooldown(value)
             toast = f"Cooldown: {value} candles"
         elif argument == "rr":
-            choices = list(self.config.min_rr_choices)
-            current = float(state["min_tp2_rr"])
-            value = choices[(choices.index(current) + 1) % len(choices)] if current in choices else choices[0]
+            value = cycle(self.config.min_rr_choices, float(state["min_tp2_rr"]))
             self.runtime.set_min_rr(value)
             toast = f"Min R:R: {value:.1f}"
+        elif argument == "hold":
+            value = cycle(self.config.holding_choices, int(state["max_holding_candles"]))
+            self.runtime.set_max_holding(value)
+            toast = f"Max hold: {value} min"
         elif argument == "session":
-            choices = list(self.config.session_choices)
             current = ",".join(state["allowed_sessions"])
-            index = choices.index(current) + 1 if current in choices else 0
-            value = choices[index % len(choices)]
+            value = cycle(self.config.session_choices, current)
             self.runtime.set_sessions([value])
             toast = f"Sessions: {value}"
         elif argument == "near":
@@ -501,6 +488,20 @@ class TelegramController:
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("On-demand analysis failed: %s", exc)
             return None
+
+    def _open_signals(self) -> int:
+        counter = getattr(self.engine, "open_signals", None)
+        try:
+            return int(counter()) if callable(counter) else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _paper_net_r(self) -> Optional[float]:
+        """Cumulative NET R from the closed paper signals, or ``None``."""
+        report = self._report()
+        if report is None or report.overall.closed == 0:
+            return None
+        return report.overall.total_net_r
 
     def _signals_today(self) -> int:
         counter = getattr(self.engine, "signals_today", None)

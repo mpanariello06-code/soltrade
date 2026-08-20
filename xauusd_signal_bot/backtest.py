@@ -1,35 +1,42 @@
-"""Historical backtester for the XAUUSD signal engine.
+"""Historical backtester for the XAUUSD M1 scalping engine.
 
-Feeds candles one at a time into the **same** :class:`~src.signal_engine.SignalEngine`
-that runs live, and tracks outcomes with the same
-:class:`~src.signal_tracker.PositionState`.
+Feeds M1 candles one at a time into the **same** SignalEngine that runs live,
+and tracks outcomes with the same PositionState.
 
 NO-LOOKAHEAD GUARANTEES
 -----------------------
 1. The engine is handed a *slice* ending at the bar being evaluated; nothing
    later is reachable.
-2. Higher-timeframe frames are cut by **close time**: an H1 candle is only
-   visible once its close time is at or before the M5 candle's close time.  A
-   forming H1 candle is never shown.
-3. The cooldown/limit context is rebuilt from signals dated on or before the
-   current bar only.
+2. The context frame is cut by **close time**: an M5 candle is only visible
+   once its close time is at or before the M1 candle's close time.
+3. The cooldown context is rebuilt from signals dated on or before the bar.
 4. Outcome tracking starts on the candle *after* the signal candle, because the
    entry is that candle's close.
 5. Indicators are pre-computed once over the whole history and then sliced.
-   Every indicator in :mod:`src.indicators` is causal, so the value at bar ``i``
-   is identical to computing it on ``0..i`` - ``tests/test_indicators.py``
-   asserts this.
+   Every indicator is causal, so the value at bar ``i`` is identical to
+   computing it on ``0..i`` - ``tests/test_indicators.py`` asserts this.
+
+COSTS
+-----
+A backtest has no live spread, so ``assumed_spread_points`` is charged on every
+trade unless ``--spread`` overrides it.  NET R is what the report leads with;
+raw R is shown for reference only.
+
+AMBIGUOUS CANDLES
+-----------------
+With no tick feed, any M1 candle that trades through both the target and the
+stop is scored **pessimistically** (stop first).  Live tracking replays ticks
+and is more accurate, so live and backtested outcomes are not strictly
+comparable - the backtest is the conservative one.
 
 Input data
 ----------
-A CSV of M5 candles with columns ``time, open, high, low, close, tick_volume``
-(``volume``/``vol`` and ``date``/``datetime``/``timestamp`` are accepted as
-aliases).  M15 and H1 are derived by resampling, so only one file is needed.
+A CSV of M1 candles with columns ``time, open, high, low, close, tick_volume``.
 
 Usage::
 
-    python backtest.py --data history/XAUUSD_M5.csv
-    python backtest.py --data history/XAUUSD_M5.csv --start 2024-01-01 --end 2024-06-30
+    python backtest.py --data history/XAUUSD_M1.csv
+    python backtest.py --data history/XAUUSD_M1.csv --spread 12
 """
 
 from __future__ import annotations
@@ -56,7 +63,7 @@ from src.market_data import (
     timeframe_minutes,
     validate_candles,
 )
-from src.runtime_state import config_view
+from src.timeframes import SIGNAL_TIMEFRAME
 from src.signal_engine import EVALUATION_COLUMNS, SignalEngine
 from src.signal_tracker import (
     OUTCOME_COLUMNS,
@@ -103,7 +110,7 @@ class BacktestResult:
 # data loading
 # --------------------------------------------------------------------------- #
 def load_history(path: Path) -> pd.DataFrame:
-    """Load and normalise a history CSV (M5 by default, see --source-timeframe)."""
+    """Load and normalise an M1 history CSV."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"history file not found: {path}")
@@ -142,122 +149,91 @@ class Backtester:
     def __init__(
         self,
         config: Config,
-        spread_points: float = float("nan"),
-        mode: Optional[str] = None,
-        timeframe: Optional[str] = None,
-        source_timeframe: str = "M5",
+        spread_points: Optional[float] = None,
     ) -> None:
-        # One config view drives everything: mode, signal timeframe and the
-        # confirmation hierarchy that follows from it - exactly as live mode
-        # builds it from the Telegram settings.
-        self.config = config_view(config, mode=mode, timeframe=timeframe)
-        self.engine = SignalEngine(self.config)
-        self.spread_points = spread_points
-        self.source_timeframe = str(source_timeframe).upper()
-        self.signal_minutes = timeframe_minutes(self.config.signal_timeframe)
-        self.source_minutes = timeframe_minutes(self.source_timeframe)
-        if self.signal_minutes % self.source_minutes != 0:
-            raise ValueError(
-                f"signal timeframe {self.config.signal_timeframe} cannot be built from "
-                f"{self.source_timeframe} history"
-            )
+        self.config = config
+        self.engine = SignalEngine(config)
+        # A backtest has no live quote, so every trade pays the configured
+        # assumption rather than trading for free.
+        self.spread_points = (
+            config.assumed_spread_points if spread_points is None else float(spread_points)
+        )
 
     # -- preparation -------------------------------------------------------- #
     def prepare(self, source: pd.DataFrame) -> Dict[str, Any]:
-        """Resample to the active hierarchy and pre-compute every indicator.
+        """Pre-compute indicators for M1 and, if enabled, the context timeframe.
 
-        ``source`` is the raw history file (M5 by default).  The signal frame and
-        both confirmation frames are derived from it, so switching the tested
-        timeframe needs no extra data files.  A confirmation timeframe that does
-        not exist for the active hierarchy (H1 has one, H4 has none) is simply
-        absent from the result.
+        The context frame is resampled from the same M1 file, so no second data
+        file is needed.
         """
         cfg = self.config
         params = cfg.indicators
 
-        signal_df = resample_candles(source, self.source_timeframe, cfg.signal_timeframe)
-        ok, reason = validate_candles(signal_df, cfg.signal_timeframe, cfg.min_candles_required)
+        ok, reason = validate_candles(source, SIGNAL_TIMEFRAME, cfg.min_candles_required)
         if not ok:
             raise ValueError(f"history failed validation: {reason}")
 
         prepared: Dict[str, Any] = {
-            "m5": compute_indicators(signal_df, params),
-            "m5_close": (
-                pd.to_datetime(signal_df["time"], utc=True)
-                + timedelta(minutes=self.signal_minutes)
+            "m1": compute_indicators(source, params),
+            "m1_close": (
+                pd.to_datetime(source["time"], utc=True) + timedelta(minutes=1)
             ).to_numpy(),
+            "context": None,
+            "context_close": None,
         }
 
-        for role, timeframe in (
-            ("m15", cfg.intermediate_timeframe),
-            ("h1", cfg.higher_timeframe),
-        ):
-            if not timeframe:
-                prepared[role] = None
-                prepared[f"{role}_close"] = None
-                continue
-            frame = resample_candles(source, self.source_timeframe, timeframe)
-            prepared[role] = compute_indicators(frame, params)
-            prepared[f"{role}_close"] = (
+        if cfg.context_timeframe:
+            frame = resample_candles(source, SIGNAL_TIMEFRAME, cfg.context_timeframe)
+            prepared["context"] = compute_indicators(frame, params)
+            prepared["context_close"] = (
                 pd.to_datetime(frame["time"], utc=True)
-                + timedelta(minutes=timeframe_minutes(timeframe))
+                + timedelta(minutes=timeframe_minutes(cfg.context_timeframe))
             ).to_numpy()
         return prepared
 
     def _warmup_index(self, prepared: Dict[str, Any]) -> int:
         """First bar index at which every active timeframe has enough history."""
         cfg = self.config
-        m5_close = prepared["m5_close"]
-        closes = [
-            prepared[f"{role}_close"]
-            for role in ("m15", "h1")
-            if prepared.get(role) is not None
-        ]
+        m1_close = prepared["m1_close"]
+        context_close = prepared["context_close"]
 
-        for index in range(cfg.min_candles_required, len(m5_close)):
-            cutoff = m5_close[index]
-            if all(
-                np.searchsorted(close, cutoff, side="right") >= cfg.min_htf_candles_required
-                for close in closes
+        for index in range(cfg.min_candles_required, len(m1_close)):
+            if context_close is None:
+                return index
+            if (
+                np.searchsorted(context_close, m1_close[index], side="right")
+                >= cfg.min_context_candles
             ):
                 return index
-        slowest = cfg.higher_timeframe or cfg.intermediate_timeframe or cfg.signal_timeframe
-        ratio = max(timeframe_minutes(slowest) // self.signal_minutes, 1)
+        needed = cfg.min_context_candles * timeframe_minutes(cfg.context_timeframe or "M1")
         raise ValueError(
-            "history is too short: need roughly "
-            f"{cfg.min_htf_candles_required * ratio} "
-            f"{cfg.signal_timeframe} candles to warm up the {slowest} view"
+            f"history is too short: need roughly {max(needed, cfg.min_candles_required)} "
+            f"M1 candles to warm up"
         )
 
     def _snapshot(self, prepared: Dict[str, Any], index: int) -> MarketSnapshot:
-        """Build the snapshot visible at the close of bar ``index``."""
+        """Build the snapshot visible at the close of M1 bar ``index``."""
         cfg = self.config
-        cutoff = prepared["m5_close"][index]
+        cutoff = prepared["m1_close"][index]
 
-        m5_start = max(0, index + 1 - cfg.candles_signal)
-        m5_window = prepared["m5"].iloc[m5_start : index + 1]
+        start = max(0, index + 1 - cfg.candles_signal)
+        signal_window = prepared["m1"].iloc[start : index + 1]
 
-        windows: Dict[str, Optional[pd.DataFrame]] = {}
-        for role, limit in (("m15", cfg.candles_intermediate), ("h1", cfg.candles_higher)):
-            frame = prepared.get(role)
-            if frame is None:
-                windows[role] = None
-                continue
-            end = int(np.searchsorted(prepared[f"{role}_close"], cutoff, side="right"))
-            windows[role] = frame.iloc[max(0, end - limit) : end]
+        context_window = None
+        if prepared["context"] is not None:
+            end = int(np.searchsorted(prepared["context_close"], cutoff, side="right"))
+            context_window = prepared["context"].iloc[
+                max(0, end - cfg.candles_context) : end
+            ]
 
         return MarketSnapshot(
             symbol=cfg.symbol,
-            m5=m5_window,
-            m15=windows["m15"],
-            h1=windows["h1"],
-            m1=None,  # no intrabar feed in a backtest -> pessimistic tie-breaking
+            signal_df=signal_window,
+            context_df=context_window,
             spread_points=self.spread_points,
             evaluated_at=as_utc(pd.Timestamp(cutoff).to_pydatetime()),
-            signal_timeframe=cfg.signal_timeframe,
-            confirmation="+".join(
-                tf for tf in (cfg.intermediate_timeframe, cfg.higher_timeframe) if tf
-            ) or "NONE",
+            signal_timeframe=SIGNAL_TIMEFRAME,
+            context_timeframe=cfg.context_timeframe or "",
         )
 
     # -- main loop ----------------------------------------------------------- #
@@ -270,7 +246,7 @@ class Backtester:
         """Replay ``m5`` and return the resulting signals and outcomes."""
         started = time.time()
         prepared = self.prepare(m5)
-        raw = prepared["m5"]
+        raw = prepared["m1"]
         first = self._warmup_index(prepared)
         total = len(raw)
 
@@ -305,7 +281,7 @@ class Backtester:
             # 2. evaluate this candle
             snapshot = self._snapshot(prepared, index)
             gate = build_gate_state(
-                result.signals, len(open_positions), bar_time, self.config.signal_timeframe
+                result.signals, len(open_positions), bar_time, SIGNAL_TIMEFRAME
             )
             evaluation = self.engine.evaluate(snapshot, gate, config=self.config)
             result.bars_evaluated += 1
@@ -361,7 +337,9 @@ class Backtester:
         row["tp_hits"] = progress.tp_hits
         row["mfe_r"] = progress.mfe_r
         row["mae_r"] = progress.mae_r
-        result.outcomes.append(build_outcome_row(row, progress, self.config.digits))
+        result.outcomes.append(
+            build_outcome_row(row, progress, self.config.digits, self.config)
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -394,28 +372,15 @@ def write_outputs(result: BacktestResult, out_dir: Path, prefix: str = "backtest
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
     config = load_config()
-    parser = argparse.ArgumentParser(description="XAUUSD signal engine backtester")
-    parser.add_argument("--data", type=Path, required=True, help="M5 history CSV")
+    parser = argparse.ArgumentParser(description="XAUUSD M1 scalping backtester")
+    parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument("--start", type=str, default=None, help="start date, e.g. 2024-01-01")
     parser.add_argument("--end", type=str, default=None, help="end date, e.g. 2024-06-30")
     parser.add_argument("--out", type=Path, default=config.data_dir, help="output directory")
     parser.add_argument("--prefix", type=str, default="backtest", help="output filename prefix")
     parser.add_argument(
-        "--spread", type=float, default=float("nan"),
-        help="simulate a constant spread in points (default: unknown -> spread filter skipped)",
-    )
-    parser.add_argument(
-        "--mode", type=str, default=None, choices=["RESEARCH", "STANDARD", "CONSERVATIVE"],
-        help="operating mode (default: MODE from .env, else STANDARD)",
-    )
-    parser.add_argument(
-        "--timeframe", type=str, default=None,
-        choices=["M1", "M5", "M15", "M30", "H1", "H4"],
-        help="signal timeframe; the confirmation hierarchy follows automatically",
-    )
-    parser.add_argument(
-        "--source-timeframe", type=str, default="M5",
-        help="timeframe of the candles in --data (default M5)",
+        "--spread", type=float, default=None,
+        help="constant spread in points (default: ASSUMED_SPREAD_POINTS from config)",
     )
     parser.add_argument(
         "--no-evaluations", action="store_true",
@@ -431,23 +396,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     try:
-        backtester = Backtester(
-            config,
-            spread_points=args.spread,
-            mode=args.mode,
-            timeframe=args.timeframe,
-            source_timeframe=args.source_timeframe,
-        )
+        backtester = Backtester(config, spread_points=args.spread)
         result = backtester.run(history, log_evaluations=not args.no_evaluations)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    view = backtester.config
+    cost_pips = config.pips(config.round_trip_cost(backtester.spread_points))
     print(
-        f"\nMode: {view.mode} | signal TF: {view.signal_timeframe} | "
-        f"confirmation: {view.intermediate_timeframe or '-'}/{view.higher_timeframe or '-'} | "
-        f"base threshold: {view.base_threshold:.0f}"
+        f"\nMode: SCALPING | timeframe: M1 | context: {config.context_timeframe or '-'} | "
+        f"threshold: {config.base_threshold:.0f}"
+        f"\nCosts charged: spread {backtester.spread_points:.0f} pts + slippage "
+        f"{config.slippage_points_entry:.0f}+{config.slippage_points_exit:.0f} pts "
+        f"= {cost_pips:.1f} pips round trip"
     )
 
     write_outputs(result, args.out, args.prefix)
