@@ -57,42 +57,130 @@ def test_symbol_lookup_is_forgiving_but_never_guesses():
 # --------------------------------------------------------------------------- #
 # broker symbol naming
 # --------------------------------------------------------------------------- #
-def test_the_configured_broker_symbols_are_used_for_the_data_feed():
+def test_the_brokers_own_names_are_the_canonical_symbols():
     """This account's broker suffixes both instruments with a lowercase "s"."""
-    assert XAUUSD_CONFIG.broker_symbol == "XAUUSDs"
-    assert BTCUSD_CONFIG.broker_symbol == "BTCUSDs"
-    assert get_market(XAUUSD).feed_symbol() == "XAUUSDs"
-    assert get_market(BTCUSD).feed_symbol() == "BTCUSDs"
-
-
-def test_the_broker_name_never_leaks_into_storage_or_records(tmp_path):
-    """Only the feed sees the suffix; everything else keeps the canonical name.
-
-    If the broker name reached the files, renaming an instrument at the broker
-    would split that market's history in two.
-    """
-    from src.signal_tracker import read_csv_rows
-
+    assert XAUUSD == "XAUUSDs"
+    assert BTCUSD == "BTCUSDs"
+    assert MARKET_ORDER == ("XAUUSDs", "BTCUSDs")
+    # nothing to translate: the feed asks for exactly the canonical symbol
     for symbol in MARKET_ORDER:
         market = get_market(symbol)
-        assert market.symbol == symbol
-        assert market.key == symbol.lower()
+        assert market.broker_symbol == "", "no translation should be configured"
+        assert market.feed_symbol() == symbol
         assert market.display == symbol
-        assert market.feed_symbol() != symbol, "fixture assumes a suffixed broker"
+        assert market.label().endswith(symbol)
+
+
+def test_the_broker_name_is_used_everywhere_not_just_the_feed(tmp_path):
+    """One name per instrument: feed, files, directory, records and menus."""
+    from src.signal_tracker import read_csv_rows
 
     btc = isolate(Config().for_market(BTCUSD), tmp_path)
-    assert btc.market_dir.name == "btcusd"
+    assert btc.symbol == "BTCUSDs"
+    assert btc.market_key == "btcusds"
+    assert btc.market_dir.name == "btcusds"
+
     tracker = SignalTracker(btc, FakeNotifier())
     tracker.load()
-    tracker.record_signal(_signal(BTCUSD))
+    signal = _signal(BTCUSD)
+    tracker.record_signal(signal)
 
     row = read_csv_rows(btc.signals_csv)[0]
-    assert row["symbol"] == BTCUSD
-    assert "BTCUSDs" not in btc.signals_csv.read_text(encoding="utf-8")
+    assert row["symbol"] == "BTCUSDs"
+    assert signal.signal_id.startswith("BTCUSDs")
 
 
-def test_the_broker_symbol_is_overridable_per_market(monkeypatch):
-    """A different broker needs an .env line, not a code change."""
+def test_the_old_spellings_still_resolve():
+    """Data, command lines and state files written before the rename still work."""
+    assert normalise_market("XAUUSD") == XAUUSD
+    assert normalise_market("BTCUSD") == BTCUSD
+    assert normalise_market("GOLD") == XAUUSD
+    # any casing of the canonical name resolves to the registry's own casing
+    for spelling in ("XAUUSDS", "xauusds", "XaUuSdS", " XAUUSDs "):
+        assert normalise_market(spelling) == XAUUSD, spelling
+    assert is_supported("XAUUSD") and is_supported("btcusds")
+    assert get_market("XAUUSD").symbol == "XAUUSDs"
+
+
+def test_the_command_line_accepts_every_spelling(tmp_path):
+    """``--symbol BTCUSD`` from an old script or note must still work.
+
+    argparse ``choices=`` compares the raw string, so it would reject the very
+    aliases the registry exists to accept - hence a type function instead.
+    """
+    import argparse
+
+    from src.markets import market_argument
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", type=market_argument, default=DEFAULT_MARKET)
+
+    for spelling in ("BTCUSD", "BTCUSDs", "btcusds", "BTCUSDS"):
+        assert parser.parse_args(["--symbol", spelling]).symbol == BTCUSD, spelling
+    for spelling in ("XAUUSD", "GOLD", "XAUUSDs"):
+        assert parser.parse_args(["--symbol", spelling]).symbol == XAUUSD, spelling
+    assert parser.parse_args([]).symbol == DEFAULT_MARKET
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--symbol", "ETHUSD"])
+
+
+def test_the_research_warning_follows_the_note_not_a_hardcoded_symbol():
+    """A hardcoded name silently stops matching the moment a symbol is renamed."""
+    import src.telegram_control as control_module
+    import main as main_module
+    import inspect
+
+    for module in (control_module, main_module):
+        source = inspect.getsource(module)
+        assert '== "BTCUSD"' not in source, f"{module.__name__} compares a literal symbol"
+        assert '== "XAUUSD"' not in source, f"{module.__name__} compares a literal symbol"
+
+    assert "INITIAL RESEARCH PARAMETERS" in BTCUSD_CONFIG.note.upper()
+    assert "INITIAL RESEARCH PARAMETERS" not in XAUUSD_CONFIG.note.upper()
+
+
+def test_a_legacy_data_directory_is_adopted_rather_than_orphaned(tmp_path):
+    """Renaming the symbol renames the directory; the old history must follow.
+
+    Left behind, the previous run's CSVs would still be on disk but invisible,
+    which is indistinguishable from data loss.
+    """
+    legacy = tmp_path / "xauusd"
+    legacy.mkdir(parents=True)
+    (legacy / "signals.csv").write_text("kept\n", encoding="utf-8")
+
+    config = isolate(Config().for_market(XAUUSD), tmp_path)
+
+    assert config.market_dir.name == "xauusds"
+    assert not legacy.exists(), "the old directory was left behind"
+    assert config.signals_csv.read_text(encoding="utf-8").strip() == "kept"
+
+
+def test_adoption_never_overwrites_an_existing_directory(tmp_path):
+    """Both directories present: the current one wins and neither is destroyed."""
+    legacy = tmp_path / "xauusd"
+    legacy.mkdir(parents=True)
+    (legacy / "signals.csv").write_text("old\n", encoding="utf-8")
+    current = tmp_path / "xauusds"
+    current.mkdir(parents=True)
+    (current / "signals.csv").write_text("current\n", encoding="utf-8")
+
+    config = isolate(Config().for_market(XAUUSD), tmp_path)
+
+    assert config.signals_csv.read_text(encoding="utf-8").strip() == "current"
+    assert (legacy / "signals.csv").read_text(encoding="utf-8").strip() == "old"
+
+
+def test_an_unknown_symbol_still_raises_rather_than_selecting_gold():
+    assert normalise_market("ETHUSD", default=XAUUSD) == XAUUSD
+    with pytest.raises(KeyError):
+        get_market("ETHUSD")
+    assert not is_supported("XAUUS"), "a truncated name must not match"
+
+
+def test_the_feed_name_is_overridable_without_renaming_the_market(monkeypatch):
+    """Moving broker changes the feed name only, never the stored history."""
     from src.markets import apply_env_overrides
 
     monkeypatch.setenv("XAUUSD_BROKER_SYMBOL", "GOLD")
@@ -103,9 +191,28 @@ def test_the_broker_symbol_is_overridable_per_market(monkeypatch):
 
     assert gold.feed_symbol() == "GOLD"
     assert btc.feed_symbol() == "BTCUSD.x"
-    # the canonical identity is untouched by the broker's naming
-    assert gold.symbol == XAUUSD and gold.key == "xauusd" and gold.display == "XAUUSD"
-    assert btc.symbol == BTCUSD and btc.key == "btcusd"
+    # identity and storage are untouched, so no history is orphaned
+    assert gold.symbol == XAUUSD and gold.key == "xauusds" and gold.display == XAUUSD
+    assert btc.symbol == BTCUSD and btc.key == "btcusds"
+
+
+def test_both_env_prefix_spellings_are_accepted(monkeypatch):
+    """XAUUSDS_THRESHOLD is derived from the symbol; XAUUSD_THRESHOLD is kinder."""
+    from src.markets import apply_env_overrides, env_prefix_hint, env_prefixes
+
+    assert "XAUUSDS" in env_prefixes(XAUUSD_CONFIG)
+    assert "XAUUSD" in env_prefixes(XAUUSD_CONFIG)
+    assert env_prefix_hint(XAUUSD_CONFIG) == "XAUUSD"
+    assert env_prefix_hint(BTCUSD_CONFIG) == "BTCUSD"
+
+    monkeypatch.setenv("XAUUSDS_THRESHOLD", "71")
+    assert apply_env_overrides(XAUUSD_CONFIG).threshold == 71
+    assert apply_env_overrides(BTCUSD_CONFIG).threshold == BTCUSD_CONFIG.threshold
+    monkeypatch.undo()
+
+    monkeypatch.setenv("BTCUSD_THRESHOLD", "59")
+    assert apply_env_overrides(BTCUSD_CONFIG).threshold == 59
+    assert apply_env_overrides(XAUUSD_CONFIG).threshold == XAUUSD_CONFIG.threshold
 
 
 def test_the_legacy_symbol_variable_still_renames_gold_only(monkeypatch):
@@ -115,7 +222,7 @@ def test_the_legacy_symbol_variable_still_renames_gold_only(monkeypatch):
     monkeypatch.setenv("SYMBOL", "XAUUSD.m")
 
     assert apply_env_overrides(XAUUSD_CONFIG).feed_symbol() == "XAUUSD.m"
-    assert apply_env_overrides(BTCUSD_CONFIG).feed_symbol() == "BTCUSDs", (
+    assert apply_env_overrides(BTCUSD_CONFIG).feed_symbol() == BTCUSD, (
         "the legacy gold-only variable renamed Bitcoin"
     )
 
@@ -124,8 +231,8 @@ def test_a_prefixed_override_wins_over_the_legacy_name(monkeypatch):
     from src.markets import apply_env_overrides
 
     monkeypatch.setenv("SYMBOL", "XAUUSD.m")
-    monkeypatch.setenv("XAUUSD_BROKER_SYMBOL", "XAUUSDs")
-    assert apply_env_overrides(XAUUSD_CONFIG).feed_symbol() == "XAUUSDs"
+    monkeypatch.setenv("XAUUSD_BROKER_SYMBOL", "XAUUSD.pro")
+    assert apply_env_overrides(XAUUSD_CONFIG).feed_symbol() == "XAUUSD.pro"
 
 
 def _fake_mt5(available):
@@ -248,7 +355,7 @@ def test_gold_keeps_its_existing_scalping_parameters():
 def test_the_default_config_view_is_gold(config):
     assert config.symbol == XAUUSD
     assert config.base_threshold == XAUUSD_CONFIG.threshold
-    assert config.market_dir.name == "xauusd"
+    assert config.market_dir.name == "xauusds"
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +494,7 @@ def test_each_market_writes_to_its_own_directory(tmp_path):
     assert gold.market_dir != btc.market_dir
     for attribute in ("signals_csv", "outcomes_csv", "evaluations_csv", "state_file"):
         assert getattr(gold, attribute) != getattr(btc, attribute), attribute
-    assert gold.market_dir.name == "xauusd" and btc.market_dir.name == "btcusd"
+    assert gold.market_dir.name == "xauusds" and btc.market_dir.name == "btcusds"
     # one shared global state file, one per-market file each
     assert gold.global_state_file == btc.global_state_file == tmp_path / "state.json"
 
@@ -633,7 +740,7 @@ def test_a_gold_trade_is_never_advanced_by_bitcoin_candles(tmp_path):
         slot.tracker.update = spy
 
     runner.slot(XAUUSD).tracker.record_signal(_gold_signal_at(runner, gold_config))
-    runner.control.handle_callback("mkt:BTCUSD")
+    runner.control.handle_callback(f"mkt:{BTCUSD}")
     for _ in range(30):
         runner._tick()
         runner.market.advance()
@@ -660,7 +767,7 @@ def controller(tmp_path):
 def test_the_panel_offers_both_markets_and_marks_the_active_one(controller):
     data = [b["callback_data"] for row in controller.main_keyboard() for b in row]
     text = [b["text"] for row in controller.main_keyboard() for b in row]
-    assert data[:2] == ["mkt:XAUUSD", "mkt:BTCUSD"]
+    assert data[:2] == [f"mkt:{XAUUSD}", f"mkt:{BTCUSD}"]
     assert any("🥇" in label for label in text)
     assert any("₿" in label for label in text)
     assert text[0].startswith("●"), "the active market is not marked"
@@ -668,13 +775,13 @@ def test_the_panel_offers_both_markets_and_marks_the_active_one(controller):
 
 
 def test_switching_market_is_reported_prominently(controller):
-    text, _keyboard, toast = controller.handle_callback("mkt:BTCUSD")
-    assert "BTCUSD" in toast
-    assert "Market: ₿ BTCUSD" in text
+    text, _keyboard, toast = controller.handle_callback(f"mkt:{BTCUSD}")
+    assert BTCUSD in toast
+    assert f"Market: ₿ {BTCUSD}" in text
     assert controller.runtime.active_market == BTCUSD
 
-    text, _keyboard, _toast = controller.handle_callback("mkt:XAUUSD")
-    assert "Market: 🥇 XAUUSD" in text
+    text, _keyboard, _toast = controller.handle_callback(f"mkt:{XAUUSD}")
+    assert f"Market: 🥇 {XAUUSD}" in text
 
 
 def test_an_unknown_market_button_does_not_change_the_selection(controller):
@@ -685,9 +792,9 @@ def test_an_unknown_market_button_does_not_change_the_selection(controller):
 def test_settings_act_on_the_active_market_only(controller):
     """Spec 19: pressing a settings button must not touch the other market."""
     runtime = controller.runtime
-    controller.handle_callback("mkt:BTCUSD")
+    controller.handle_callback(f"mkt:{BTCUSD}")
     text = controller.render_settings()
-    assert "⚙️ BTCUSD SETTINGS" in text
+    assert f"⚙️ {BTCUSD} SETTINGS" in text
 
     before = runtime.market(XAUUSD).active_threshold()
     controller.handle_callback("thr:5")
@@ -696,17 +803,17 @@ def test_settings_act_on_the_active_market_only(controller):
         "a BTC threshold press moved gold"
     )
 
-    controller.handle_callback("mkt:XAUUSD")
-    assert "⚙️ XAUUSD SETTINGS" in controller.render_settings()
+    controller.handle_callback(f"mkt:{XAUUSD}")
+    assert f"⚙️ {XAUUSD} SETTINGS" in controller.render_settings()
     controller.handle_callback("thr:-5")
     assert runtime.market(XAUUSD).active_threshold() == before - 5
     assert runtime.market(BTCUSD).active_threshold() == BTCUSD_CONFIG.threshold + 5
 
 
 def test_the_threshold_panel_names_the_market_it_edits(controller):
-    controller.handle_callback("mkt:BTCUSD")
+    controller.handle_callback(f"mkt:{BTCUSD}")
     text, _keyboard, _toast = controller.handle_callback("menu:threshold")
-    assert "BTCUSD" in text
+    assert BTCUSD in text
     assert "does not affect the other market" in text
 
 
@@ -733,10 +840,10 @@ def test_analysis_follows_the_selected_market(controller):
             return None
 
     controller.engine = Engine()
-    controller.handle_callback("mkt:BTCUSD")
+    controller.handle_callback(f"mkt:{BTCUSD}")
     text, _keyboard, _toast = controller.handle_callback("view:analysis")
     assert asked == [BTCUSD]
-    assert "BTCUSD" in text
+    assert BTCUSD in text
 
 
 def test_performance_is_per_market_and_combined_is_opt_in(controller):
@@ -753,7 +860,7 @@ def test_performance_is_per_market_and_combined_is_opt_in(controller):
 
     controller._report_loader = loader
     data = [b["callback_data"] for row in controller.performance_keyboard() for b in row]
-    assert data[:3] == ["perf:XAUUSD", "perf:BTCUSD", "perf:COMBINED"]
+    assert data[:3] == [f"perf:{XAUUSD}", f"perf:{BTCUSD}", "perf:COMBINED"]
 
     controller.handle_callback("view:performance")
     assert requested[-1] == XAUUSD, "the default view merged the markets"
@@ -771,7 +878,7 @@ def test_the_panel_reports_the_other_markets_open_trades(controller):
     controller.engine = Engine()
     text = controller.render_panel()
     assert "Also tracking" in text
-    assert "₿ BTCUSD 2 open" in text
+    assert f"₿ {BTCUSD} 2 open" in text
 
 
 def test_no_button_can_place_an_order(controller):
@@ -798,11 +905,11 @@ def test_the_card_is_rendered_in_the_signals_own_market(config):
     """A BTC card must not be printed with gold's icon or pip unit."""
     notifier = TelegramNotifier(config)          # notifier configured for gold
     text = notifier.format_signal(_signal(BTCUSD))
-    assert "₿ BTCUSD M1 SCALP" in text
+    assert f"₿ {BTCUSD} M1 SCALP" in text
     assert "$)" in text, "BTC distances are quoted in dollars"
 
     gold_text = notifier.format_signal(_signal(XAUUSD))
-    assert "🥇 XAUUSD M1 SCALP" in gold_text
+    assert f"🥇 {XAUUSD} M1 SCALP" in gold_text
     assert "p)" in gold_text
 
 
@@ -865,7 +972,7 @@ def test_switching_markets_moves_evaluation_and_keeps_the_other_intact(tmp_path)
     gold_marker = runner.runtime.market(XAUUSD).last_processed_candle()
     assert gold_rows and gold_marker is not None
 
-    runner.control.handle_callback("mkt:BTCUSD")
+    runner.control.handle_callback(f"mkt:{BTCUSD}")
     for _ in range(20):
         runner._tick()
         runner.market.advance()
@@ -886,7 +993,7 @@ def test_each_market_evaluates_each_closed_candle_exactly_once(tmp_path):
         runner._tick()          # same candle twice - must be ignored
         runner.market.advance()
 
-    runner.control.handle_callback("mkt:BTCUSD")
+    runner.control.handle_callback(f"mkt:{BTCUSD}")
     for _ in range(15):
         runner._tick()
         runner._tick()
@@ -904,7 +1011,7 @@ def test_an_open_trade_keeps_being_tracked_after_switching_away(tmp_path):
     row = gold_slot.tracker.record_signal(_gold_signal_at(runner, gold_config))
     assert gold_slot.has_open_signals()
 
-    runner.control.handle_callback("mkt:BTCUSD")
+    runner.control.handle_callback(f"mkt:{BTCUSD}")
     assert runner.runtime.active_market == BTCUSD
 
     for _ in range(40):
@@ -978,6 +1085,6 @@ def test_a_bitcoin_signal_carries_every_required_field(tmp_path):
 
 def test_the_global_state_file_records_the_active_market(tmp_path):
     runner, _gold, _btc = _runner(tmp_path)
-    runner.control.handle_callback("mkt:BTCUSD")
+    runner.control.handle_callback(f"mkt:{BTCUSD}")
     saved = json.loads(runner.config.global_state_file.read_text(encoding="utf-8"))
     assert saved["runtime"]["active_market"] == BTCUSD

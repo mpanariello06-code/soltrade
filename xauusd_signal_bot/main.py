@@ -1,4 +1,4 @@
-"""M1 micro-scalping research runner - XAUUSD and BTCUSD.
+"""M1 micro-scalping research runner, one engine over every configured market.
 
 Connects to MetaTrader 5 for **market data only**, evaluates one candidate per
 newly closed M1 candle of the active market, notifies Telegram and logs
@@ -221,7 +221,7 @@ class SignalRunner:
         state = self.runtime.describe()
         lines = [
             "=" * BANNER_WIDTH,
-            "M1 SCALPER - XAUUSD / BTCUSD",
+            f"M1 SCALPER - {' / '.join(MARKET_ORDER)}",
             f"Status: {state['status']}" if mt5_ok else "Status: NOT CONNECTED",
             "=" * BANNER_WIDTH,
             f"MT5:      {'CONNECTED' if mt5_ok else 'DISCONNECTED'}",
@@ -254,7 +254,11 @@ class SignalRunner:
         lines += [
             "",
             "PAPER TEST ONLY - no orders are ever sent.",
-            "BTCUSD parameters are INITIAL RESEARCH PARAMETERS.",
+            *[
+                f"{symbol} parameters are INITIAL RESEARCH PARAMETERS."
+                for symbol in MARKET_ORDER
+                if "INITIAL RESEARCH PARAMETERS" in get_market(symbol).note.upper()
+            ],
             "=" * BANNER_WIDTH,
         ]
         print("\n".join(lines), flush=True)

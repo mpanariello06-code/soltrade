@@ -6,6 +6,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from src.markets import BTCUSD, XAUUSD
 from src.runtime_state import JsonStateStore, RuntimeState, effective_config
 from src.telegram_control import TelegramController
 from src.timeframes import STATUS_PAUSED, STATUS_RUNNING, STATUS_STOPPED
@@ -42,7 +43,7 @@ def button_text(keyboard):
 # --------------------------------------------------------------------------- #
 def test_main_panel_matches_the_specified_layout(controller):
     text = controller.render_panel()
-    for expected in ("⚡ M1 SCALPER", "Market: 🥇 XAUUSD", "Status:", "Mode: SCALPING",
+    for expected in ("⚡ M1 SCALPER", f"Market: 🥇 {XAUUSD}", "Status:", "Mode: SCALPING",
                      "Timeframe: M1",
                      "Threshold:", "Signals today:", "Open signals:", "Paper Net R:"):
         assert expected in text, expected
@@ -51,7 +52,7 @@ def test_main_panel_matches_the_specified_layout(controller):
 def test_main_keyboard_has_only_the_scalping_controls(controller):
     data = button_data(controller.main_keyboard())
     assert data == [
-        "mkt:XAUUSD", "mkt:BTCUSD",
+        f"mkt:{XAUUSD}", f"mkt:{BTCUSD}",
         "view:analysis", "view:performance",
         "run:pause",                     # single toggle: the engine is RUNNING
         "menu:settings", "panel:refresh",

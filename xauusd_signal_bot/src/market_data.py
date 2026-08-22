@@ -21,7 +21,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .markets import MARKET_ORDER, get_market
+from .markets import MARKET_ORDER, env_prefix_hint, env_prefixes, get_market
 from .timeframes import SIGNAL_TIMEFRAME
 from .utils import (
     BoundedCache,
@@ -424,17 +424,22 @@ class MarketData:
 
             with _MT5_LOCK:
                 everything = mt5.symbols_get() or ()
+            # Search on every accepted spelling, not just the canonical one:
+            # the canonical name already carries this broker's suffix, so
+            # "XAUUSDs" would never prefix-match another broker's "XAUUSD.m".
+            stems = tuple(env_prefixes(get_market(symbol)))
             names = [str(getattr(item, "name", "")) for item in everything]
             matches = [
                 name for name in names
-                if name and name.upper().startswith(symbol.upper())
+                if name and name.upper().startswith(stems)
             ]
+            variable = f"{env_prefix_hint(get_market(symbol))}_BROKER_SYMBOL"
             if not matches:
                 LOGGER.error(
                     "Symbol '%s' not found on this account, and nothing starts "
-                    "with '%s'. Set %s_BROKER_SYMBOL in .env to the exact name "
-                    "your broker uses.",
-                    configured, symbol, symbol,
+                    "with '%s'. Set %s in .env to the exact name your broker "
+                    "uses.",
+                    configured, symbol, variable,
                 )
                 return None
 
@@ -443,9 +448,8 @@ class MarketData:
             chosen = min(matches, key=len)
             LOGGER.warning(
                 "Symbol '%s' not found; using '%s' for this session. "
-                "Other candidates: %s. Set %s_BROKER_SYMBOL=%s in .env to make "
-                "this permanent.",
-                configured, chosen, ", ".join(sorted(matches)[:8]), symbol, chosen,
+                "Other candidates: %s. Set %s=%s in .env to make this permanent.",
+                configured, chosen, ", ".join(sorted(matches)[:8]), variable, chosen,
             )
             self._symbol_overrides[symbol] = chosen
             return chosen

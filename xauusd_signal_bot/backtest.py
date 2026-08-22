@@ -39,9 +39,9 @@ A CSV of M1 candles with columns ``time, open, high, low, close, tick_volume``.
 
 Usage::
 
-    python backtest.py --data history/XAUUSD_M1.csv
-    python backtest.py --symbol BTCUSD --data history/BTCUSD_M1.csv
-    python backtest.py --data history/XAUUSD_M1.csv --spread 12
+    python backtest.py --data history/XAUUSDs_M1.csv
+    python backtest.py --symbol BTCUSDs --data history/BTCUSDs_M1.csv
+    python backtest.py --data history/XAUUSDs_M1.csv --spread 12
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ from config import Config, load_config
 from performance import build_report, render_report
 from src.indicators import compute_indicators
 from src.logger import get_logger, setup_logging
-from src.markets import MARKET_ORDER, DEFAULT_MARKET, get_market
+from src.markets import MARKET_ORDER, DEFAULT_MARKET, get_market, market_argument
 from src.market_data import (
     MarketSnapshot,
     clean_candles,
@@ -380,8 +380,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     base_config = load_config()
     parser = argparse.ArgumentParser(description="M1 scalping backtester")
     parser.add_argument(
-        "--symbol", type=str, default=DEFAULT_MARKET, choices=list(MARKET_ORDER),
-        help="market to backtest (default: %(default)s)",
+        "--symbol", type=market_argument, default=DEFAULT_MARKET,
+        help=f"market to backtest: {', '.join(MARKET_ORDER)} "
+             f"(default: %(default)s; older spellings are accepted)",
     )
     parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument("--start", type=str, default=None, help="start date, e.g. 2024-01-01")

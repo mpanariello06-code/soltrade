@@ -20,6 +20,7 @@ the most recent candle on every evaluation so you can sanity-check it.
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import os
 from dataclasses import dataclass, field, asdict
@@ -200,8 +201,8 @@ class Config:
     # they are kept so that a bare ``Config()`` remains usable (tests, tooling)
     # without having to select a market first.
     #
-    symbol: str = field(default_factory=lambda: _env_str("SYMBOL", "XAUUSD"))
-    market_key: str = "xauusd"
+    symbol: str = field(default_factory=lambda: _env_str("SYMBOL", "XAUUSDs"))
+    market_key: str = "xauusds"
 
     #: The ONLY signal timeframe.  This is a dedicated M1 scalping system; the
     #: multi-timeframe selector was removed deliberately.
@@ -528,19 +529,19 @@ class Config:
     # Each market owns a directory so nothing can ever be mixed:
     #
     #     data/state.json              global runtime (active market, run state)
-    #     data/xauusd/{evaluations,signals,outcomes}.csv, state.json
-    #     data/btcusd/{evaluations,signals,outcomes}.csv, state.json
+    #     data/xauusds/{evaluations,signals,outcomes}.csv, state.json
+    #     data/btcusds/{evaluations,signals,outcomes}.csv, state.json
     #
     # The paths below point at the ACTIVE market and are rewritten by
     # :meth:`for_market`.
     #
     data_dir: Path = DATA_DIR
-    market_dir: Path = DATA_DIR / "xauusd"
-    signals_csv: Path = DATA_DIR / "xauusd" / "signals.csv"
-    evaluations_csv: Path = DATA_DIR / "xauusd" / "evaluations.csv"
-    outcomes_csv: Path = DATA_DIR / "xauusd" / "outcomes.csv"
+    market_dir: Path = DATA_DIR / "xauusds"
+    signals_csv: Path = DATA_DIR / "xauusds" / "signals.csv"
+    evaluations_csv: Path = DATA_DIR / "xauusds" / "evaluations.csv"
+    outcomes_csv: Path = DATA_DIR / "xauusds" / "outcomes.csv"
     #: Per-market runtime state (threshold, cooldown, last processed candle).
-    state_file: Path = DATA_DIR / "xauusd" / "state.json"
+    state_file: Path = DATA_DIR / "xauusds" / "state.json"
     #: Global runtime state (active market, run state, alert preferences).
     global_state_file: Path = DATA_DIR / "state.json"
     log_file: Path = DATA_DIR / "system_log.txt"
@@ -600,7 +601,41 @@ class Config:
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._adopt_legacy_market_dir()
         self.market_dir.mkdir(parents=True, exist_ok=True)
+
+    def _adopt_legacy_market_dir(self) -> None:
+        """Carry a pre-rename data directory over to the current name.
+
+        The market key follows the symbol, so renaming ``XAUUSD`` to the
+        broker's ``XAUUSDs`` moves the directory from ``data/xauusd`` to
+        ``data/xauusds``.  Without this the old history would still be on disk
+        but invisible, which looks exactly like data loss.
+
+        Only ever renames INTO a name that does not exist yet, so it cannot
+        overwrite anything, and it is a no-op on every run after the first.
+        """
+        from src.markets import SYMBOL_ALIASES
+
+        if self.market_dir.exists():
+            return
+        candidates = [
+            alias.lower() for alias, canonical in SYMBOL_ALIASES.items()
+            if canonical.casefold() == str(self.symbol).casefold()
+        ]
+        for legacy_key in candidates:
+            legacy = self.data_dir / legacy_key
+            if legacy_key != self.market_key and legacy.is_dir():
+                try:
+                    legacy.rename(self.market_dir)
+                except OSError:
+                    # A failed rename must not stop start-up: the engine simply
+                    # begins with an empty directory, and the old one is intact.
+                    return
+                logging.getLogger("scalper.config").info(
+                    "Adopted legacy data directory %s -> %s", legacy, self.market_dir
+                )
+                return
 
     # ------------------------------------------------------------------ #
     # market selection

@@ -6,7 +6,7 @@ market-agnostic by extracting everything instrument-specific into one
 `MarketConfig` per market; XAUUSD's shipped values were lifted verbatim from the
 previous build so gold's behaviour is unchanged.
 
-* **Tests:** 273 passing (216 before + 57 new two-market tests), ~125 s
+* **Tests:** 280 passing (216 before + 64 new two-market tests), ~120 s
 * **Static analysis:** `pyflakes` clean across every module
 * **Order execution:** still none anywhere — paper/signal only
 * **BTCUSD parameters:** INITIAL RESEARCH PARAMETERS. Not optimised, not
@@ -198,30 +198,49 @@ The BTCUSD synthetic profile is a plausible-looking guess at crypto M1
 behaviour, not a calibration against exchange data, and BTCUSD has not been
 calibrated or validated on real data at all.
 
-## B9a. Broker symbol names
+## B9a. Symbol names
 
-The configured account suffixes both instruments with a lowercase `s`, so
-`MarketConfig.broker_symbol` ships as `XAUUSDs` and `BTCUSDs`.
+The account's broker suffixes both instruments with a lowercase `s`, so the
+**canonical symbols are `XAUUSDs` and `BTCUSDs`** — one name per instrument,
+used at the MT5 feed, in `data/xauusds/`, in the `symbol` column of every CSV,
+in signal ids, in every Telegram panel and on every CLI. `broker_symbol` is left
+empty because there is nothing to translate.
 
-`broker_symbol` is used at the MT5 boundary **only** — `copy_rates_from_pos`,
-`symbol_info`, `symbol_info_tick`, `copy_ticks_range` and `symbol_select`.
-Every file path, CSV row, signal id, menu label and report keeps the canonical
-`XAUUSD` / `BTCUSD`, so a broker-side rename cannot split a market's history.
+Choosing the broker's name as canonical (rather than translating at the feed)
+means there is exactly one string per instrument and no boundary at which the
+two spellings can drift apart. The cost is that renaming the symbol renames the
+data directory, which is handled below.
 
-Two failure modes are handled explicitly:
+Four failure modes are handled explicitly:
 
-* **A wrong symbol is silent.** MT5 returns an empty result, not an error, for
-  a symbol it does not have — indistinguishable from a market with no candles.
-  `MarketData._resolve_symbol()` therefore checks the configured name at connect
-  time and, if it is missing, searches the broker's own symbol list, adopts the
-  shortest match for that session, and logs the exact `.env` line to make it
-  permanent. The guess is never written back to config: naming the broker's
-  instruments is the user's decision, not the program's.
-* **The legacy `SYMBOL` variable overrides the new default.** It predates
-  multi-market support and still means "gold's broker symbol", so an existing
-  `.env` carrying `SYMBOL=XAUUSD` would silently undo `XAUUSDs`.
-  `.env.example` now ships it commented out with a caution, and a test asserts
-  it renames gold only and never touches Bitcoin.
+* **`.upper()` would destroy the suffix.** Symbol matching previously
+  upper-cased, which would turn `XAUUSDs` into `XAUUSDS` — the exact character
+  that makes the name correct. Matching is now case-insensitive via `casefold`
+  and always returns the registry's own casing. The same bug existed in the
+  `MultiMarket` test double and was fixed there too.
+* **Older spellings must keep working.** `SYMBOL_ALIASES` maps `XAUUSD`,
+  `BTCUSD` and `GOLD` onto the canonical names, so a `--symbol BTCUSD`, a
+  persisted `active_market`, a CSV row and `XAUUSD_THRESHOLD` in `.env` all
+  still resolve. argparse `choices=` compares the raw string and would have
+  rejected exactly those aliases, so the CLIs use a `market_argument` type
+  function instead. Unknown symbols still raise rather than defaulting to gold.
+* **A renamed market orphans its data directory.** The key follows the symbol,
+  so `data/xauusd/` became `data/xauusds/`. `Config._adopt_legacy_market_dir()`
+  renames an existing legacy directory on first use — only ever into a name that
+  does not exist yet, so it cannot overwrite, and it is a no-op afterwards.
+* **A wrong symbol is silent.** MT5 returns an empty result, not an error, for a
+  symbol it does not have — indistinguishable from a market with no candles.
+  `MarketData._resolve_symbol()` checks the configured name at connect time and,
+  if missing, searches the broker's own symbol list (across every accepted
+  spelling, since `XAUUSDs` would not prefix-match another broker's
+  `XAUUSD.m`), adopts the shortest match for that session, and logs the exact
+  `.env` line to make it permanent. The guess is never written back to config.
+
+Two hardcoded symbol comparisons were removed while doing this: the Telegram
+panel and the startup dashboard both tested `symbol == "BTCUSD"` to decide
+whether to show the research-parameters warning, which silently stopped matching
+the moment the symbol changed. Both now key off the market's own `note`, and a
+test asserts neither module compares a symbol literal again.
 
 ## B10. Verification runs
 

@@ -36,7 +36,7 @@ import pandas as pd
 
 from backtest import Backtester, load_history, write_outputs
 from config import load_config
-from src.markets import MARKET_ORDER, DEFAULT_MARKET
+from src.markets import MARKET_ORDER, DEFAULT_MARKET, market_argument
 from performance import Report, build_report
 from src.logger import get_logger, setup_logging
 from src.market_data import timeframe_minutes
@@ -183,8 +183,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config = load_config()
     parser = argparse.ArgumentParser(description="Walk-forward robustness report")
     parser.add_argument(
-        "--symbol", type=str, default=DEFAULT_MARKET, choices=list(MARKET_ORDER),
-        help="market to evaluate (default: %(default)s)",
+        "--symbol", type=market_argument, default=DEFAULT_MARKET,
+        help=f"market to evaluate: {', '.join(MARKET_ORDER)} "
+             f"(default: %(default)s; older spellings are accepted)",
     )
     parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument(

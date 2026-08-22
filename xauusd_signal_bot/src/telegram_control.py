@@ -215,8 +215,11 @@ class TelegramController:
             )
             lines += ["", f"Also tracking: {carried}"]
         lines += ["", DIVIDER, "🔬 PAPER TEST ONLY - no orders are placed."]
-        if symbol == "BTCUSD":
-            lines.append("BTCUSD uses INITIAL RESEARCH PARAMETERS.")
+        # Driven by the market's own note, not a symbol comparison: a hardcoded
+        # name silently stops matching the moment a symbol is renamed.
+        note = get_market(symbol).note
+        if "INITIAL RESEARCH PARAMETERS" in note.upper():
+            lines.append(f"{symbol} uses INITIAL RESEARCH PARAMETERS.")
         return "\n".join(lines)
 
     def render_threshold_panel(self) -> str:

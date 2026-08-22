@@ -46,8 +46,20 @@ from .logger import get_logger
 
 LOGGER = get_logger("markets")
 
-XAUUSD = "XAUUSD"
-BTCUSD = "BTCUSD"
+#: Canonical symbols - the exact names THIS ACCOUNT'S BROKER uses.  These are
+#: what the MT5 feed is asked for AND what every file, record, menu and report
+#: shows, so there is one name per instrument and no translation anywhere.
+XAUUSD = "XAUUSDs"
+BTCUSD = "BTCUSDs"
+
+#: Older spellings that still resolve to the canonical symbol above.  Data
+#: written before the rename, a ``--symbol XAUUSD`` on the command line and a
+#: persisted ``active_market`` all keep working.  Matching is case-insensitive.
+SYMBOL_ALIASES: Dict[str, str] = {
+    "XAUUSD": XAUUSD,
+    "GOLD": XAUUSD,
+    "BTCUSD": BTCUSD,
+}
 
 
 @dataclass(frozen=True)
@@ -113,10 +125,11 @@ class MarketConfig:
     candles_signal: int = 900
     candles_context: int = 400
 
-    #: Symbol as the BROKER names it, when that differs from the canonical one
-    #: (``XAUUSD.m``, ``GOLD``, ``BTCUSD.x`` ...).  Empty means "same".
-    #: Only the data feed uses it; every file, record and menu keeps the
-    #: canonical symbol so a broker rename cannot split a market's history.
+    #: Set ONLY when the data feed needs a different name from ``symbol``.
+    #: Normally empty, because ``symbol`` is already the broker's own name -
+    #: one name per instrument, no translation anywhere.  It exists for moving
+    #: to a broker that spells an instrument differently without renaming the
+    #: market and orphaning its stored history.
     broker_symbol: str = ""
 
     #: Free-text note surfaced in the README/build report and the settings panel.
@@ -150,14 +163,12 @@ class MarketConfig:
 #
 XAUUSD_CONFIG = MarketConfig(
     symbol=XAUUSD,
-    key="xauusd",
-    display="XAUUSD",
+    key="xauusds",
+    display=XAUUSD,
     icon="🥇",
-    # This account's broker suffixes both instruments with a lowercase "s".
-    # Only the data feed sees it; files, records and menus keep XAUUSD, so a
-    # broker rename can never split this market's history.
-    # Override with XAUUSD_BROKER_SYMBOL in .env for a different broker.
-    broker_symbol="XAUUSDs",
+    # broker_symbol is left empty: `symbol` above IS this broker's name, so
+    # there is nothing to translate.  Set XAUUSD_BROKER_SYMBOL only if you move
+    # to a broker that spells it differently again.
     digits=2,
     point_value=0.01,
     # Gold is quoted to 2 decimals and a pip is conventionally the first
@@ -221,10 +232,9 @@ XAUUSD_CONFIG = MarketConfig(
 #
 BTCUSD_CONFIG = MarketConfig(
     symbol=BTCUSD,
-    key="btcusd",
-    display="BTCUSD",
+    key="btcusds",
+    display=BTCUSD,
     icon="₿",
-    broker_symbol="BTCUSDs",   # same suffix convention as gold; see above
     digits=2,
     point_value=0.01,
     pip_value=1.0,            # one "pip" == one US dollar
@@ -318,6 +328,33 @@ _LEGACY_ENV_ALIASES: Dict[str, str] = {
 }
 
 
+def env_prefixes(market: MarketConfig) -> Tuple[str, ...]:
+    """Environment-variable prefixes accepted for ``market``, best first.
+
+    The canonical symbol carries the broker's lowercase suffix, and shouting
+    ``XAUUSDS_THRESHOLD`` in a ``.env`` file is unpleasant, so the un-suffixed
+    spelling is accepted too: ``XAUUSD_THRESHOLD`` and ``XAUUSDS_THRESHOLD``
+    both retune gold.
+    """
+    prefixes = [market.symbol.upper()]
+    for alias, canonical in SYMBOL_ALIASES.items():
+        if canonical == market.symbol and alias not in prefixes:
+            prefixes.append(alias)
+    return tuple(prefixes)
+
+
+def env_prefix_hint(market: MarketConfig) -> str:
+    """The friendliest accepted prefix, for messages that tell a user what to set.
+
+    Every prefix in :func:`env_prefixes` works; this picks the shortest one that
+    is genuinely a prefix of the canonical symbol, so gold is suggested as
+    ``XAUUSD_...`` rather than the shoutier ``XAUUSDS_...``.
+    """
+    canonical = market.symbol.upper()
+    usable = [p for p in env_prefixes(market) if canonical.startswith(p)]
+    return min(usable, key=len) if usable else canonical
+
+
 def apply_env_overrides(market: MarketConfig) -> MarketConfig:
     """Overlay ``<SYMBOL>_<FIELD>`` environment variables onto ``market``.
 
@@ -327,8 +364,9 @@ def apply_env_overrides(market: MarketConfig) -> MarketConfig:
     engine at start-up.
     """
     changes: Dict[str, object] = {}
+    prefixes = env_prefixes(market)
     for field_name, caster in _ENV_FIELDS.items():
-        names = [f"{market.symbol}_{field_name.upper()}"]
+        names = [f"{prefix}_{field_name.upper()}" for prefix in prefixes]
         if market.symbol == XAUUSD and field_name in _LEGACY_ENV_ALIASES:
             names.append(_LEGACY_ENV_ALIASES[field_name])
         for name in names:
@@ -377,24 +415,61 @@ def get_market(symbol: str) -> MarketConfig:
     return MARKETS[normalise_market(symbol, default="")]
 
 
+def _match(symbol: Optional[str]) -> Optional[str]:
+    """Resolve any spelling of a symbol to its canonical form, or ``None``.
+
+    Matching is case-insensitive because the canonical symbols now carry the
+    broker's lowercase suffix (``XAUUSDs``), so the old ``.upper()`` would have
+    destroyed the very character that makes the name correct.  The value
+    returned is always the registry's own casing, never the caller's.
+    """
+    candidate = str(symbol or "").strip()
+    if not candidate:
+        return None
+    folded = candidate.casefold()
+    for known in MARKETS:
+        if known.casefold() == folded:
+            return known
+    alias = SYMBOL_ALIASES.get(candidate.upper())
+    return alias if alias in MARKETS else None
+
+
 def normalise_market(symbol: Optional[str], default: str = DEFAULT_MARKET) -> str:
-    """Upper-case and validate a market symbol, falling back to ``default``.
+    """Validate a market symbol, falling back to ``default``.
+
+    Accepts the canonical name in any casing, plus the legacy spellings in
+    :data:`SYMBOL_ALIASES`, so a ``--symbol XAUUSD`` or an ``active_market``
+    persisted before the rename still resolves.
 
     Passing ``default=""`` makes an unknown symbol raise instead of silently
     resolving - used by :func:`get_market` so a typo cannot select gold by
     accident.
     """
-    candidate = str(symbol or "").strip().upper()
-    if candidate in MARKETS:
-        return candidate
+    matched = _match(symbol)
+    if matched is not None:
+        return matched
     if default == "":
         raise KeyError(f"unknown market '{symbol}' (known: {', '.join(MARKET_ORDER)})")
     return default
 
 
 def is_supported(symbol: str) -> bool:
-    """True when ``symbol`` is a configured market."""
-    return str(symbol or "").strip().upper() in MARKETS
+    """True when ``symbol`` is a configured market, under any accepted spelling."""
+    return _match(symbol) is not None
+
+
+def market_argument(value: str) -> str:
+    """``argparse`` type for ``--symbol``: accepts any spelling, returns canonical.
+
+    ``choices=`` cannot be used for this, because it compares the raw string and
+    would reject the very aliases :func:`normalise_market` exists to accept.
+    """
+    import argparse
+
+    try:
+        return normalise_market(value, default="")
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def register_market(market: MarketConfig) -> None:

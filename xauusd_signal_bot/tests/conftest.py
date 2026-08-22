@@ -288,13 +288,16 @@ class MultiMarket:
     """
 
     def __init__(self, feeds) -> None:
-        self.feeds = {symbol.upper(): feed for symbol, feed in feeds.items()}
+        # Keyed case-insensitively but WITHOUT upper-casing: the canonical
+        # symbols carry the broker's lowercase suffix ("XAUUSDs"), so an
+        # .upper() here would report fetches under a name nothing else uses.
+        self.feeds = {symbol.casefold(): feed for symbol, feed in feeds.items()}
         self.connected = True
         self.cache_cleared = 0
         self.fetches = []
 
     def feed(self, symbol: str) -> "FakeMarket":
-        key = str(symbol).upper()
+        key = str(symbol).casefold()
         if key not in self.feeds:
             raise KeyError(f"no feed configured for {symbol!r}")
         return self.feeds[key]
@@ -315,7 +318,7 @@ class MultiMarket:
 
     def get_candles(self, symbol, timeframe, count, closed_only=True, use_cache=False,
                     cache_result=True):
-        self.fetches.append((str(symbol).upper(), timeframe))
+        self.fetches.append((str(symbol), timeframe))
         return self.feed(symbol).get_candles(
             symbol, timeframe, count, closed_only, use_cache, cache_result
         )
@@ -332,7 +335,7 @@ class MultiMarket:
     def build_snapshot(self, config=None, use_cache: bool = False):
         if config is None:
             raise ValueError("MultiMarket.build_snapshot needs a market config view")
-        self.fetches.append((str(config.symbol).upper(), "M1"))
+        self.fetches.append((str(config.symbol), "M1"))
         return self.feed(config.symbol).build_snapshot(config, use_cache)
 
 

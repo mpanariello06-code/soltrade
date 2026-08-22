@@ -27,6 +27,8 @@ from typing import Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from src.markets import BTCUSD, XAUUSD, normalise_market
+
 #: (drift per M1 bar, volatility per M1 bar) in PRICE terms, per regime.
 #: XAUUSD: an M1 ATR of roughly 2-5 pips, the right order for gold.
 REGIMES = {
@@ -48,10 +50,11 @@ BTC_REGIMES_PCT = {
     "quiet": (0.0, 0.00025),
 }
 
-#: symbol -> (start price, regime table in price terms)
+#: symbol -> (start price, regime table in price terms).  Keyed by the canonical
+#: symbols so a broker rename cannot leave this table pointing at nothing.
 PROFILES = {
-    "XAUUSD": (2300.0, REGIMES),
-    "BTCUSD": (
+    XAUUSD: (2300.0, REGIMES),
+    BTCUSD: (
         60000.0,
         {
             name: (drift * 60000.0, vol * 60000.0)
@@ -65,10 +68,10 @@ def generate(
     bars: int = 30000,
     seed: int = 42,
     start_price: Optional[float] = None,
-    symbol: str = "XAUUSD",
+    symbol: str = XAUUSD,
 ) -> pd.DataFrame:
     """Build a regime-switching synthetic M1 series with valid OHLC."""
-    default_price, regimes = PROFILES[symbol.upper()]
+    default_price, regimes = PROFILES[normalise_market(symbol)]
     if start_price is None:
         start_price = default_price
     rng = np.random.default_rng(seed)
@@ -104,8 +107,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(description="Generate synthetic M1 history")
     parser.add_argument(
-        "--symbol", type=str, default="XAUUSD", choices=sorted(PROFILES),
-        help="market profile to imitate (default: %(default)s)",
+        "--symbol", type=normalise_market, default=XAUUSD,
+        help=f"market profile to imitate: {', '.join(sorted(PROFILES))} "
+             f"(default: %(default)s; older spellings are accepted)",
     )
     parser.add_argument("--bars", type=int, default=30000, help="number of M1 candles")
     parser.add_argument("--seed", type=int, default=42)
@@ -113,7 +117,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    symbol = args.symbol.upper()
+    symbol = normalise_market(args.symbol)
     out = args.out or Path(f"history/{symbol}_M1_synthetic.csv")
     frame = generate(args.bars, args.seed, args.start_price, symbol)
     out.parent.mkdir(parents=True, exist_ok=True)

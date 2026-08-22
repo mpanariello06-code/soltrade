@@ -1,12 +1,13 @@
-# XAUUSD + BTCUSD M1 Micro-Scalping Research System
+# XAUUSDs + BTCUSDs M1 Micro-Scalping Research System
 
 A standalone, deterministic **signal-only** system running one M1 micro-scalping
-engine over two markets: **XAUUSD** and **BTCUSD**.
+engine over two markets: **XAUUSDs** and **BTCUSDs** — the exact names this
+account's broker uses.
 
 ```
 MT5 M1 market data (per market)
       ↓
-market configuration (XAUUSD | BTCUSD) folded onto the shared engine
+market configuration (XAUUSDs | BTCUSDs) folded onto the shared engine
       ↓
 M1 microstructure analysis (momentum, displacement, sweeps, immediate S/R)
       ↓
@@ -165,27 +166,26 @@ python backtest.py --data history/XAUUSD_M5.csv
 
 ## Markets
 
-Two markets, **one engine**. `ScalpingEngine → MarketConfig → XAUUSD | BTCUSD`.
+Two markets, **one engine**. `ScalpingEngine → MarketConfig → XAUUSDs | BTCUSDs`.
 Nothing in `src/` is duplicated per market: `src/markets.py` holds one
 `MarketConfig` per instrument, and `Config.for_market(symbol)` folds it onto the
 base configuration to produce the view the engine runs on.
 
 ```
-config.Config                       base settings from .env
+config.Config                        base settings from .env
         │
-        ├── for_market("XAUUSD") ──► view: gold's scale, costs, targets, paths
-        └── for_market("BTCUSD") ──► view: BTC's  scale, costs, targets, paths
-                                             │
-                       effective_config() ───┴─► + that market's live
-                                                  Telegram settings
+        ├── for_market("XAUUSDs") ──► view: gold's scale, costs, targets, paths
+        └── for_market("BTCUSDs") ──► view: BTC's  scale, costs, targets, paths
+                                              │
+                        effective_config() ───┴─► + that market's live
+                                                   Telegram settings
 ```
 
 ### What differs, and why
 
-| | XAUUSD | BTCUSD |
+| | XAUUSDs | BTCUSDs |
 |---|---|---|
 | Icon | 🥇 | ₿ |
-| Broker symbol (data feed) | `XAUUSDs` | `BTCUSDs` |
 | Trading hours | Sun 22:00 – Fri 21:00 UTC | 24/7 |
 | Session filter | applied | **bypassed** (label still recorded) |
 | Quote digits | 2 | 2 |
@@ -202,7 +202,7 @@ config.Config                       base settings from .env
 | Spread rejection | > 35 points | > 4 000 points ($40) |
 | Cooldown | 10 candles | 10 candles *(initial)* |
 | Timeout | 15 candles | 15 candles *(initial)* |
-| Data directory | `data/xauusd/` | `data/btcusd/` |
+| Data directory | `data/xauusds/` | `data/btcusds/` |
 
 **The target model transfers; the floors do not.** Every distance is already a
 multiple of the live M1 ATR, so it self-scales: a market that moves more per
@@ -229,16 +229,38 @@ Read this before drawing any conclusion from a BTCUSD run:
 * Nothing here is claimed to be profitable. **Re-derive every number from your
   own venue's data** before trusting it.
 
-### Broker symbol names
+### Symbol names
 
-Brokers suffix instruments inconsistently. This build ships **`XAUUSDs`** and
-**`BTCUSDs`**, which is what the configured account uses.
+Brokers suffix instruments inconsistently. This account's broker uses a
+lowercase `s`, so the markets are named **`XAUUSDs`** and **`BTCUSDs`** — and
+that one name is used *everywhere*:
 
-Only the MT5 data feed ever sees that name. Every file, CSV row, menu, report
-and signal id keeps the canonical `XAUUSD` / `BTCUSD`, so if your broker renames
-an instrument it cannot split that market's history in two.
+| Where | Value |
+|---|---|
+| MT5 data feed | `XAUUSDs` |
+| Data directory | `data/xauusds/` |
+| `symbol` column in every CSV | `XAUUSDs` |
+| Signal ids | `XAUUSDs-BUY-20240501-123700-…` |
+| Telegram panel, cards, reports | `🥇 XAUUSDs` |
+| `--symbol` on every CLI | `XAUUSDs` |
 
-For a different broker, override per market:
+There is no translation layer, because there is nothing to translate.
+
+**Older spellings still resolve.** `XAUUSD`, `BTCUSD` and `GOLD` are accepted
+aliases, matched case-insensitively, so a `--symbol BTCUSD` in an old script, a
+state file written before the rename, or `XAUUSD_THRESHOLD` in your `.env` all
+keep working. Anything unrecognised is rejected rather than quietly resolving to
+gold.
+
+If a previous run left a `data/xauusd/` directory behind, it is renamed to
+`data/xauusds/` on the next start so its history follows the rename instead of
+becoming invisible. It never overwrites an existing directory.
+
+#### Moving to a different broker
+
+Set the feed name per market. This changes **only** what MT5 is asked for — the
+market keeps its name and its stored history, so switching broker does not
+orphan your CSVs:
 
 ```dotenv
 XAUUSD_BROKER_SYMBOL=XAUUSD.m
@@ -260,10 +282,9 @@ WARNING  Symbol 'XAUUSDs' not found; using 'XAUUSD.m' for this session.
 The guess is never written back to config — naming your broker's instruments is
 your decision, not the program's.
 
-> **Upgrading from the single-market build?** The legacy `SYMBOL` variable is
-> still honoured and still means "gold's broker symbol". If your existing `.env`
-> has `SYMBOL=XAUUSD`, it will **override** the `XAUUSDs` default — comment it
-> out or set it to `XAUUSDs`.
+> **Upgrading from the single-market build?** The legacy `SYMBOL` variable still
+> means "gold's feed name". If your existing `.env` has `SYMBOL=XAUUSD`, it will
+> **override** the `XAUUSDs` default — comment it out.
 
 ### Retuning a market
 
@@ -303,12 +324,12 @@ xauusd_signal_bot/
 ├── data/                    created on first run
 │   ├── state.json           GLOBAL: run status, active market
 │   ├── system_log.txt       rotating log
-│   ├── xauusd/              gold's data - never mixed with Bitcoin's
+│   ├── xauusds/             gold's data - never mixed with Bitcoin's
 │   │   ├── signals.csv      one row per signal, status updated in place
 │   │   ├── evaluations.csv  one row per evaluated candle (signal or not)
 │   │   ├── outcomes.csv     one row per closed signal
 │   │   └── state.json       gold's settings + last processed M1 candle
-│   └── btcusd/              same five files, Bitcoin's own
+│   └── btcusds/             same five files, Bitcoin's own
 ├── src/
 │   ├── market_data.py       MT5 access (READ-ONLY), validation, ticks, resampling
 │   ├── indicators.py        EMA/RSI/MACD/ATR/ADX/Stoch/BB/swings
@@ -672,8 +693,8 @@ one market, and every row is self-identifying (`symbol`, `timeframe`,
 data/
 ├── state.json          GLOBAL - run status, active_market
 ├── system_log.txt
-├── xauusd/  signals.csv  evaluations.csv  outcomes.csv  state.json
-└── btcusd/  signals.csv  evaluations.csv  outcomes.csv  state.json
+├── xauusds/  signals.csv  evaluations.csv  outcomes.csv  state.json
+└── btcusds/  signals.csv  evaluations.csv  outcomes.csv  state.json
 ```
 
 Each `state.json` has exactly **one writer**. The global file is written only by
@@ -719,7 +740,7 @@ deterministic, and the same inputs always give the same outputs.
 
 Because each market's features and labels are stored separately but in an
 identical schema, either shape of future model is possible without migrating
-anything: **one model per market** (train on `data/btcusd/`) or **one shared
+anything: **one model per market** (train on `data/btcusds/`) or **one shared
 model with the market as a feature** (concatenate both directories — every row
 already carries its `symbol`).
 
@@ -776,7 +797,7 @@ python backtest.py --data history/XAUUSD_M1.csv --start 2024-01-01 --end 2024-01
 
 `--symbol` selects which `MarketConfig` is folded onto the engine — **the same
 engine runs both markets**. Output goes to that market's own directory
-(`data/xauusd/backtest_*.csv`, `data/btcusd/backtest_*.csv`), so two runs can
+(`data/xauusds/backtest_*.csv`, `data/btcusds/backtest_*.csv`), so two runs can
 never contaminate each other's results. The header of every run states the
 market, its cost model and, for BTCUSD, the research-parameters warning.
 
@@ -947,7 +968,7 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-273 tests covering indicator correctness and causality, no-repaint swings,
+280 tests covering indicator correctness and causality, no-repaint swings,
 score aggregation and weight renormalisation, the adaptive threshold, bull/bear
 separation, the spread and **net** R:R gates, the cost model, target geometry
 (ATR scaling, pip floors, percentage floors, cost floors, proportional lifting,
@@ -957,14 +978,17 @@ lifecycle, CSV creation/append/schema-change handling, `state.json` round-trip
 and corruption tolerance, Telegram formatting and every panel control, duplicate
 prevention, restart safety, and the backtester's no-lookahead guarantees.
 
-`tests/test_markets.py` (57 tests) covers the two-market behaviour specifically:
+`tests/test_markets.py` (64 tests) covers the two-market behaviour specifically:
 
 * the registry, symbol normalisation, and adding a third market without an
   engine change;
-* the broker symbol names (`XAUUSDs` / `BTCUSDs`), that they never leak into
-  storage or records, that they are overridable per market, that the legacy
-  `SYMBOL` variable still renames gold only, and that a missing symbol is
-  resolved loudly rather than read as a quiet market;
+* the symbol names (`XAUUSDs` / `BTCUSDs`) reaching the feed, the directories,
+  the CSV rows, the signal ids and the menus alike; that every older spelling
+  still resolves on the CLI and in config; that a legacy data directory is
+  adopted rather than orphaned; that the feed name is overridable without
+  renaming the market; that the legacy `SYMBOL` variable still renames gold
+  only; and that a missing symbol is resolved loudly rather than read as a
+  quiet market;
 * that XAUUSD's shipped parameters are still the single-market build's values;
 * that BTCUSD copies none of gold's absolute distances, and that its percentage
   floors scale with price while gold's pip floors do not;
