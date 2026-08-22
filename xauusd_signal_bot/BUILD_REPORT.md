@@ -6,7 +6,7 @@ market-agnostic by extracting everything instrument-specific into one
 `MarketConfig` per market; XAUUSD's shipped values were lifted verbatim from the
 previous build so gold's behaviour is unchanged.
 
-* **Tests:** 262 passing (216 before + 46 new two-market tests), ~100 s
+* **Tests:** 264 passing (216 before + 48 new two-market tests), ~100 s
 * **Static analysis:** `pyflakes` clean across every module
 * **Order execution:** still none anywhere — paper/signal only
 * **BTCUSD parameters:** INITIAL RESEARCH PARAMETERS. Not optimised, not
@@ -197,6 +197,48 @@ regimes are expressed as fractions of price.
 The BTCUSD synthetic profile is a plausible-looking guess at crypto M1
 behaviour, not a calibration against exchange data, and BTCUSD has not been
 calibrated or validated on real data at all.
+
+## B10. Verification runs
+
+Both markets were replayed through the same engine over 19 251 evaluated M1
+bars of their own synthetic history (`--no-evaluations`, default assumed
+spreads). **These runs verify the plumbing. They are not evidence of an edge on
+either market and must not be read as performance.**
+
+| | XAUUSD | BTCUSD |
+|---|---|---|
+| Bars evaluated | 19 251 | 19 251 |
+| Signals | 45 | 220 |
+| Cost charged per trade | 2.4p (0.60R) | $14.0 (0.31R) |
+| Raw win rate | 68.9% | 63.2% |
+| Average RAW R | +0.151R | −0.033R |
+| **Average NET R** | **−0.449R** | **−0.344R** |
+| Net profit factor | 0.20 | 0.34 |
+| TP1 reached | 48.9% | 63.2% |
+| Closed at SL | 42.2% | 87.7% |
+| Timed out | 55.6% | 0.5% |
+| Average hold | 11.2 min | 3.0 min |
+| Output written to | `data/xauusd/` | `data/btcusd/` |
+
+What these runs *do* establish:
+
+* the same engine runs both markets, with no per-market analysis code;
+* BTCUSD builds dollar-scaled geometry from its own ATR (e.g. `SL 27.2$
+  TP 21.0/46.7/79.3$`) rather than gold-sized distances;
+* each market charges its own cost and writes to its own directory, with every
+  row carrying its `symbol`, `timeframe` and `estimated_slippage`;
+* neither market's files contain a row belonging to the other.
+
+What they do **not** establish: anything about either market's profitability.
+Both are negative after costs on this data, and the data is synthetic.
+
+The one structural difference worth flagging for future work is the timeout/SL
+split. Gold times out 55.6% of the time; Bitcoin almost never does (0.5%) and
+reaches its stop 87.7% of the time. On this fixture BTC's per-minute movement
+resolves a trade well inside the 15-candle window, which means **the shared
+15-candle timeout is very likely the wrong number for Bitcoin** — it was set
+equal to gold's deliberately, as an initial value, and this is exactly the kind
+of parameter that must be re-derived from real data rather than inherited.
 
 ---
 

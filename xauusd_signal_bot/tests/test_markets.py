@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import pandas as pd
 import pytest
 
 from config import Config
@@ -782,6 +783,48 @@ def _gold_signal_at(runner, gold_config):
     signal.tp1, signal.tp2, signal.tp3 = price + step, price + 2 * step, price + 3 * step
     signal.timestamp = snapshot.candle_time
     return signal
+
+
+def test_bitcoin_evaluates_closed_candles_only(btc_config):
+    """Spec 7: the anti-lookahead guarantees hold for the new market too."""
+    from src.signal_engine import SignalEngine
+    from tests.conftest import build_snapshot
+
+    candles = make_candles(1200, seed=71, volatility=30.0, start_price=60_000.0)
+    snapshot = build_snapshot(btc_config, candles, spread_points=1000.0)
+    evaluation = SignalEngine(btc_config).evaluate(snapshot)
+
+    expected = pd.Timestamp(candles["time"].iloc[-1]).to_pydatetime()
+    assert evaluation.timestamp.replace(tzinfo=None) == expected.replace(tzinfo=None), (
+        "the signal is stamped with wall clock rather than the closed candle"
+    )
+    assert evaluation.symbol == BTCUSD
+    assert evaluation.timeframe == "M1"
+    assert not hasattr(snapshot, "forming_candle")
+    # nothing after the evaluated candle is reachable from the snapshot
+    assert snapshot.signal_df["time"].max() == candles["time"].iloc[-1]
+
+
+def test_a_bitcoin_signal_carries_every_required_field(tmp_path):
+    """Spec 14, for BTCUSD: no field is left blank or fabricated."""
+    from src.signal_tracker import read_csv_rows
+
+    btc = isolate(Config().for_market(BTCUSD), tmp_path)
+    tracker = SignalTracker(btc, FakeNotifier())
+    tracker.load()
+    tracker.record_signal(_signal(BTCUSD))
+    row = read_csv_rows(btc.signals_csv)[0]
+
+    assert row["symbol"] == BTCUSD
+    assert row["timeframe"] == "M1"
+    for column in ("timestamp", "direction", "entry", "tp1", "tp2", "tp3", "sl",
+                   "score", "bullish_score", "bearish_score", "threshold_used",
+                   "regime", "session", "spread_points", "estimated_slippage"):
+        assert row[column] != "", column
+    assert float(row["spread_points"]) == BTCUSD_CONFIG.assumed_spread_points
+    assert float(row["estimated_slippage"]) == (
+        BTCUSD_CONFIG.slippage_points_entry + BTCUSD_CONFIG.slippage_points_exit
+    )
 
 
 def test_the_global_state_file_records_the_active_market(tmp_path):

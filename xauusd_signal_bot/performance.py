@@ -432,9 +432,20 @@ def render_report(report: Report) -> str:
         f"Median mins to TP1 : {overall.median_minutes_to_tp1:.1f}",
         f"Average MFE / MAE  : {overall.average_mfe_r:+.2f}R / {overall.average_mae_r:+.2f}R",
         "",
-        "--- BY MARKET " + "-" * 60,
-        _table([s.as_row() for s in report.by_market]),
-        "",
+    ]
+
+    # A one-row BY MARKET table restates the header, so it only earns its place
+    # when the report actually spans more than one market (the COMBINED view).
+    if len(report.by_market) > 1:
+        lines += [
+            "--- BY MARKET " + "-" * 60,
+            "  R is NOT comparable across markets: different cost and",
+            "  volatility regimes.  Read each row on its own.",
+            _table([s.as_row() for s in report.by_market]),
+            "",
+        ]
+
+    lines += [
         "--- BY UTC HOUR " + "-" * 58,
         _table([s.as_row() for s in report.by_hour]),
         "",

@@ -912,7 +912,7 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-262 tests covering indicator correctness and causality, no-repaint swings,
+264 tests covering indicator correctness and causality, no-repaint swings,
 score aggregation and weight renormalisation, the adaptive threshold, bull/bear
 separation, the spread and **net** R:R gates, the cost model, target geometry
 (ATR scaling, pip floors, percentage floors, cost floors, proportional lifting,
@@ -922,7 +922,7 @@ lifecycle, CSV creation/append/schema-change handling, `state.json` round-trip
 and corruption tolerance, Telegram formatting and every panel control, duplicate
 prevention, restart safety, and the backtester's no-lookahead guarantees.
 
-`tests/test_markets.py` (46 tests) covers the two-market behaviour specifically:
+`tests/test_markets.py` (48 tests) covers the two-market behaviour specifically:
 
 * the registry, symbol normalisation, and adding a third market without an
   engine change;
@@ -945,6 +945,9 @@ prevention, restart safety, and the backtester's no-lookahead guarantees.
 * **switch safety** — switching markets three times leaves the other market's
   full state, marker and open trades identical, and an open gold trade keeps
   being tracked after switching to Bitcoin;
+* the anti-lookahead guarantees re-checked on BTCUSD (closed candles only, the
+  signal stamped with the candle rather than wall clock) and every spec-required
+  signal field present and non-empty on a BTCUSD row;
 * Telegram routing, per-market settings, threshold bounds on both markets,
   per-market analysis, per-market (not merged) performance, and that no button
   on any panel maps to an order.
@@ -997,11 +1000,32 @@ judge on NET expectancy over a few hundred scalps.
 
 ### And on BTCUSD
 
-**Nothing.** BTCUSD has not been calibrated, validated or backtested on real
-data. The only BTCUSD runs performed were on a synthetic fixture, and their sole
-purpose was to prove the plumbing — that the engine builds dollar-scaled targets,
-charges a dollar-scaled cost and writes to its own files. **No BTCUSD number in
-this repository is evidence of anything about Bitcoin.**
+**BTCUSD has not been calibrated, validated or backtested on real data.** The
+only BTCUSD runs performed were on a synthetic fixture, and their sole purpose
+was to prove the plumbing — that the engine builds dollar-scaled targets, charges
+a dollar-scaled cost and writes to its own files. **No BTCUSD number in this
+repository is evidence of anything about Bitcoin.**
+
+For completeness, the same 19,251-bar plumbing run on each market's synthetic
+history — read as a smoke test, not a result:
+
+| | XAUUSD | BTCUSD |
+|---|---|---|
+| Signals | 45 | 220 |
+| Cost per trade | 2.4p (0.60R) | $14.0 (0.31R) |
+| Raw win rate | 68.9% | 63.2% |
+| **Average NET R** | **−0.449R** | **−0.344R** |
+| TP1 reached | 48.9% | 63.2% |
+| Closed at SL | 42.2% | 87.7% |
+| Timed out | 55.6% | 0.5% |
+| Average hold | 11.2 min | 3.0 min |
+
+One structural difference is worth flagging: gold times out 55.6% of the time,
+Bitcoin almost never (0.5%). BTC's per-minute movement resolves a trade well
+inside the 15-candle window, so **the shared 15-candle timeout is very likely
+wrong for Bitcoin.** It was set equal to gold's deliberately, as an initial
+value — and it is exactly the kind of parameter that must be re-derived from
+real data rather than inherited.
 
 The honest summary is: the machinery now runs two markets and provably keeps
 them apart; gold's measured result is negative after costs; Bitcoin's is
