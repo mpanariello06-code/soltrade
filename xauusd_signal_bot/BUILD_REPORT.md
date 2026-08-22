@@ -6,7 +6,7 @@ market-agnostic by extracting everything instrument-specific into one
 `MarketConfig` per market; XAUUSD's shipped values were lifted verbatim from the
 previous build so gold's behaviour is unchanged.
 
-* **Tests:** 264 passing (216 before + 48 new two-market tests), ~100 s
+* **Tests:** 273 passing (216 before + 57 new two-market tests), ~125 s
 * **Static analysis:** `pyflakes` clean across every module
 * **Order execution:** still none anywhere — paper/signal only
 * **BTCUSD parameters:** INITIAL RESEARCH PARAMETERS. Not optimised, not
@@ -197,6 +197,31 @@ regimes are expressed as fractions of price.
 The BTCUSD synthetic profile is a plausible-looking guess at crypto M1
 behaviour, not a calibration against exchange data, and BTCUSD has not been
 calibrated or validated on real data at all.
+
+## B9a. Broker symbol names
+
+The configured account suffixes both instruments with a lowercase `s`, so
+`MarketConfig.broker_symbol` ships as `XAUUSDs` and `BTCUSDs`.
+
+`broker_symbol` is used at the MT5 boundary **only** — `copy_rates_from_pos`,
+`symbol_info`, `symbol_info_tick`, `copy_ticks_range` and `symbol_select`.
+Every file path, CSV row, signal id, menu label and report keeps the canonical
+`XAUUSD` / `BTCUSD`, so a broker-side rename cannot split a market's history.
+
+Two failure modes are handled explicitly:
+
+* **A wrong symbol is silent.** MT5 returns an empty result, not an error, for
+  a symbol it does not have — indistinguishable from a market with no candles.
+  `MarketData._resolve_symbol()` therefore checks the configured name at connect
+  time and, if it is missing, searches the broker's own symbol list, adopts the
+  shortest match for that session, and logs the exact `.env` line to make it
+  permanent. The guess is never written back to config: naming the broker's
+  instruments is the user's decision, not the program's.
+* **The legacy `SYMBOL` variable overrides the new default.** It predates
+  multi-market support and still means "gold's broker symbol", so an existing
+  `.env` carrying `SYMBOL=XAUUSD` would silently undo `XAUUSDs`.
+  `.env.example` now ships it commented out with a caution, and a test asserts
+  it renames gold only and never touches Bitcoin.
 
 ## B10. Verification runs
 

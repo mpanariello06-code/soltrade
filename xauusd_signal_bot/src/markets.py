@@ -153,6 +153,11 @@ XAUUSD_CONFIG = MarketConfig(
     key="xauusd",
     display="XAUUSD",
     icon="🥇",
+    # This account's broker suffixes both instruments with a lowercase "s".
+    # Only the data feed sees it; files, records and menus keep XAUUSD, so a
+    # broker rename can never split this market's history.
+    # Override with XAUUSD_BROKER_SYMBOL in .env for a different broker.
+    broker_symbol="XAUUSDs",
     digits=2,
     point_value=0.01,
     # Gold is quoted to 2 decimals and a pip is conventionally the first
@@ -219,6 +224,7 @@ BTCUSD_CONFIG = MarketConfig(
     key="btcusd",
     display="BTCUSD",
     icon="₿",
+    broker_symbol="BTCUSDs",   # same suffix convention as gold; see above
     digits=2,
     point_value=0.01,
     pip_value=1.0,            # one "pip" == one US dollar

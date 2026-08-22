@@ -54,6 +54,155 @@ def test_symbol_lookup_is_forgiving_but_never_guesses():
         get_market("ETHUSD")
 
 
+# --------------------------------------------------------------------------- #
+# broker symbol naming
+# --------------------------------------------------------------------------- #
+def test_the_configured_broker_symbols_are_used_for_the_data_feed():
+    """This account's broker suffixes both instruments with a lowercase "s"."""
+    assert XAUUSD_CONFIG.broker_symbol == "XAUUSDs"
+    assert BTCUSD_CONFIG.broker_symbol == "BTCUSDs"
+    assert get_market(XAUUSD).feed_symbol() == "XAUUSDs"
+    assert get_market(BTCUSD).feed_symbol() == "BTCUSDs"
+
+
+def test_the_broker_name_never_leaks_into_storage_or_records(tmp_path):
+    """Only the feed sees the suffix; everything else keeps the canonical name.
+
+    If the broker name reached the files, renaming an instrument at the broker
+    would split that market's history in two.
+    """
+    from src.signal_tracker import read_csv_rows
+
+    for symbol in MARKET_ORDER:
+        market = get_market(symbol)
+        assert market.symbol == symbol
+        assert market.key == symbol.lower()
+        assert market.display == symbol
+        assert market.feed_symbol() != symbol, "fixture assumes a suffixed broker"
+
+    btc = isolate(Config().for_market(BTCUSD), tmp_path)
+    assert btc.market_dir.name == "btcusd"
+    tracker = SignalTracker(btc, FakeNotifier())
+    tracker.load()
+    tracker.record_signal(_signal(BTCUSD))
+
+    row = read_csv_rows(btc.signals_csv)[0]
+    assert row["symbol"] == BTCUSD
+    assert "BTCUSDs" not in btc.signals_csv.read_text(encoding="utf-8")
+
+
+def test_the_broker_symbol_is_overridable_per_market(monkeypatch):
+    """A different broker needs an .env line, not a code change."""
+    from src.markets import apply_env_overrides
+
+    monkeypatch.setenv("XAUUSD_BROKER_SYMBOL", "GOLD")
+    monkeypatch.setenv("BTCUSD_BROKER_SYMBOL", "BTCUSD.x")
+
+    gold = apply_env_overrides(XAUUSD_CONFIG)
+    btc = apply_env_overrides(BTCUSD_CONFIG)
+
+    assert gold.feed_symbol() == "GOLD"
+    assert btc.feed_symbol() == "BTCUSD.x"
+    # the canonical identity is untouched by the broker's naming
+    assert gold.symbol == XAUUSD and gold.key == "xauusd" and gold.display == "XAUUSD"
+    assert btc.symbol == BTCUSD and btc.key == "btcusd"
+
+
+def test_the_legacy_symbol_variable_still_renames_gold_only(monkeypatch):
+    """``SYMBOL`` is the pre-multi-market name and stays gold-only."""
+    from src.markets import apply_env_overrides
+
+    monkeypatch.setenv("SYMBOL", "XAUUSD.m")
+
+    assert apply_env_overrides(XAUUSD_CONFIG).feed_symbol() == "XAUUSD.m"
+    assert apply_env_overrides(BTCUSD_CONFIG).feed_symbol() == "BTCUSDs", (
+        "the legacy gold-only variable renamed Bitcoin"
+    )
+
+
+def test_a_prefixed_override_wins_over_the_legacy_name(monkeypatch):
+    from src.markets import apply_env_overrides
+
+    monkeypatch.setenv("SYMBOL", "XAUUSD.m")
+    monkeypatch.setenv("XAUUSD_BROKER_SYMBOL", "XAUUSDs")
+    assert apply_env_overrides(XAUUSD_CONFIG).feed_symbol() == "XAUUSDs"
+
+
+def _fake_mt5(available):
+    """A stand-in for the MetaTrader5 module exposing only what resolution uses."""
+    class Symbol:
+        def __init__(self, name):
+            self.name = name
+
+    class FakeMT5:
+        def symbol_info(self, name):
+            return Symbol(name) if name in available else None
+
+        def symbols_get(self):
+            return [Symbol(name) for name in available]
+
+    return FakeMT5()
+
+
+def test_a_missing_broker_symbol_is_resolved_rather_than_read_as_a_quiet_market(
+    monkeypatch, caplog
+):
+    """MT5 returns no data - not an error - for a symbol it does not have.
+
+    Left alone that looks like a market with no candles, so the configured name
+    being wrong must surface as a loud, actionable message instead.
+    """
+    from src import market_data
+
+    monkeypatch.setattr(market_data, "mt5", _fake_mt5({"XAUUSD.m", "BTCUSD.m"}))
+    feed = market_data.MarketData(Config())
+
+    with caplog.at_level("WARNING"):
+        resolved = feed._resolve_symbol(XAUUSD)
+
+    assert resolved == "XAUUSD.m", "the broker's actual name was not found"
+    message = caplog.text
+    assert "XAUUSDs" in message and "XAUUSD.m" in message
+    assert "XAUUSD_BROKER_SYMBOL" in message, "the fix was not spelled out"
+
+    # the discovery is remembered for the session, not re-searched every call
+    assert feed.feed_symbol(XAUUSD) == "XAUUSD.m"
+    assert feed.feed_symbol(BTCUSD) == "BTCUSDs", "gold's fallback leaked to Bitcoin"
+
+
+def test_the_configured_symbol_is_used_untouched_when_it_exists(monkeypatch):
+    from src import market_data
+
+    monkeypatch.setattr(market_data, "mt5", _fake_mt5({"XAUUSDs", "BTCUSDs"}))
+    feed = market_data.MarketData(Config())
+
+    assert feed._resolve_symbol(XAUUSD) == "XAUUSDs"
+    assert feed._resolve_symbol(BTCUSD) == "BTCUSDs"
+    assert feed._symbol_overrides == {}, "no override should be recorded"
+
+
+def test_resolution_gives_up_loudly_when_nothing_matches(monkeypatch, caplog):
+    from src import market_data
+
+    monkeypatch.setattr(market_data, "mt5", _fake_mt5({"EURUSD", "GBPUSD"}))
+    feed = market_data.MarketData(Config())
+
+    with caplog.at_level("ERROR"):
+        assert feed._resolve_symbol(XAUUSD) is None
+    assert "XAUUSD_BROKER_SYMBOL" in caplog.text
+
+
+def test_the_shortest_candidate_wins(monkeypatch):
+    """Brokers append suffixes, so the shortest match is the plain instrument."""
+    from src import market_data
+
+    monkeypatch.setattr(
+        market_data, "mt5", _fake_mt5({"BTCUSD.raw", "BTCUSD", "BTCUSD.pro"})
+    )
+    feed = market_data.MarketData(Config())
+    assert feed._resolve_symbol(BTCUSD) == "BTCUSD"
+
+
 def test_a_third_market_can_be_added_without_touching_the_engine():
     """Extensibility is a registry entry, not an engine change (spec 2)."""
     from dataclasses import replace

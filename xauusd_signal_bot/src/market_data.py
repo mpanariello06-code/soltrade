@@ -259,6 +259,10 @@ class MarketData:
         self._cache_lock = threading.RLock()
         self._tick_buffer: Optional[pd.DataFrame] = None
         self._tick_last_time: Optional[datetime] = None
+        # canonical symbol -> broker name discovered at connect time, when the
+        # configured one turned out not to exist.  Session-scoped; see
+        # ``_resolve_symbol``.
+        self._symbol_overrides: Dict[str, str] = {}
 
     # -- candle cache ------------------------------------------------------ #
     def _cache_ttl(self, timeframe: str) -> float:
@@ -328,7 +332,9 @@ class MarketData:
             # being tracked and therefore keeps needing its candles.
             available = []
             for market_symbol in MARKET_ORDER:
-                feed = self.feed_symbol(market_symbol)
+                feed = self._resolve_symbol(market_symbol)
+                if feed is None:
+                    continue
                 with _MT5_LOCK:
                     selected = mt5.symbol_select(feed, True)
                 if selected:
@@ -392,14 +398,71 @@ class MarketData:
             LOGGER.info("MT5 connection closed")
 
     # -- data ------------------------------------------------------------- #
-    @staticmethod
-    def feed_symbol(symbol: str) -> str:
+    def _resolve_symbol(self, symbol: str) -> Optional[str]:
+        """Confirm the configured broker symbol exists, or find what replaced it.
+
+        Brokers suffix instruments inconsistently (``XAUUSDs``, ``XAUUSD.m``,
+        ``GOLD``) and occasionally rename them.  Asking MT5 for a symbol it does
+        not have returns *no data* rather than an error, which would look like a
+        quiet market rather than a misconfiguration - so when the configured name
+        is missing this searches the broker's own symbol list for the obvious
+        match and says exactly what to put in ``.env``.
+
+        The override is remembered for the session only.  It is never written to
+        the config, because guessing a symbol is a diagnostic aid, not a
+        decision this code should make permanently on the user's behalf.
+        """
+        configured = self.feed_symbol(symbol)
+        cached = self._symbol_overrides.get(symbol)
+        if cached:
+            return cached
+        try:
+            with _MT5_LOCK:
+                info = mt5.symbol_info(configured)
+            if info is not None:
+                return configured
+
+            with _MT5_LOCK:
+                everything = mt5.symbols_get() or ()
+            names = [str(getattr(item, "name", "")) for item in everything]
+            matches = [
+                name for name in names
+                if name and name.upper().startswith(symbol.upper())
+            ]
+            if not matches:
+                LOGGER.error(
+                    "Symbol '%s' not found on this account, and nothing starts "
+                    "with '%s'. Set %s_BROKER_SYMBOL in .env to the exact name "
+                    "your broker uses.",
+                    configured, symbol, symbol,
+                )
+                return None
+
+            # Prefer the shortest match: brokers append suffixes, so the
+            # shortest candidate is the plain instrument rather than a variant.
+            chosen = min(matches, key=len)
+            LOGGER.warning(
+                "Symbol '%s' not found; using '%s' for this session. "
+                "Other candidates: %s. Set %s_BROKER_SYMBOL=%s in .env to make "
+                "this permanent.",
+                configured, chosen, ", ".join(sorted(matches)[:8]), symbol, chosen,
+            )
+            self._symbol_overrides[symbol] = chosen
+            return chosen
+        except Exception as exc:  # noqa: BLE001 - resolution must not break connect
+            LOGGER.debug("Symbol resolution for %s failed: %s", symbol, exc)
+            return configured
+
+    def feed_symbol(self, symbol: str) -> str:
         """Translate a canonical market symbol into the broker's own name.
 
         Every internal record, file and menu uses the canonical symbol; only
         the MT5 boundary sees ``XAUUSD.m`` or ``BTCUSD.x``.  An unknown symbol
         is passed through untouched so nothing here can mask a typo.
         """
+        override = self._symbol_overrides.get(symbol)
+        if override:
+            return override
         try:
             return get_market(symbol).feed_symbol()
         except KeyError:

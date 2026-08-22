@@ -185,6 +185,7 @@ config.Config                       base settings from .env
 | | XAUUSD | BTCUSD |
 |---|---|---|
 | Icon | 🥇 | ₿ |
+| Broker symbol (data feed) | `XAUUSDs` | `BTCUSDs` |
 | Trading hours | Sun 22:00 – Fri 21:00 UTC | 24/7 |
 | Session filter | applied | **bypassed** (label still recorded) |
 | Quote digits | 2 | 2 |
@@ -228,6 +229,42 @@ Read this before drawing any conclusion from a BTCUSD run:
 * Nothing here is claimed to be profitable. **Re-derive every number from your
   own venue's data** before trusting it.
 
+### Broker symbol names
+
+Brokers suffix instruments inconsistently. This build ships **`XAUUSDs`** and
+**`BTCUSDs`**, which is what the configured account uses.
+
+Only the MT5 data feed ever sees that name. Every file, CSV row, menu, report
+and signal id keeps the canonical `XAUUSD` / `BTCUSD`, so if your broker renames
+an instrument it cannot split that market's history in two.
+
+For a different broker, override per market:
+
+```dotenv
+XAUUSD_BROKER_SYMBOL=XAUUSD.m
+BTCUSD_BROKER_SYMBOL=BTCUSD.x
+```
+
+**Not sure of the exact name? Start the bot anyway.** MT5 returns *no data*
+rather than an error for a symbol it does not have, which would otherwise look
+like a quiet market rather than a typo. So on connect, if the configured symbol
+is missing, the feed searches your broker's symbol list, uses the obvious match
+for that session, and logs the exact line to paste into `.env`:
+
+```
+WARNING  Symbol 'XAUUSDs' not found; using 'XAUUSD.m' for this session.
+         Other candidates: XAUUSD.m, XAUUSD.pro. Set
+         XAUUSD_BROKER_SYMBOL=XAUUSD.m in .env to make this permanent.
+```
+
+The guess is never written back to config — naming your broker's instruments is
+your decision, not the program's.
+
+> **Upgrading from the single-market build?** The legacy `SYMBOL` variable is
+> still honoured and still means "gold's broker symbol". If your existing `.env`
+> has `SYMBOL=XAUUSD`, it will **override** the `XAUUSDs` default — comment it
+> out or set it to `XAUUSDs`.
+
 ### Retuning a market
 
 Each market's values live in `src/markets.py`, beside the reasoning for them.
@@ -238,8 +275,6 @@ variable can move both markets at once:
 BTCUSD_THRESHOLD=72
 BTCUSD_ASSUMED_SPREAD_POINTS=1500
 XAUUSD_COOLDOWN_CANDLES=15
-# brokers that rename an instrument:
-BTCUSD_BROKER_SYMBOL=BTCUSD.x
 ```
 
 The legacy unprefixed names (`SCALP_THRESHOLD`, `ASSUMED_SPREAD_POINTS`, …)
@@ -912,7 +947,7 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-264 tests covering indicator correctness and causality, no-repaint swings,
+273 tests covering indicator correctness and causality, no-repaint swings,
 score aggregation and weight renormalisation, the adaptive threshold, bull/bear
 separation, the spread and **net** R:R gates, the cost model, target geometry
 (ATR scaling, pip floors, percentage floors, cost floors, proportional lifting,
@@ -922,10 +957,14 @@ lifecycle, CSV creation/append/schema-change handling, `state.json` round-trip
 and corruption tolerance, Telegram formatting and every panel control, duplicate
 prevention, restart safety, and the backtester's no-lookahead guarantees.
 
-`tests/test_markets.py` (48 tests) covers the two-market behaviour specifically:
+`tests/test_markets.py` (57 tests) covers the two-market behaviour specifically:
 
 * the registry, symbol normalisation, and adding a third market without an
   engine change;
+* the broker symbol names (`XAUUSDs` / `BTCUSDs`), that they never leak into
+  storage or records, that they are overridable per market, that the legacy
+  `SYMBOL` variable still renames gold only, and that a missing symbol is
+  resolved loudly rather than read as a quiet market;
 * that XAUUSD's shipped parameters are still the single-market build's values;
 * that BTCUSD copies none of gold's absolute distances, and that its percentage
   floors scale with price while gold's pip floors do not;
