@@ -406,7 +406,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # market alone, so two runs can never contaminate each other.
     market = get_market(args.symbol)
     config = base_config.for_market(market)
-    out_dir = args.out if args.out is not None else config.data_dir
+    # the market's OWN directory, so two markets' results never mix
+    out_dir = args.out if args.out is not None else config.market_dir
 
     setup_logging(config.log_file, config.log_level)
     try:

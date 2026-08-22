@@ -10,6 +10,10 @@ from pathlib import Path
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-22s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+#: Root logger namespace.  Market-neutral: one process serves every market, and
+#: each log line names the market it concerns.
+ROOT_NAME = "scalper"
+
 MAX_BYTES = 5 * 1024 * 1024
 BACKUP_COUNT = 3
 
@@ -25,7 +29,7 @@ def setup_logging(log_file: Path, level: str = "INFO", console: bool = True) -> 
     global _configured
     root = logging.getLogger()
     if _configured:
-        return logging.getLogger("xauusd")
+        return logging.getLogger(ROOT_NAME)
 
     root.setLevel(getattr(logging, str(level).upper(), logging.INFO))
     for handler in list(root.handlers):
@@ -53,9 +57,9 @@ def setup_logging(log_file: Path, level: str = "INFO", console: bool = True) -> 
     logging.getLogger("requests").setLevel(logging.WARNING)
 
     _configured = True
-    return logging.getLogger("xauusd")
+    return logging.getLogger(ROOT_NAME)
 
 
 def get_logger(name: str) -> logging.Logger:
     """Return a namespaced child logger."""
-    return logging.getLogger(f"xauusd.{name}")
+    return logging.getLogger(f"{ROOT_NAME}.{name}")

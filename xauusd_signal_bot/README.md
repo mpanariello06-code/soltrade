@@ -995,6 +995,18 @@ Before trusting any of this: run it on **real** multi-month XAUUSD M1 data with
 your broker's actual spreads, then paper-trade the live signals for weeks, and
 judge on NET expectancy over a few hundred scalps.
 
+### And on BTCUSD
+
+**Nothing.** BTCUSD has not been calibrated, validated or backtested on real
+data. The only BTCUSD runs performed were on a synthetic fixture, and their sole
+purpose was to prove the plumbing — that the engine builds dollar-scaled targets,
+charges a dollar-scaled cost and writes to its own files. **No BTCUSD number in
+this repository is evidence of anything about Bitcoin.**
+
+The honest summary is: the machinery now runs two markets and provably keeps
+them apart; gold's measured result is negative after costs; Bitcoin's is
+unmeasured.
+
 ---
 
 ## Known limitations
@@ -1034,21 +1046,29 @@ judge on NET expectancy over a few hundred scalps.
 
 ## Recommended next steps
 
-1. **Get real M1 data with recorded spreads.** Everything below is premature
-   until the numbers above are re-measured on real ticks. Record the live spread
-   per candle rather than assuming one.
-2. **Re-examine the breakeven rule.** It is the largest single driver of the raw
+1. **Measure BTCUSD's real cost structure before anything else.** Record the
+   live spread per M1 candle on the venue you would actually use, and replace
+   `BTCUSD_CONFIG`'s spread and slippage assumptions with what you measure.
+   Every other BTCUSD number is downstream of those two, so tuning anything
+   before them tunes against a guess. Then get real BTCUSD M1 history and run
+   `backtest.py --symbol BTCUSD` and `walkforward.py --symbol BTCUSD` on it,
+   calibrating on one segment and judging on another.
+2. **Get real XAUUSD M1 data with recorded spreads.** Everything below is
+   premature until the gold numbers above are re-measured on real ticks.
+3. **Re-examine the breakeven rule.** It is the largest single driver of the raw
    → net collapse. Test holding the original stop, or moving it only after TP2.
-3. **Re-examine the holding window.** 64% of scalps timed out at the wider
+4. **Re-examine the holding window.** 64% of scalps timed out at the wider
    spread. `minutes_to_tp1` in the outcomes file tells you what the window
    should be — but tune it on one period and verify on another.
-4. **Per-partial cost accounting**, so NET R stops being mildly optimistic.
-5. **An ML probability filter.** `evaluations.csv` + `outcomes.csv` already form
+5. **Per-partial cost accounting**, so NET R stops being mildly optimistic.
+6. **An ML probability filter.** `evaluations.csv` + `outcomes.csv` already form
    the training set, and the label (`net_r`) is already cost-adjusted. It would
    sit *after* the deterministic engine as a veto, never replacing it.
-6. **Spread-aware scheduling** — only signal in the hours where the recorded
+7. **Spread-aware scheduling** — only signal in the hours where the recorded
    spread historically supports the target size.
-7. **Economic-calendar filter** around high-impact USD releases.
+8. **Economic-calendar filter** around high-impact USD releases — and for
+   Bitcoin, the venue-specific equivalents (funding resets, exchange outages,
+   large scheduled unlocks).
 
 ---
 
