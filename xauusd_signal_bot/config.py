@@ -19,6 +19,7 @@ the most recent candle on every evaluation so you can sanity-check it.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 from dataclasses import dataclass, field, asdict
@@ -193,7 +194,14 @@ class Config:
     telegram_enabled: bool = field(default_factory=lambda: _env_bool("TELEGRAM_ENABLED", True))
 
     # ---- market ------------------------------------------------------------ #
+    #
+    # The symbol and every market-specific parameter live in src/markets.py.
+    # The fields below are the DEFAULTS that :meth:`for_market` overwrites, and
+    # they are kept so that a bare ``Config()`` remains usable (tests, tooling)
+    # without having to select a market first.
+    #
     symbol: str = field(default_factory=lambda: _env_str("SYMBOL", "XAUUSD"))
+    market_key: str = "xauusd"
 
     #: The ONLY signal timeframe.  This is a dedicated M1 scalping system; the
     #: multi-timeframe selector was removed deliberately.
@@ -208,13 +216,17 @@ class Config:
     candles_signal: int = 900        # 15 hours of M1
     candles_context: int = 400       # ~33 hours of M5
 
-    digits: int = 2               # XAUUSD is quoted with 2 decimals on most brokers
+    digits: int = 2
     point_value: float = 0.01     # one "point" in price terms (the last digit)
 
-    #: One "pip" for XAUUSD, in price terms.  Brokers quote gold to 2 decimals
-    #: and a pip is conventionally the first decimal, i.e. 10 points = 0.10.
-    #: The research target of "1-3 pips" therefore means 0.10 - 0.30 in price.
+    #: One "pip" in price terms.  Market-specific: 0.10 for gold, 1.00 (= $1)
+    #: for Bitcoin.  See src/markets.py.
     pip_value: float = field(default_factory=lambda: _env_float("PIP_VALUE", 0.10))
+    pip_name: str = "p"
+
+    #: True for a market that never closes (Bitcoin).  The session *label* is
+    #: still recorded for analysis; only the session *filter* is bypassed.
+    is_24h: bool = False
 
     mt5_server_utc_offset_hours: float = field(
         default_factory=lambda: _env_float("MT5_SERVER_UTC_OFFSET_HOURS", 0.0)
@@ -391,13 +403,21 @@ class Config:
     #: the cost floor and any structure truncation.
     tp_atr_multiples: Tuple[float, float, float] = (0.45, 1.00, 1.70)
 
-    #: Absolute floor on each target, in pips, so a dead-quiet minute cannot
-    #: produce a target smaller than the tick grid.
+    #: Absolute floor on each target, in the market's pip unit, so a dead-quiet
+    #: minute cannot produce a target smaller than the tick grid.
     min_tp_pips: Tuple[float, float, float] = (1.0, 1.8, 3.0)
 
-    #: Hard ceiling on TP3, in pips.  A "scalp" that needs 20 pips is not a
-    #: scalp; the setup is rejected rather than silently re-scoped.
+    #: Floor on each target as a FRACTION OF PRICE.  The larger of this and the
+    #: pip floor applies.  Gold leaves this at zero (its pip floor is meaningful
+    #: at any gold price); Bitcoin uses it instead, because a fixed dollar floor
+    #: is far too tight at $90,000 and far too loose at $20,000.
+    min_tp_pct: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    #: Hard ceiling on TP3.  A "scalp" that needs a huge move is not a scalp;
+    #: the setup is rejected rather than silently re-scoped.  Expressed in pips
+    #: and/or as a fraction of price - whichever is non-zero, larger wins.
     max_tp3_pips: float = field(default_factory=lambda: _env_float("MAX_TP3_PIPS", 12.0))
+    max_tp3_pct: float = 0.0
 
     # Zone significance.  A "zone" accumulates weight from every level that
     # merges into it; raising these keeps noise pivots out of the S/R engine and
@@ -446,6 +466,10 @@ class Config:
     min_tp1_cost_multiple: float = field(
         default_factory=lambda: _env_float("MIN_TP1_COST_MULTIPLE", 1.5)
     )
+
+    #: Human-readable name of the active market's cost assumptions, shown in
+    #: Telegram settings so it is obvious which model produced a NET R figure.
+    cost_model_name: str = "XAUUSD_RETAIL"
 
     #: The stop must also clear costs, otherwise a normal spread excursion stops
     #: the trade out on noise alone.
@@ -500,13 +524,35 @@ class Config:
     )
 
     # ---- storage ------------------------------------------------------------- #
+    #
+    # Each market owns a directory so nothing can ever be mixed:
+    #
+    #     data/state.json              global runtime (active market, run state)
+    #     data/xauusd/{evaluations,signals,outcomes}.csv, state.json
+    #     data/btcusd/{evaluations,signals,outcomes}.csv, state.json
+    #
+    # The paths below point at the ACTIVE market and are rewritten by
+    # :meth:`for_market`.
+    #
     data_dir: Path = DATA_DIR
-    signals_csv: Path = DATA_DIR / "signals.csv"
-    evaluations_csv: Path = DATA_DIR / "evaluations.csv"
-    outcomes_csv: Path = DATA_DIR / "outcomes.csv"
+    market_dir: Path = DATA_DIR / "xauusd"
+    signals_csv: Path = DATA_DIR / "xauusd" / "signals.csv"
+    evaluations_csv: Path = DATA_DIR / "xauusd" / "evaluations.csv"
+    outcomes_csv: Path = DATA_DIR / "xauusd" / "outcomes.csv"
+    #: Per-market runtime state (threshold, cooldown, last processed candle).
+    state_file: Path = DATA_DIR / "xauusd" / "state.json"
+    #: Global runtime state (active market, run state, alert preferences).
+    global_state_file: Path = DATA_DIR / "state.json"
     log_file: Path = DATA_DIR / "system_log.txt"
-    state_file: Path = DATA_DIR / "state.json"
     log_level: str = field(default_factory=lambda: _env_str("LOG_LEVEL", "INFO").upper())
+
+    #: Evaluate every configured market on each cycle instead of only the one
+    #: selected in Telegram.  Off by default - the panel shows one market and
+    #: signalling on an unselected market would be surprising - but useful when
+    #: collecting research data for both at once.
+    evaluate_all_markets: bool = field(
+        default_factory=lambda: _env_bool("EVALUATE_ALL_MARKETS", False)
+    )
 
     # ------------------------------------------------------------------ #
     def validate(self) -> None:
@@ -531,8 +577,14 @@ class Config:
                 f"most {achievable_rr2:.2f}R, below MIN_TP2_RR {self.min_tp2_rr:.2f} - "
                 "the R:R gate would reject every setup"
             )
-        if not (self.min_tp_pips[0] < self.min_tp_pips[1] < self.min_tp_pips[2]):
-            raise ValueError("min_tp_pips must be strictly increasing")
+        if not (self.min_tp_pips[0] <= self.min_tp_pips[1] <= self.min_tp_pips[2]):
+            raise ValueError("min_tp_pips must be non-decreasing")
+        if not (self.min_tp_pct[0] <= self.min_tp_pct[1] <= self.min_tp_pct[2]):
+            raise ValueError("min_tp_pct must be non-decreasing")
+        if max(self.min_tp_pips) <= 0 and max(self.min_tp_pct) <= 0:
+            raise ValueError("a market needs either pip floors or percentage floors")
+        if self.max_tp3_pips <= 0 and self.max_tp3_pct <= 0:
+            raise ValueError("a market needs a TP3 ceiling in pips or percent")
         if self.sl_min_atr_multiplier >= self.sl_max_atr_multiplier:
             raise ValueError("sl_min_atr_multiplier must be < sl_max_atr_multiplier")
         if self.base_threshold <= 0 or self.base_threshold > 100:
@@ -548,6 +600,79 @@ class Config:
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.market_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------ #
+    # market selection
+    # ------------------------------------------------------------------ #
+    def for_market(self, market) -> "Config":
+        """Return a copy of this config set up for one market.
+
+        This is the only seam between the engine and the instrument: every
+        analysis engine, filter and target calculation keeps reading plain
+        config attributes, but the values now describe whichever market is being
+        evaluated.  Adding a third instrument therefore needs a
+        :class:`~src.markets.MarketConfig` and nothing else.
+
+        ``market`` may be a :class:`~src.markets.MarketConfig` or a symbol.
+
+        The copy is shallow - ``weights``, ``indicators`` and ``sessions`` are
+        shared and never mutated here.
+        """
+        from src.markets import MarketConfig, get_market
+
+        if not isinstance(market, MarketConfig):
+            market = get_market(market)
+
+        view = copy.copy(self)
+        view.symbol = market.symbol
+        view.market_key = market.key
+        view.digits = market.digits
+        view.point_value = market.point_value
+        view.pip_value = market.pip_value
+        view.pip_name = market.pip_name
+        view.is_24h = market.is_24h
+        view.context_timeframe = market.context_timeframe
+        view.candles_signal = market.candles_signal
+        view.candles_context = market.candles_context
+
+        view.base_threshold = market.threshold
+        view.tp_atr_multiples = market.tp_atr_multiples
+        view.min_tp_pips = market.min_tp_pips
+        view.min_tp_pct = market.min_tp_pct
+        view.max_tp3_pips = market.max_tp3_pips
+        view.max_tp3_pct = market.max_tp3_pct
+        view.sl_atr_multiplier = market.sl_atr_multiplier
+        view.sl_min_atr_multiplier = market.sl_min_atr_multiplier
+        view.sl_max_atr_multiplier = market.sl_max_atr_multiplier
+        view.sl_structure_buffer_atr = market.sl_structure_buffer_atr
+        view.sl_structure_lookback = market.sl_structure_lookback
+        view.min_tp2_rr = market.min_tp2_rr
+        view.min_net_tp2_rr = market.min_net_tp2_rr
+
+        view.assumed_spread_points = market.assumed_spread_points
+        view.slippage_points_entry = market.slippage_points_entry
+        view.slippage_points_exit = market.slippage_points_exit
+        view.commission_points_per_side = market.commission_points_per_side
+        view.min_tp1_cost_multiple = market.min_tp1_cost_multiple
+        view.min_sl_cost_multiple = market.min_sl_cost_multiple
+        view.max_spread_points = market.max_spread_points
+        view.max_spread_to_expected_move = market.max_spread_to_expected_move
+        view.cost_model_name = market.cost_model_name
+
+        view.cooldown_candles = market.cooldown_candles
+        view.same_direction_cooldown_candles = market.same_direction_cooldown_candles
+        view.max_signals_per_day = market.max_signals_per_day
+        view.max_concurrent_active_signals = market.max_concurrent_active_signals
+        view.max_holding_candles = market.max_holding_candles
+        view.allowed_sessions = market.default_sessions
+
+        view.market_dir = self.data_dir / market.key
+        view.signals_csv = view.market_dir / "signals.csv"
+        view.evaluations_csv = view.market_dir / "evaluations.csv"
+        view.outcomes_csv = view.market_dir / "outcomes.csv"
+        view.state_file = view.market_dir / "state.json"
+        return view
 
     # ------------------------------------------------------------------ #
     def clamp_threshold(self, value: float) -> float:

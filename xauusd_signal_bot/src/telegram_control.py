@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .logger import get_logger
 from .runtime_state import RuntimeState
+from .markets import MARKET_ORDER, get_market, normalise_market
 from .timeframes import (
     MODE_SCALPING,
     SIGNAL_TIMEFRAME,
@@ -92,6 +93,9 @@ class TelegramController:
         self._stop_event = threading.Event()
         self._offset = 0
         self._panel_message_id: Optional[int] = None
+        #: Market the PERFORMANCE view is scoped to; "COMBINED" merges them.
+        #: Purely UI state - it never affects which market is being evaluated.
+        self._perf_symbol: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # keyboards
@@ -99,14 +103,26 @@ class TelegramController:
     def main_keyboard(self) -> List[List[Dict[str, str]]]:
         """The main control panel keyboard.
 
-        No mode or timeframe buttons: this build is M1 SCALPING only.  STOP
-        lives in Settings rather than the main panel so it cannot be hit by
-        accident while reaching for PAUSE.
+        The market row marks the active market with a filled dot.  START/PAUSE
+        is one toggle rather than two buttons, so the panel shows the action
+        that is actually available.
         """
+        active = self.runtime.active_market
+        market_row = []
+        for symbol in MARKET_ORDER:
+            market = get_market(symbol)
+            mark = "●" if symbol == active else "○"
+            market_row.append(_button(f"{mark} {market.icon} {symbol}", f"mkt:{symbol}"))
+
+        running = self.runtime.is_running
+        toggle = (
+            _button("⏸ PAUSE", "run:pause") if running else _button("▶️ START", "run:start")
+        )
         return [
-            [_button("▶️ START", "run:start"), _button("⏸ PAUSE", "run:pause")],
+            market_row,
             [_button("📊 CURRENT ANALYSIS", "view:analysis")],
             [_button("📈 PERFORMANCE", "view:performance")],
+            [toggle],
             [_button("⚙️ SETTINGS", "menu:settings")],
             [_button("🔄 REFRESH", "panel:refresh")],
         ]
@@ -116,27 +132,44 @@ class TelegramController:
         return [
             [_button(f"{step:+d}", f"thr:{step}") for step in steps],
             [_button("♻️ RESET", "thr:reset")],
-            [_button("⬅️ BACK", "nav:main")],
+            [_button("⬅️ BACK", "menu:settings")],
         ]
 
     def settings_keyboard(self) -> List[List[Dict[str, str]]]:
+        """Settings always act on the ACTIVE market - never on the other one."""
         state = self.runtime.describe()
         near = "ON ✅" if state["near_signal_alerts"] else "OFF"
         return [
             [_button(f"🎯 Threshold: {state['threshold']:.0f}", "menu:threshold")],
-            [_button(f"⏳ Max hold: {state['max_holding_candles']} min", "set:hold")],
-            [_button(f"❄️ Cooldown: {state['cooldown_candles']} candles", "set:cooldown")],
+            [_button(f"⏳ Holding time: {state['max_holding_candles']} min", "set:hold")],
+            [_button(f"❄️ Cooldown: {state['cooldown_candles']} min", "set:cooldown")],
             [_button(f"⚖️ Min R:R: {state['min_tp2_rr']:.1f}", "set:rr")],
-            [_button(f"🕐 Sessions: {', '.join(state['allowed_sessions'])[:24]}", "set:session")],
+            [_button(f"🕐 Sessions: {', '.join(state['allowed_sessions'])[:22]}", "set:session")],
             [_button(f"👀 Near-signal alerts: {near}", "set:near")],
             [_button("⏹ STOP ENGINE", "run:stop")],
             [_button("⬅️ BACK", "nav:main")],
         ]
 
     def performance_keyboard(self) -> List[List[Dict[str, str]]]:
+        """Market selector plus the per-market drill-downs.
+
+        Markets are deliberately NOT merged by default: an R on gold and an R on
+        Bitcoin share a unit but come from different cost and volatility
+        regimes.  COMBINED is offered and clearly labelled as such.
+        """
+        scope = self._perf_scope()
+        row = []
+        for symbol in MARKET_ORDER:
+            market = get_market(symbol)
+            mark = "●" if symbol == scope else "○"
+            row.append(_button(f"{mark} {market.icon} {symbol}", f"perf:{symbol}"))
+        combined_mark = "●" if scope == "COMBINED" else "○"
         return [
-            [_button("BY SCORE", "perf:score"), _button("BY REGIME", "perf:regime")],
-            [_button("BY SESSION", "perf:session"), _button("BY OUTCOME", "perf:outcome")],
+            row,
+            [_button(f"{combined_mark} 📊 COMBINED", "perf:COMBINED")],
+            [_button("BY SCORE", "perfv:score"), _button("BY REGIME", "perfv:regime")],
+            [_button("BY HOUR", "perfv:hour"), _button("BY SESSION", "perfv:session")],
+            [_button("BY OUTCOME", "perfv:outcome")],
             [_button("⬅️ BACK", "nav:main")],
         ]
 
@@ -148,32 +181,42 @@ class TelegramController:
     # panel rendering
     # ------------------------------------------------------------------ #
     def render_panel(self) -> str:
-        """The main control panel text."""
+        """The main control panel text - active market stated prominently."""
         state = self.runtime.describe()
         status = state["status"]
         custom = " (custom)" if state["threshold_is_custom"] else ""
-        net_r = self._paper_net_r()
+        symbol = state["active_market"]
+        net_r = self._paper_net_r(symbol)
 
         lines = [
             DIVIDER,
-            "⚡ XAUUSD SCALPER",
+            "⚡ M1 SCALPER",
             DIVIDER,
             "",
-            f"Status: {STATUS_ICONS.get(status, '❔')} {status}",
-            f"Mode: {MODE_SCALPING}",
+            f"Market: {state['label']}",
             f"Timeframe: {SIGNAL_TIMEFRAME}",
-            f"Threshold: {state['threshold']:.0f}{custom}",
+            f"Mode: {MODE_SCALPING}",
+            f"Status: {STATUS_ICONS.get(status, '❔')} {status}",
             "",
-            f"Signals today: {self._signals_today()}",
-            f"Open signals: {self._open_signals()}",
+            f"Threshold: {state['threshold']:.0f}{custom}",
+            f"Max hold: {state['max_holding_candles']} min",
+            f"Cost model: {state['cost_model']}",
+            "",
+            f"Signals today: {self._signals_today(symbol)}",
+            f"Open signals: {self._open_signals(symbol)}",
             f"Paper Net R: {net_r:+.2f}" if net_r is not None else "Paper Net R: -",
             "",
-            f"Max hold: {state['max_holding_candles']} min",
             f"MT5: {self._connection_state()}",
-            "",
-            DIVIDER,
-            "🔬 PAPER TEST ONLY - no orders are placed.",
         ]
+        other = [s for s in MARKET_ORDER if s != symbol]
+        if other:
+            carried = ", ".join(
+                f"{get_market(o).icon} {o} {self._open_signals(o)} open" for o in other
+            )
+            lines += ["", f"Also tracking: {carried}"]
+        lines += ["", DIVIDER, "🔬 PAPER TEST ONLY - no orders are placed."]
+        if symbol == "BTCUSD":
+            lines.append("BTCUSD uses INITIAL RESEARCH PARAMETERS.")
         return "\n".join(lines)
 
     def render_threshold_panel(self) -> str:
@@ -181,44 +224,55 @@ class TelegramController:
         return "\n".join(
             [
                 DIVIDER,
-                "🎯 THRESHOLD",
+                f"🎯 {state['label']} THRESHOLD",
                 DIVIDER,
                 "",
                 f"Current threshold: {state['threshold']:.0f}",
-                f"Default for {state['mode']} / {state['signal_timeframe']}: "
-                f"{self.runtime.default_threshold():.0f}",
+                f"Default for {state['symbol']}: {state['default_threshold']:.0f}",
                 "",
                 f"Allowed range: {self.config.min_threshold:.0f} - {self.config.max_threshold:.0f}",
                 "",
                 "The regime still adjusts this per candle;",
                 "this is the base value.",
+                "",
+                "Thresholds are per market - changing this",
+                "does not affect the other market.",
                 DIVIDER,
             ]
         )
 
     def render_settings(self) -> str:
+        """Settings for the ACTIVE market only."""
         state = self.runtime.describe()
+        market = get_market(state["symbol"])
+        view = self.config.for_market(market)
+        cost = view.pips(view.round_trip_cost(None))
         return "\n".join(
             [
                 DIVIDER,
-                "⚙️ SETTINGS",
+                f"⚙️ {state['symbol']} SETTINGS",
                 DIVIDER,
                 "",
-                f"Mode: {MODE_SCALPING}  (fixed)",
+                f"Market: {state['label']}",
                 f"Timeframe: {SIGNAL_TIMEFRAME}  (fixed)",
-                f"Context: {state['context_timeframe']}",
+                f"Mode: {MODE_SCALPING}  (fixed)",
+                f"24/7 market: {'yes' if state['is_24h'] else 'no'}",
+                "",
                 f"Threshold: {state['threshold']:.0f}",
                 f"Max holding period: {state['max_holding_candles']} minutes",
                 f"Cooldown: {state['cooldown_candles']} candles",
                 f"Minimum R:R (TP2): {state['min_tp2_rr']:.1f}",
-                f"Session filter: {', '.join(state['allowed_sessions'])}",
+                f"Session filter: {', '.join(state['allowed_sessions'])}"
+                + ("  (not applied - 24/7)" if state["is_24h"] else ""),
                 f"Near-signal alerts: {'ON' if state['near_signal_alerts'] else 'OFF'}",
                 "",
+                f"Cost model: {state['cost_model']}",
                 "Costs assumed per round trip:",
-                f"  spread (fallback) {self.config.assumed_spread_points:.0f} pts",
-                f"  slippage {self.config.slippage_points_entry:.0f}+"
-                f"{self.config.slippage_points_exit:.0f} pts",
+                f"  {cost:.1f}{state['pip_name']}"
+                f"  (spread {view.assumed_spread_points:.0f} + slippage "
+                f"{view.slippage_points_entry:.0f}+{view.slippage_points_exit:.0f} pts)",
                 "",
+                "These settings apply to this market only.",
                 "Credentials and file paths are not editable here.",
                 DIVIDER,
             ]
@@ -226,10 +280,12 @@ class TelegramController:
 
     def render_analysis(self) -> str:
         """Latest evaluation, computed on demand from closed candles only."""
-        evaluation = self._analyze_now()
+        symbol = self.runtime.active_market
+        evaluation = self._analyze_now(symbol)
         if evaluation is None:
             return "\n".join(
-                [DIVIDER, "📊 ANALYSIS", DIVIDER, "", "No market data available right now.",
+                [DIVIDER, f"📊 {symbol} M1 ANALYSIS", DIVIDER, "",
+                 "No market data available right now.",
                  "(MT5 disconnected, or not enough closed candles yet.)", DIVIDER]
             )
 
@@ -243,7 +299,7 @@ class TelegramController:
         direction = "BUY" if card.bullish_score >= card.bearish_score else "SELL"
         lines = [
             DIVIDER,
-            f"📊 {evaluation.symbol} M1 ANALYSIS",
+            f"📊 {get_market(evaluation.symbol).icon} {evaluation.symbol} M1 ANALYSIS",
             DIVIDER,
             "",
             f"Bullish Score: {card.bullish_score:.0f}",
@@ -296,11 +352,22 @@ class TelegramController:
         return "\n".join(lines)
 
     # -- performance views -------------------------------------------------- #
-    def _report(self):
+    def _perf_scope(self) -> str:
+        """Market the performance view is scoped to (defaults to the active one)."""
+        return self._perf_symbol or self.runtime.active_market
+
+    def _report(self, symbol: Optional[str] = None):
         if self._report_loader is None:
             return None
         try:
-            return self._report_loader()
+            return self._report_loader(symbol)
+        except TypeError:
+            # a loader that predates per-market reports
+            try:
+                return self._report_loader()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Could not build the performance report: %s", exc)
+                return None
         except Exception as exc:  # noqa: BLE001 - a report must never break the panel
             LOGGER.exception("Could not build the performance report: %s", exc)
             return None
@@ -311,60 +378,74 @@ class TelegramController:
             return [title, "  (no closed signals yet)"]
         lines = [title, f"  {'group':<22}{'n':>4}{'win%':>7}{'avgR':>8}{'PF':>7}"]
         for stats in rows:
-            profit_factor = "inf" if stats.profit_factor == float("inf") else f"{stats.profit_factor:.2f}"
+            profit_factor = (
+                "inf" if stats.net_profit_factor == float("inf")
+                else f"{stats.net_profit_factor:.2f}"
+            )
             lines.append(
-                f"  {stats.label[:21]:<22}{stats.closed:>4}{stats.win_rate:>7.1f}"
-                f"{stats.average_r:>+8.2f}{profit_factor:>7}"
+                f"  {stats.label[:21]:<22}{stats.closed:>4}{stats.net_win_rate:>7.1f}"
+                f"{stats.average_net_r:>+8.2f}{profit_factor:>7}"
             )
         return lines
 
     def render_performance(self, view: str = "summary") -> str:
-        """Paper-performance summary, read straight from the CSV files."""
-        report = self._report()
-        if report is None or report.total_signals == 0:
+        """Paper-performance for one market, read straight from its CSV files."""
+        scope = self._perf_scope()
+        report = self._report(scope)
+        title = "📊 COMBINED" if scope == "COMBINED" else get_market(scope).label()
+
+        if report is None or (report.total_signals == 0 and report.total_evaluations == 0):
             return "\n".join(
-                [DIVIDER, "📈 PAPER PERFORMANCE", DIVIDER, "",
+                [DIVIDER, f"📈 {title} PERFORMANCE", DIVIDER, "",
                  "No signals recorded yet.", DIVIDER]
             )
 
         overall = report.overall
         header = [
             DIVIDER,
-            "📈 PAPER PERFORMANCE",
+            f"📈 {title} PERFORMANCE",
             DIVIDER,
             "",
-            f"{SIGNAL_TIMEFRAME} {MODE_SCALPING}  (all recorded signals)",
+            f"{SIGNAL_TIMEFRAME} {MODE_SCALPING}",
             "",
         ]
 
         if view == "score":
             body = self._stats_table("BY SCORE BAND", report.by_score_band)
-            body.append("")
-            body.append("Higher score = better outcome?  Check, do not assume.")
+            body += ["", "Higher score = better outcome?  Check, do not assume."]
         elif view == "regime":
             body = self._stats_table("BY REGIME", report.by_regime)
+        elif view == "hour":
+            body = self._stats_table("BY UTC HOUR", report.by_hour)
         elif view == "session":
             body = self._stats_table("BY SESSION", report.by_session)
+            if scope != "COMBINED" and get_market(scope).is_24h:
+                body += ["", "This market trades 24/7 - the session label is",
+                         "recorded for analysis but never filters signals."]
         elif view == "outcome":
             body = self._stats_table("BY OUTCOME", report.by_result)
         else:
             profit_factor = (
-                "inf" if overall.profit_factor == float("inf") else f"{overall.profit_factor:.2f}"
+                "inf" if overall.net_profit_factor == float("inf")
+                else f"{overall.net_profit_factor:.2f}"
             )
             body = [
+                f"Evaluations: {report.total_evaluations}",
                 f"Signals: {report.total_signals}",
                 f"Closed & scored: {overall.closed}",
-                f"Win Rate (net): {overall.net_win_rate:.1f}%",
+                f"Wins / Losses: {overall.wins} / {overall.losses}",
+                f"Timed out: {overall.timeout_rate:.1f}%",
                 "",
+                f"Win rate (net): {overall.net_win_rate:.1f}%",
                 f"Avg RAW R: {overall.average_r:+.3f}",
                 f"Avg NET R: {overall.average_net_r:+.3f}",
                 f"Total NET R: {overall.total_net_r:+.2f}",
-                f"Profit Factor (net): {profit_factor}",
+                f"Profit factor (net): {profit_factor}",
                 f"Max drawdown: {overall.max_drawdown_r:.2f}R",
-                "",
-                f"Timed out: {overall.timeout_rate:.1f}%",
-                f"Avg hold: {overall.average_duration_min:.1f} min",
+                f"Avg holding time: {overall.average_duration_min:.1f} min",
                 f"Avg cost: {overall.average_cost_r:.2f}R",
+                "",
+                f"TP1 reached: {overall.tp1_rate:.1f}%   SL: {overall.sl_rate:.1f}%",
                 "",
                 "Best Regime:",
                 report.best_regime(),
@@ -372,6 +453,9 @@ class TelegramController:
                 "Worst Regime:",
                 report.worst_regime(),
             ]
+            if scope == "COMBINED":
+                body += ["", "⚠️ Markets merged - different cost and",
+                         "volatility regimes.  Per-market is the honest view."]
         return "\n".join(header + body + ["", DIVIDER, "Paper results only. Not advice."])
 
     # ------------------------------------------------------------------ #
@@ -389,6 +473,8 @@ class TelegramController:
         try:
             if action == "run":
                 return self._handle_run(argument)
+            if action == "mkt":
+                return self._handle_market(argument)
             if action == "thr":
                 return self._handle_threshold(argument)
             if action == "menu":
@@ -399,10 +485,30 @@ class TelegramController:
                 if argument == "analysis":
                     return self.render_analysis(), self.back_keyboard(), "Analysing…"
                 if argument == "performance":
-                    return self.render_performance(), self.performance_keyboard(), "Performance"
+                    self._perf_symbol = self.runtime.active_market
+                    return (
+                        self.render_performance(),
+                        self.performance_keyboard(),
+                        "Performance",
+                    )
             if action == "perf":
-                return self.render_performance(argument), self.performance_keyboard(), argument
-            if action == "nav" or action == "panel":
+                # scope the performance view to a market (or COMBINED)
+                self._perf_symbol = (
+                    "COMBINED" if argument.upper() == "COMBINED"
+                    else normalise_market(argument, self.runtime.active_market)
+                )
+                return (
+                    self.render_performance(),
+                    self.performance_keyboard(),
+                    self._perf_symbol,
+                )
+            if action == "perfv":
+                return (
+                    self.render_performance(argument),
+                    self.performance_keyboard(),
+                    argument,
+                )
+            if action in ("nav", "panel"):
                 return self.render_panel(), self.main_keyboard(), "Refreshed"
         except Exception as exc:  # noqa: BLE001 - a bad press must not kill the thread
             LOGGER.exception("Callback '%s' failed: %s", data, exc)
@@ -410,8 +516,28 @@ class TelegramController:
 
         return self.render_panel(), self.main_keyboard(), ""
 
+    def _handle_market(self, argument: str):
+        """Switch the active market.
+
+        Selection only: the other market's state, CSV files, cooldowns and open
+        paper trades are untouched, and its open trades keep being tracked.
+        """
+        previous = self.runtime.active_market
+        symbol = self.runtime.set_active_market(argument)
+        self._perf_symbol = None
+        if symbol != previous:
+            notify = getattr(self.engine, "on_market_changed", None)
+            if callable(notify):
+                notify(previous, symbol)
+        market = get_market(symbol)
+        return self.render_panel(), self.main_keyboard(), f"Market: {market.label()}"
+
     def _handle_run(self, argument: str):
-        mapping = {"start": self.runtime.start, "pause": self.runtime.pause, "stop": self.runtime.stop}
+        mapping = {
+            "start": self.runtime.start,
+            "pause": self.runtime.pause,
+            "stop": self.runtime.stop,
+        }
         handler = mapping.get(argument)
         if handler is None:
             return self.render_panel(), self.main_keyboard(), ""
@@ -424,15 +550,17 @@ class TelegramController:
         return self.render_panel(), self.main_keyboard(), toast
 
     def _handle_threshold(self, argument: str):
+        """Threshold controls always act on the ACTIVE market."""
+        market_runtime = self.runtime.active
         if argument == "reset":
-            value = self.runtime.reset_threshold()
-            toast = f"Reset to {value:.0f}"
+            value = market_runtime.reset_threshold()
+            toast = f"{market_runtime.symbol} reset to {value:.0f}"
         else:
             try:
-                value = self.runtime.adjust_threshold(float(argument))
+                value = market_runtime.adjust_threshold(float(argument))
             except ValueError:
-                value = self.runtime.active_threshold()
-            toast = f"Threshold: {value:.0f}"
+                value = market_runtime.active_threshold()
+            toast = f"{market_runtime.symbol} threshold: {value:.0f}"
         return self.render_threshold_panel(), self.threshold_keyboard(), toast
 
     def _handle_menu(self, argument: str):
@@ -443,8 +571,10 @@ class TelegramController:
         return self.render_panel(), self.main_keyboard(), ""
 
     def _handle_setting(self, argument: str):
-        """Cycle one editable setting to its next allowed value."""
+        """Cycle one editable setting of the ACTIVE market to its next value."""
         state = self.runtime.describe()
+        market_runtime = self.runtime.active
+        symbol = market_runtime.symbol
 
         def cycle(choices, current):
             choices = list(choices)
@@ -454,21 +584,21 @@ class TelegramController:
 
         if argument == "cooldown":
             value = cycle(self.config.cooldown_choices, int(state["cooldown_candles"]))
-            self.runtime.set_cooldown(value)
-            toast = f"Cooldown: {value} candles"
+            market_runtime.set_cooldown(value)
+            toast = f"{symbol} cooldown: {value} candles"
         elif argument == "rr":
             value = cycle(self.config.min_rr_choices, float(state["min_tp2_rr"]))
-            self.runtime.set_min_rr(value)
-            toast = f"Min R:R: {value:.1f}"
+            market_runtime.set_min_rr(value)
+            toast = f"{symbol} min R:R: {value:.1f}"
         elif argument == "hold":
             value = cycle(self.config.holding_choices, int(state["max_holding_candles"]))
-            self.runtime.set_max_holding(value)
-            toast = f"Max hold: {value} min"
+            market_runtime.set_max_holding(value)
+            toast = f"{symbol} max hold: {value} min"
         elif argument == "session":
             current = ",".join(state["allowed_sessions"])
             value = cycle(self.config.session_choices, current)
-            self.runtime.set_sessions([value])
-            toast = f"Sessions: {value}"
+            market_runtime.set_sessions([value])
+            toast = f"{symbol} sessions: {value}"
         elif argument == "near":
             value = self.runtime.set_near_signal_alerts(not state["near_signal_alerts"])
             toast = f"Near-signal alerts: {'ON' if value else 'OFF'}"
@@ -479,35 +609,54 @@ class TelegramController:
     # ------------------------------------------------------------------ #
     # engine hooks
     # ------------------------------------------------------------------ #
-    def _analyze_now(self):
+    def _analyze_now(self, symbol: Optional[str] = None):
         analyse = getattr(self.engine, "analyze_now", None)
         if not callable(analyse):
             return None
         try:
-            return analyse()
+            return analyse(symbol)
+        except TypeError:
+            try:
+                return analyse()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("On-demand analysis failed: %s", exc)
+                return None
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("On-demand analysis failed: %s", exc)
             return None
 
-    def _open_signals(self) -> int:
-        counter = getattr(self.engine, "open_signals", None)
+    def _call_engine(self, name: str, symbol: Optional[str], default=0):
+        """Call an optional engine hook that may or may not take a symbol."""
+        hook = getattr(self.engine, name, None)
+        if not callable(hook):
+            return default
         try:
-            return int(counter()) if callable(counter) else 0
+            return hook(symbol)
+        except TypeError:
+            try:
+                return hook()
+            except Exception:  # noqa: BLE001
+                return default
         except Exception:  # noqa: BLE001
+            return default
+
+    def _open_signals(self, symbol: Optional[str] = None) -> int:
+        try:
+            return int(self._call_engine("open_signals", symbol, 0))
+        except (TypeError, ValueError):
             return 0
 
-    def _paper_net_r(self) -> Optional[float]:
-        """Cumulative NET R from the closed paper signals, or ``None``."""
-        report = self._report()
+    def _paper_net_r(self, symbol: Optional[str] = None) -> Optional[float]:
+        """Cumulative NET R from this market's closed paper signals."""
+        report = self._report(symbol or self.runtime.active_market)
         if report is None or report.overall.closed == 0:
             return None
         return report.overall.total_net_r
 
-    def _signals_today(self) -> int:
-        counter = getattr(self.engine, "signals_today", None)
+    def _signals_today(self, symbol: Optional[str] = None) -> int:
         try:
-            return int(counter()) if callable(counter) else 0
-        except Exception:  # noqa: BLE001
+            return int(self._call_engine("signals_today", symbol, 0))
+        except (TypeError, ValueError):
             return 0
 
     def _connection_state(self) -> str:

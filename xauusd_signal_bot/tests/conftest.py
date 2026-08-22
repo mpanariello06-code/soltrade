@@ -17,6 +17,7 @@ from typing import Optional  # noqa: E402
 
 from config import Config  # noqa: E402
 from src.indicators import compute_indicators  # noqa: E402
+from src.markets import BTCUSD, XAUUSD, get_market  # noqa: E402
 
 
 def make_candles(
@@ -77,10 +78,18 @@ def make_ticks(prices, start: str = "2024-05-01 12:01", freq: str = "5s") -> pd.
 
 @pytest.fixture
 def config() -> Config:
-    """A validated default configuration (no .env dependency)."""
+    """A validated default XAUUSD configuration (no .env dependency)."""
     cfg = Config()
     cfg.validate()
-    return cfg
+    return cfg.for_market(XAUUSD)
+
+
+@pytest.fixture
+def btc_config() -> Config:
+    """The same base configuration folded onto BTCUSD."""
+    cfg = Config()
+    cfg.validate()
+    return cfg.for_market(BTCUSD)
 
 
 @pytest.fixture
@@ -248,16 +257,99 @@ class FakeMarket:
         )
 
 
+def isolate(config: Config, root: Path, symbol: Optional[str] = None) -> Config:
+    """Repoint ``config`` at a throwaway ``data`` root, preserving the layout.
+
+    The per-market subdirectory is kept, because the whole point of the layout
+    is that XAUUSD and BTCUSD files never land in the same place.
+    """
+    symbol = symbol or config.symbol
+    market = get_market(symbol)
+    config.data_dir = root
+    config.market_dir = root / market.key
+    config.signals_csv = config.market_dir / "signals.csv"
+    config.evaluations_csv = config.market_dir / "evaluations.csv"
+    config.outcomes_csv = config.market_dir / "outcomes.csv"
+    config.state_file = config.market_dir / "state.json"
+    config.global_state_file = root / "state.json"
+    config.log_file = root / "system_log.txt"
+    config.telegram_chat_id = "4242"
+    config.ensure_dirs()
+    return config
+
+
+class MultiMarket:
+    """Serves each market from its OWN candle history.
+
+    A single :class:`FakeMarket` knows one series; the two-market tests need a
+    feed that hands XAUUSD gold candles and BTCUSD bitcoin candles from the same
+    object, exactly as MT5 would.  Anything asking for an unknown symbol raises,
+    so a test can never silently score one market against the other's prices.
+    """
+
+    def __init__(self, feeds) -> None:
+        self.feeds = {symbol.upper(): feed for symbol, feed in feeds.items()}
+        self.connected = True
+        self.cache_cleared = 0
+        self.fetches = []
+
+    def feed(self, symbol: str) -> "FakeMarket":
+        key = str(symbol).upper()
+        if key not in self.feeds:
+            raise KeyError(f"no feed configured for {symbol!r}")
+        return self.feeds[key]
+
+    def connect(self):
+        return True
+
+    def shutdown(self, quiet=False):
+        self.connected = False
+
+    def clear_cache(self, timeframe=None):
+        self.cache_cleared += 1
+
+    def advance(self, steps: int = 1, symbol: Optional[str] = None):
+        targets = self.feeds.values() if symbol is None else [self.feed(symbol)]
+        for feed in targets:
+            feed.advance(steps)
+
+    def get_candles(self, symbol, timeframe, count, closed_only=True, use_cache=False,
+                    cache_result=True):
+        self.fetches.append((str(symbol).upper(), timeframe))
+        return self.feed(symbol).get_candles(
+            symbol, timeframe, count, closed_only, use_cache, cache_result
+        )
+
+    def get_spread(self, symbol):
+        return self.feed(symbol).get_spread(symbol)
+
+    def refresh_tick_buffer(self, symbol, minutes):
+        return self.feed(symbol).refresh_tick_buffer(symbol, minutes)
+
+    def latest_closed_candle_time(self, symbol, timeframe):
+        return self.feed(symbol).latest_closed_candle_time(symbol, timeframe)
+
+    def build_snapshot(self, config=None, use_cache: bool = False):
+        if config is None:
+            raise ValueError("MultiMarket.build_snapshot needs a market config view")
+        self.fetches.append((str(config.symbol).upper(), "M1"))
+        return self.feed(config.symbol).build_snapshot(config, use_cache)
+
+
 @pytest.fixture
 def isolated_config(config, tmp_path) -> Config:
-    """Config pointed at a throwaway data directory."""
-    config.data_dir = tmp_path
-    config.signals_csv = tmp_path / "signals.csv"
-    config.evaluations_csv = tmp_path / "evaluations.csv"
-    config.outcomes_csv = tmp_path / "outcomes.csv"
-    config.state_file = tmp_path / "state.json"
-    config.telegram_chat_id = "4242"
-    return config
+    """XAUUSD config pointed at a throwaway data directory."""
+    return isolate(config, tmp_path)
+
+
+@pytest.fixture
+def isolated_btc_config(btc_config, tmp_path) -> Config:
+    """BTCUSD config pointed at the SAME throwaway root as ``isolated_config``.
+
+    Sharing the root is deliberate: it is what lets the isolation tests prove
+    the two markets write to different files under one data directory.
+    """
+    return isolate(btc_config, tmp_path)
 
 
 def build_snapshot(config, candles: pd.DataFrame, spread_points: float = 12.0):

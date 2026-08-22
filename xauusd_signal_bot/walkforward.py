@@ -36,6 +36,7 @@ import pandas as pd
 
 from backtest import Backtester, load_history, write_outputs
 from config import load_config
+from src.markets import MARKET_ORDER, DEFAULT_MARKET
 from performance import Report, build_report
 from src.logger import get_logger, setup_logging
 from src.market_data import timeframe_minutes
@@ -107,9 +108,10 @@ def run_walkforward(
     fractions: Sequence[float],
     out_dir: Optional[Path] = None,
     spread_points: Optional[float] = None,
+    symbol: str = DEFAULT_MARKET,
 ) -> List[Segment]:
-    """Run every segment and collect its report."""
-    config = load_config()
+    """Run every segment and collect its report, for one market."""
+    config = load_config().for_market(symbol)
     results: List[Segment] = []
 
     for name, frame, evaluated in split_history(m5, fractions, config):
@@ -180,6 +182,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
     config = load_config()
     parser = argparse.ArgumentParser(description="Walk-forward robustness report")
+    parser.add_argument(
+        "--symbol", type=str, default=DEFAULT_MARKET, choices=list(MARKET_ORDER),
+        help="market to evaluate (default: %(default)s)",
+    )
     parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument(
         "--split", type=float, nargs=3, default=(0.5, 0.25, 0.25),
@@ -196,8 +202,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    segments = run_walkforward(history, args.split, args.out, args.spread)
+    segments = run_walkforward(history, args.split, args.out, args.spread, args.symbol)
     print()
+    print(f"Market: {args.symbol}")
     print(render_walkforward(segments))
     return 0
 

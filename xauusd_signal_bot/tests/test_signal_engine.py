@@ -35,7 +35,7 @@ from src.signal_tracker import (
 )
 from src.telegram_bot import TelegramNotifier
 from src.utils import atomic_write_json, iso, parse_iso, read_json
-from tests.conftest import FakeMarket, FakeNotifier, build_snapshot, make_candles
+from tests.conftest import FakeMarket, FakeNotifier, build_snapshot, isolate, make_candles
 
 
 # --------------------------------------------------------------------------- #
@@ -49,13 +49,8 @@ def long_candles() -> pd.DataFrame:
 
 @pytest.fixture
 def tracker_config(config, tmp_path):
-    """Config pointed at a throwaway data directory."""
-    config.data_dir = tmp_path
-    config.signals_csv = tmp_path / "signals.csv"
-    config.evaluations_csv = tmp_path / "evaluations.csv"
-    config.outcomes_csv = tmp_path / "outcomes.csv"
-    config.state_file = tmp_path / "state.json"
-    return config
+    """XAUUSD config pointed at a throwaway data directory."""
+    return isolate(config, tmp_path)
 
 
 def sample_signal(direction: str = "BUY", when: datetime | None = None) -> Signal:
@@ -434,7 +429,7 @@ def test_telegram_is_disabled_without_credentials(config):
 
 def test_scalp_message_matches_the_specified_format(config):
     text = TelegramNotifier(config).format_signal(sample_signal("BUY"))
-    assert "⚡ XAUUSD M1 SCALP" in text
+    assert "🥇 XAUUSD M1 SCALP" in text, "the card is headed with the market's icon"
     assert "Direction: BUY" in text
     assert "Score: 71/100" in text
     assert "Entry: 2300.00" in text
@@ -555,7 +550,7 @@ def test_live_loop_processes_each_candle_exactly_once(tracker_config):
     runner.market = FakeMarket(tracker_config, candles, start=3100)
     runner.notifier.config.telegram_enabled = False
     ensure_csv(tracker_config.evaluations_csv, EVALUATION_COLUMNS)
-    runner.tracker.load()
+    runner.slot("XAUUSD").tracker.load()
 
     for _ in range(20):
         runner._tick()
@@ -578,7 +573,7 @@ def test_live_loop_skips_a_candle_it_has_already_processed(tracker_config):
     runner.market = FakeMarket(tracker_config, candles, start=3150)
     runner.notifier.config.telegram_enabled = False
     ensure_csv(tracker_config.evaluations_csv, EVALUATION_COLUMNS)
-    runner.tracker.load()
+    runner.slot("XAUUSD").tracker.load()
 
     runner._tick()
     runner._tick()   # same candle - must be ignored
@@ -594,7 +589,7 @@ def test_live_loop_records_signals_and_never_duplicates_them(tracker_config):
     runner.market = FakeMarket(tracker_config, candles, start=3000)
     runner.notifier.config.telegram_enabled = False
     ensure_csv(tracker_config.evaluations_csv, EVALUATION_COLUMNS)
-    runner.tracker.load()
+    runner.slot("XAUUSD").tracker.load()
 
     for _ in range(120):
         runner._tick()
@@ -621,10 +616,10 @@ def _runner(config, candles, start):
     runner = SignalRunner(config)
     runner.market = FakeMarket(config, candles, start=start)
     runner.notifier = FakeNotifier()
-    runner.tracker.notifier = runner.notifier
+    runner.slot(config.symbol).tracker.notifier = runner.notifier
     runner.control.notifier = runner.notifier
     ensure_csv(config.evaluations_csv, EVALUATION_COLUMNS)
-    runner.tracker.load()
+    runner.slot(config.symbol).tracker.load()
     return runner
 
 
@@ -638,7 +633,7 @@ def test_paused_runner_evaluates_nothing(tracker_config):
         runner.market.advance()
 
     assert read_csv_rows(tracker_config.evaluations_csv) == []
-    assert runner.runtime.last_processed_candle("M5") is None
+    assert runner.runtime.active.last_processed_candle() is None
 
 
 def test_resuming_restarts_evaluation(tracker_config):
@@ -694,7 +689,7 @@ def test_near_signal_alerts_fire_only_when_enabled(tracker_config):
         assert row["decision"] == "NEAR_SIGNAL"
         assert row["signal_id"] == "", "a near signal must not create a signal"
     assert runner.notifier.signals == [] or all(
-        signal.confidence >= float(runner.runtime.active_threshold())
+        signal.confidence >= float(runner.runtime.active.active_threshold())
         for signal in runner.notifier.signals
     ), "a near signal leaked into the signal feed"
 
@@ -709,5 +704,5 @@ def test_analyze_now_has_no_side_effects(tracker_config):
     assert evaluation.card is not None
     assert read_csv_rows(tracker_config.evaluations_csv) == []
     assert read_csv_rows(tracker_config.signals_csv) == []
-    assert runner.runtime.last_processed_candle("M5") is None
+    assert runner.runtime.active.last_processed_candle() is None
     assert runner.notifier.signals == []

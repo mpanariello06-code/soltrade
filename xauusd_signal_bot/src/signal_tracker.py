@@ -92,7 +92,8 @@ SIGNAL_COLUMNS: Tuple[str, ...] = (
     "confidence", "bullish_score", "bearish_score", "regime", "status",
     "mode", "threshold_used", "score", "session",
     # scalping geometry and costs, recorded at signal time
-    "spread_points", "cost_pips", "cost_r", "sl_pips", "tp1_pips", "tp2_pips", "tp3_pips",
+    "spread_points", "estimated_slippage", "cost_pips", "cost_r",
+    "sl_pips", "tp1_pips", "tp2_pips", "tp3_pips",
     "atr", "risk_reward", "rr1", "rr2", "rr3", "net_rr1", "net_rr2", "net_rr3",
     "sl_mode", "expected_hold", "confidence_label", "reason_summary",
     "status_updated_at", "tp_hits", "mfe_r", "mae_r",
@@ -106,7 +107,7 @@ OUTCOME_COLUMNS: Tuple[str, ...] = (
     # --- scalping detail -------------------------------------------------- #
     # RAW R is price movement only; NET R is what is left after the spread,
     # slippage and commission assumed at signal time.  Never quote RAW alone.
-    "raw_r", "net_r", "cost_r", "spread_points",
+    "raw_r", "net_r", "cost_r", "spread_points", "estimated_slippage",
     "minutes_to_tp1", "minutes_to_tp2", "minutes_to_tp3", "minutes_to_sl",
     "bars_to_tp1", "bars_to_tp2", "bars_to_tp3", "bars_to_sl",
     "mfe_price", "mae_price", "mfe_pips", "mae_pips",
@@ -592,6 +593,7 @@ def build_outcome_row(
         "net_r": progress.net_r,
         "cost_r": progress.cost_r,
         "spread_points": signal_row.get("spread_points", ""),
+        "estimated_slippage": signal_row.get("estimated_slippage", ""),
         "minutes_to_tp1": progress.minutes_to(progress.bars_to_tp1),
         "minutes_to_tp2": progress.minutes_to(progress.bars_to_tp2),
         "minutes_to_tp3": progress.minutes_to(progress.bars_to_tp3),

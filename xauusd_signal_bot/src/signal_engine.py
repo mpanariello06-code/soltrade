@@ -132,6 +132,9 @@ class Signal:
 
     # -- scalping geometry and costs, fixed at signal time ------------------ #
     spread_points: float = float("nan")
+    #: assumed round-trip slippage in points, taken from the market cost model.
+    #: An ASSUMPTION, not a measurement - see ``MarketConfig`` for the source.
+    estimated_slippage: float = 0.0
     cost_pips: float = 0.0
     cost_r: float = 0.0
     sl_pips: float = 0.0
@@ -165,6 +168,7 @@ class Signal:
             "score": self.confidence,
             "session": self.session,
             "spread_points": round(self.spread_points, 1) if pd.notna(self.spread_points) else "",
+            "estimated_slippage": round(self.estimated_slippage, 1),
             "cost_pips": self.cost_pips,
             "cost_r": self.cost_r,
             "sl_pips": self.sl_pips,
@@ -541,6 +545,7 @@ class SignalEngine:
             mode=MODE_SCALPING,
             threshold_used=round(outcome.threshold, 2),
             spread_points=targets.spread_points,
+            estimated_slippage=cfg.slippage_points_entry + cfg.slippage_points_exit,
             cost_pips=targets.cost_pips,
             cost_r=targets.cost_r,
             sl_pips=targets.sl_pips,

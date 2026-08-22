@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .logger import get_logger
+from .markets import get_market, is_supported
 
 LOGGER = get_logger("telegram")
 
@@ -179,6 +180,21 @@ class TelegramNotifier:
     # -- formatting --------------------------------------------------------- #
     PAPER_DISCLAIMER = "🔬 PAPER TEST ONLY"
 
+    def _view(self, symbol: str):
+        """Config folded onto ``symbol``'s market.
+
+        A card must be rendered with the digits, pip unit and icon of the
+        market the SIGNAL belongs to - not whichever market happens to be
+        selected in the control panel when the message is sent.
+        """
+        if symbol and is_supported(symbol):
+            return self.config.for_market(symbol)
+        return self.config
+
+    @staticmethod
+    def _icon(symbol: str) -> str:
+        return get_market(symbol).icon if symbol and is_supported(symbol) else "⚡"
+
     def format_signal(self, signal) -> str:
         """Render the M1 scalp card.
 
@@ -186,11 +202,13 @@ class TelegramNotifier:
         target is a few pips would be actively misleading - the spread is often
         a large fraction of the move.
         """
-        digits = self.config.digits
-        spread_price = signal.spread_points * self.config.point_value
+        view = self._view(signal.symbol)
+        digits = view.digits
+        unit = view.pip_name
+        spread_price = signal.spread_points * view.point_value
         lines = [
             DIVIDER,
-            f"⚡ {signal.symbol} M1 SCALP",
+            f"{self._icon(signal.symbol)} {signal.symbol} M1 SCALP",
             DIVIDER,
             "",
             f"Direction: {signal.direction}",
@@ -199,11 +217,11 @@ class TelegramNotifier:
             "",
             f"Entry: {signal.entry:.{digits}f}",
             "",
-            f"TP1: {signal.tp1:.{digits}f}   ({signal.tp_pips[0]:.1f}p)",
-            f"TP2: {signal.tp2:.{digits}f}   ({signal.tp_pips[1]:.1f}p)",
-            f"TP3: {signal.tp3:.{digits}f}   ({signal.tp_pips[2]:.1f}p)",
+            f"TP1: {signal.tp1:.{digits}f}   ({signal.tp_pips[0]:.1f}{unit})",
+            f"TP2: {signal.tp2:.{digits}f}   ({signal.tp_pips[1]:.1f}{unit})",
+            f"TP3: {signal.tp3:.{digits}f}   ({signal.tp_pips[2]:.1f}{unit})",
             "",
-            f"SL: {signal.stop_loss:.{digits}f}   ({signal.sl_pips:.1f}p)",
+            f"SL: {signal.stop_loss:.{digits}f}   ({signal.sl_pips:.1f}{unit})",
             "",
             "Expected holding period:",
             signal.expected_hold,
@@ -216,7 +234,7 @@ class TelegramNotifier:
             f"TP2 {signal.rr2:.2f}R",
             f"TP3 {signal.rr3:.2f}R",
             "",
-            f"After costs ({signal.cost_pips:.1f}p = {signal.cost_r:.2f}R):",
+            f"After costs ({signal.cost_pips:.1f}{unit} = {signal.cost_r:.2f}R):",
             f"TP1 {signal.net_rr1:.2f}R",
             f"TP2 {signal.net_rr2:.2f}R",
             f"TP3 {signal.net_rr3:.2f}R",
@@ -242,7 +260,8 @@ class TelegramNotifier:
                 "👀 NEAR SIGNAL",
                 DIVIDER,
                 "",
-                f"{evaluation.symbol} M1  ({direction} side)",
+                f"{self._icon(evaluation.symbol)} {evaluation.symbol} M1"
+                f"  ({direction} side)",
                 "",
                 f"Threshold: {evaluation.threshold:.0f}",
                 f"Bullish: {bullish:.0f}",
@@ -266,13 +285,14 @@ class TelegramNotifier:
         net_r: Optional[float] = None,
     ) -> str:
         """Render a TP/SL/timeout update for an existing signal."""
-        digits = self.config.digits
+        symbol = str(signal_row.get("symbol", ""))
+        digits = self._view(symbol).digits
         header = OUTCOME_ICONS.get(event, event)
         lines = [
             DIVIDER,
             f"{header}",
             DIVIDER,
-            f"{signal_row.get('symbol', '')} M1 {signal_row.get('direction', '')}"
+            f"{self._icon(symbol)} {symbol} M1 {signal_row.get('direction', '')}"
             f" @ {float(signal_row.get('entry', 0.0)):.{digits}f}",
             f"Level: {price:.{digits}f}",
         ]

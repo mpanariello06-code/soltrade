@@ -122,6 +122,12 @@ class Report:
     by_confidence: List[Stats] = field(default_factory=list)
     by_score_band: List[Stats] = field(default_factory=list)
     by_result: List[Stats] = field(default_factory=list)
+    by_hour: List[Stats] = field(default_factory=list)
+    by_market: List[Stats] = field(default_factory=list)
+    #: Which market this report covers, or "COMBINED".
+    symbol: str = ""
+    #: Rows in evaluations.csv - every candle looked at, signal or not.
+    total_evaluations: int = 0
 
     def best_regime(self) -> str:
         """Regime with the highest average NET R (at least one closed signal)."""
@@ -158,13 +164,14 @@ def merge_outcomes(signals: pd.DataFrame, outcomes: pd.DataFrame) -> pd.DataFram
         columns = [
             c for c in (
                 "signal_id", "session", "regime", "confidence", "direction",
-                "timeframe", "mode", "score", "threshold_used",
+                "timeframe", "mode", "score", "threshold_used", "symbol",
             )
             if c in signals.columns
         ]
         meta = signals[columns].drop_duplicates(subset=["signal_id"])
         merged = merged.merge(meta, on="signal_id", how="left", suffixes=("", "_signal"))
-        for column in ("session", "regime", "confidence", "direction", "mode", "timeframe", "score"):
+        for column in ("session", "regime", "confidence", "direction", "mode",
+                   "timeframe", "score", "symbol"):
             fallback = f"{column}_signal"
             if fallback in merged.columns:
                 merged[column] = merged[column].where(
@@ -312,6 +319,22 @@ def _score_band_stats(frame: pd.DataFrame) -> List[Stats]:
     return groups
 
 
+def _hour_stats(frame: pd.DataFrame) -> List[Stats]:
+    """Statistics per UTC hour of the signal timestamp.
+
+    Especially relevant for a 24/7 market, where "session" is a weaker idea than
+    it is for gold but the hour of day still carries liquidity structure.
+    """
+    if frame.empty or "signal_time" not in frame.columns:
+        return []
+    times = pd.to_datetime(frame["signal_time"], errors="coerce", utc=True)
+    hours = times.dt.hour
+    groups: List[Stats] = []
+    for hour, subset in frame.groupby(hours.astype("Int64"), dropna=True):
+        groups.append(compute_stats(subset, label=f"{int(hour):02d}:00"))
+    return sorted(groups, key=lambda s: s.label)
+
+
 def build_report(signals: pd.DataFrame, outcomes: pd.DataFrame, config=None) -> Report:
     """Assemble the full report from the two CSVs."""
     report = Report()
@@ -339,6 +362,11 @@ def build_report(signals: pd.DataFrame, outcomes: pd.DataFrame, config=None) -> 
     report.by_confidence = _confidence_stats(merged, config)
     report.by_score_band = _score_band_stats(merged)
     report.by_result = _group_stats(merged, "result")
+    report.by_hour = _hour_stats(merged)
+    report.by_market = _group_stats(merged, "symbol")
+    if not signals.empty and "symbol" in signals.columns:
+        symbols = sorted(set(signals["symbol"].astype(str)) - {""})
+        report.symbol = symbols[0] if len(symbols) == 1 else "COMBINED"
     return report
 
 
@@ -369,8 +397,10 @@ def render_report(report: Report) -> str:
     raw_pf = "inf" if overall.profit_factor == float("inf") else f"{overall.profit_factor:.2f}"
     lines = [
         "=" * 76,
-        "XAUUSD M1 SCALPER - PAPER PERFORMANCE",
+        f"{report.symbol or 'M1'} SCALPER - PAPER PERFORMANCE",
         "=" * 76,
+        f"Market             : {report.symbol or '-'}   timeframe M1   mode SCALPING",
+        f"Total evaluations  : {report.total_evaluations}",
         f"Total signals      : {report.total_signals}",
         f"  BUY / SELL       : {report.buy_signals} / {report.sell_signals}",
         f"  still open       : {report.active_signals}",
@@ -402,6 +432,12 @@ def render_report(report: Report) -> str:
         f"Median mins to TP1 : {overall.median_minutes_to_tp1:.1f}",
         f"Average MFE / MAE  : {overall.average_mfe_r:+.2f}R / {overall.average_mae_r:+.2f}R",
         "",
+        "--- BY MARKET " + "-" * 60,
+        _table([s.as_row() for s in report.by_market]),
+        "",
+        "--- BY UTC HOUR " + "-" * 58,
+        _table([s.as_row() for s in report.by_hour]),
+        "",
         "--- BY SCORE BAND " + "-" * 56,
         "  Does a higher score actually mean a better outcome?  Measure, do not assume.",
         _table([s.as_row() for s in report.by_score_band]),
@@ -428,24 +464,116 @@ def render_report(report: Report) -> str:
     return "\n".join(lines)
 
 
-def analyse(signals_path: Path, outcomes_path: Path, config=None) -> Report:
-    """Load both CSVs and build the report."""
-    return build_report(load_frame(signals_path), load_frame(outcomes_path), config)
+def count_rows(path: Path) -> int:
+    """Number of data rows in a CSV, without loading it into memory.
+
+    ``evaluations.csv`` is the large file - one row per M1 candle - and the
+    report only needs its length.
+    """
+    path = Path(path)
+    if not path.exists():
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return max(sum(1 for _ in handle) - 1, 0)
+    except OSError:
+        return 0
+
+
+def analyse(
+    signals_path: Path,
+    outcomes_path: Path,
+    config=None,
+    evaluations_path: Optional[Path] = None,
+) -> Report:
+    """Load one market's CSVs and build its report."""
+    report = build_report(load_frame(signals_path), load_frame(outcomes_path), config)
+    if evaluations_path is None and config is not None:
+        evaluations_path = getattr(config, "evaluations_csv", None)
+    if evaluations_path is not None:
+        report.total_evaluations = count_rows(evaluations_path)
+    if not report.symbol and config is not None:
+        report.symbol = getattr(config, "symbol", "")
+    return report
+
+
+def analyse_combined(config, symbols: Sequence[str]) -> Report:
+    """Merge several markets into one clearly-labelled report.
+
+    Combining markets is offered because it is sometimes useful, not because it
+    is meaningful by default: an R on gold and an R on Bitcoin are the same unit
+    but come from very different cost and volatility regimes.  The per-market
+    reports are the ones to trust.
+    """
+    signal_frames, outcome_frames = [], []
+    evaluations = 0
+    for symbol in symbols:
+        view = config.for_market(symbol)
+        signals = load_frame(view.signals_csv)
+        outcomes = load_frame(view.outcomes_csv)
+        if not signals.empty:
+            signals = signals.copy()
+            signals["symbol"] = symbol
+            signal_frames.append(signals)
+        if not outcomes.empty:
+            outcomes = outcomes.copy()
+            outcomes["symbol"] = symbol
+            outcome_frames.append(outcomes)
+        evaluations += count_rows(view.evaluations_csv)
+
+    merged_signals = pd.concat(signal_frames, ignore_index=True) if signal_frames else pd.DataFrame()
+    merged_outcomes = pd.concat(outcome_frames, ignore_index=True) if outcome_frames else pd.DataFrame()
+    report = build_report(merged_signals, merged_outcomes, config)
+    report.total_evaluations = evaluations
+    report.symbol = "COMBINED"
+    return report
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
+    from src.markets import MARKET_ORDER
+
     config = load_config()
-    parser = argparse.ArgumentParser(description="XAUUSD M1 scalper performance report")
-    parser.add_argument("--signals", type=Path, default=config.signals_csv)
-    parser.add_argument("--outcomes", type=Path, default=config.outcomes_csv)
+    parser = argparse.ArgumentParser(description="M1 scalper performance report")
+    parser.add_argument(
+        "--symbol", type=str, default=None,
+        help=f"market to report on ({', '.join(MARKET_ORDER)}); omit for every market",
+    )
+    parser.add_argument(
+        "--combined", action="store_true",
+        help="also print a single merged report across markets",
+    )
+    parser.add_argument("--signals", type=Path, default=None)
+    parser.add_argument("--outcomes", type=Path, default=None)
     args = parser.parse_args(argv)
 
-    report = analyse(args.signals, args.outcomes, config)
-    if report.total_signals == 0:
-        print("No signals recorded yet - run main.py or backtest.py first.")
+    # Explicit paths win, for ad-hoc analysis of a backtest's output.
+    if args.signals or args.outcomes:
+        view = config.for_market(args.symbol or config.symbol)
+        report = analyse(args.signals or view.signals_csv, args.outcomes or view.outcomes_csv, view)
+        print(render_report(report))
         return 0
-    print(render_report(report))
+
+    symbols = [args.symbol.upper()] if args.symbol else list(MARKET_ORDER)
+    printed = False
+    for symbol in symbols:
+        view = config.for_market(symbol)
+        report = analyse(view.signals_csv, view.outcomes_csv, view)
+        if report.total_signals == 0 and report.total_evaluations == 0:
+            print(f"{symbol}: no data yet - run main.py or backtest.py first.\n")
+            continue
+        print(render_report(report))
+        print()
+        printed = True
+
+    if args.combined and len(symbols) > 1:
+        combined = analyse_combined(config, symbols)
+        if combined.total_signals:
+            print(render_report(combined))
+            printed = True
+
+    if not printed:
+        print("No signals recorded yet.")
     return 0
 
 

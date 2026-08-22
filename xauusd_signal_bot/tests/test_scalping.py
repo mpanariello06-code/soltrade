@@ -19,7 +19,7 @@ from src.signal_tracker import (
 )
 from src.targets import build_targets, compute_stop_loss, compute_target_distances
 from src.timeframes import MODE_SCALPING, SIGNAL_TIMEFRAME, expected_hold_label
-from tests.conftest import make_bars, make_candles, make_ticks
+from tests.conftest import isolate, make_bars, make_candles, make_ticks
 
 SIGNAL = {
     "signal_id": "s1",
@@ -342,12 +342,15 @@ def test_no_signal_stays_active_beyond_the_holding_window(config):
 
 
 def test_timeout_is_configurable_from_the_runtime(config, tmp_path):
-    config.state_file = tmp_path / "state.json"
+    config = isolate(config, tmp_path)
     runtime = RuntimeState.load(config)
-    runtime.set_max_holding(30)
+    runtime.active.set_max_holding(30)
     assert effective_config(config, runtime).max_holding_candles == 30
-    restored = RuntimeState.load(config, JsonStateStore(config.state_file))
+    restored = RuntimeState.load(config, JsonStateStore(config.global_state_file))
     assert restored.describe()["max_holding_candles"] == 30
+    assert restored.market("BTCUSD").max_holding_candles is None, (
+        "changing gold's holding time must not touch Bitcoin's"
+    )
 
 
 # --------------------------------------------------------------------------- #

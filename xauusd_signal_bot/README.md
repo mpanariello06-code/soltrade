@@ -1,10 +1,12 @@
-# XAUUSD M1 Micro-Scalping Research System
+# XAUUSD + BTCUSD M1 Micro-Scalping Research System
 
-A standalone, deterministic **signal-only** system for XAUUSD on the M1
-timeframe.
+A standalone, deterministic **signal-only** system running one M1 micro-scalping
+engine over two markets: **XAUUSD** and **BTCUSD**.
 
 ```
-MT5 M1 market data
+MT5 M1 market data (per market)
+      ↓
+market configuration (XAUUSD | BTCUSD) folded onto the shared engine
       ↓
 M1 microstructure analysis (momentum, displacement, sweeps, immediate S/R)
       ↓
@@ -30,34 +32,40 @@ outcome tracking with timeout, milestone timing, RAW **and NET** R
 > See [Honest assessment](#honest-assessment). Reading only the RAW numbers
 > would be actively misleading at this timescale.
 
-**One timeframe (M1). One mode (SCALPING).** The multi-timeframe selector and
-the RESEARCH/STANDARD/CONSERVATIVE modes were removed.
+**One timeframe (M1). One mode (SCALPING). Two markets.** The multi-timeframe
+selector and the RESEARCH/STANDARD/CONSERVATIVE modes were removed.
+
+> **BTCUSD's parameters are INITIAL RESEARCH PARAMETERS.**
+> They were chosen from the arithmetic of price scale and typical cost, not
+> from a backtest. They are not optimised, not validated and **not claimed to
+> be profitable**. See [Markets](#markets).
 
 ## Table of contents
 
 1. [Quick start (Windows)](#quick-start-windows)
-2. [Project layout](#project-layout)
-3. [What "scalping" means here](#what-scalping-means-here)
-4. [The cost model](#the-cost-model)
-5. [Targets](#targets)
-6. [Telegram control panel](#telegram-control-panel)
-7. [How the signal engine works](#how-the-signal-engine-works)
-8. [Scoring](#scoring)
-9. [Filtering](#filtering)
-10. [Near-signal diagnostic](#near-signal-diagnostic)
-11. [Telegram messages](#telegram-messages)
-12. [Where data is stored](#where-data-is-stored)
-13. [Outcome tracking, timeout and the R model](#outcome-tracking-timeout-and-the-r-model)
-14. [Backtesting](#backtesting)
-15. [Walk-forward testing](#walk-forward-testing)
-16. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
-17. [Calibration](#calibration)
-18. [Timezones](#timezones)
-19. [Anti-lookahead guarantees](#anti-lookahead-guarantees)
-20. [Tests](#tests)
-21. [Honest assessment](#honest-assessment)
-22. [Known limitations](#known-limitations)
-23. [Recommended next steps](#recommended-next-steps)
+2. [Markets](#markets)
+3. [Project layout](#project-layout)
+4. [What "scalping" means here](#what-scalping-means-here)
+5. [The cost model](#the-cost-model)
+6. [Targets](#targets)
+7. [Telegram control panel](#telegram-control-panel)
+8. [How the signal engine works](#how-the-signal-engine-works)
+9. [Scoring](#scoring)
+10. [Filtering](#filtering)
+11. [Near-signal diagnostic](#near-signal-diagnostic)
+12. [Telegram messages](#telegram-messages)
+13. [Where data is stored](#where-data-is-stored)
+14. [Outcome tracking, timeout and the R model](#outcome-tracking-timeout-and-the-r-model)
+15. [Backtesting](#backtesting)
+16. [Walk-forward testing](#walk-forward-testing)
+17. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
+18. [Calibration](#calibration)
+19. [Timezones](#timezones)
+20. [Anti-lookahead guarantees](#anti-lookahead-guarantees)
+21. [Tests](#tests)
+22. [Honest assessment](#honest-assessment)
+23. [Known limitations](#known-limitations)
+24. [Recommended next steps](#recommended-next-steps)
 
 ---
 
@@ -155,6 +163,95 @@ python backtest.py --data history/XAUUSD_M5.csv
 
 ---
 
+## Markets
+
+Two markets, **one engine**. `ScalpingEngine → MarketConfig → XAUUSD | BTCUSD`.
+Nothing in `src/` is duplicated per market: `src/markets.py` holds one
+`MarketConfig` per instrument, and `Config.for_market(symbol)` folds it onto the
+base configuration to produce the view the engine runs on.
+
+```
+config.Config                       base settings from .env
+        │
+        ├── for_market("XAUUSD") ──► view: gold's scale, costs, targets, paths
+        └── for_market("BTCUSD") ──► view: BTC's  scale, costs, targets, paths
+                                             │
+                       effective_config() ───┴─► + that market's live
+                                                  Telegram settings
+```
+
+### What differs, and why
+
+| | XAUUSD | BTCUSD |
+|---|---|---|
+| Icon | 🥇 | ₿ |
+| Trading hours | Sun 22:00 – Fri 21:00 UTC | 24/7 |
+| Session filter | applied | **bypassed** (label still recorded) |
+| Quote digits | 2 | 2 |
+| 1 point | 0.01 | 0.01 |
+| 1 "pip" | 0.10 (`p`) | 1.00 (`$`) |
+| Base threshold | 68 | 68 *(initial, for comparability)* |
+| TP ladder | 0.45 / 1.00 / 1.70 × ATR | **same** |
+| TP floors | 1.0 / 1.8 / 3.0 pips | 0.020% / 0.036% / 0.060% of price |
+| TP3 ceiling | 12 pips | 0.240% of price |
+| Stop | 0.70 × ATR, clamped 0.50–0.80 | **same** |
+| Assumed spread | 20 points (2 pips) | 1 000 points ($10) |
+| Assumed slippage | 2 + 2 points | 200 + 200 points ($2/side) |
+| Cost model name | `XAUUSD_RETAIL` | `BTC_RETAIL_CFD` |
+| Spread rejection | > 35 points | > 4 000 points ($40) |
+| Cooldown | 10 candles | 10 candles *(initial)* |
+| Timeout | 15 candles | 15 candles *(initial)* |
+| Data directory | `data/xauusd/` | `data/btcusd/` |
+
+**The target model transfers; the floors do not.** Every distance is already a
+multiple of the live M1 ATR, so it self-scales: a market that moves more per
+minute automatically gets a wider target. What does *not* transfer is the
+absolute floor underneath it. "At least 1.8 pips" is a sensible tick-grid floor
+on gold at \$2 300 and a meaningless one on Bitcoin at \$60 000, so BTCUSD's
+floors are expressed as a **fraction of price** instead. Gold's percentage
+floors are set to zero, which leaves its pip floors in sole control and its
+behaviour byte-for-byte unchanged.
+
+### BTCUSD parameters are INITIAL RESEARCH PARAMETERS
+
+Read this before drawing any conclusion from a BTCUSD run:
+
+* They were derived from **arithmetic, not from a backtest** — price scale,
+  plausible retail CFD spread, and the requirement that a target clear its own
+  cost. No optimisation was performed, on any data.
+* The spread and slippage figures are **assumptions about a venue we have not
+  measured**. A retail crypto CFD, a spot exchange and a perpetual-futures
+  venue have materially different cost structures. `src/markets.py` also ships
+  `BTCUSD_EXCHANGE_COSTS`, a commented alternative for a maker/taker exchange.
+* The threshold starts at gold's 68 **only so the two markets are comparable**
+  on the first run. It is not a calibrated value for Bitcoin.
+* Nothing here is claimed to be profitable. **Re-derive every number from your
+  own venue's data** before trusting it.
+
+### Retuning a market
+
+Each market's values live in `src/markets.py`, beside the reasoning for them.
+For per-install changes, `.env` overrides are namespaced by symbol, so no
+variable can move both markets at once:
+
+```dotenv
+BTCUSD_THRESHOLD=72
+BTCUSD_ASSUMED_SPREAD_POINTS=1500
+XAUUSD_COOLDOWN_CANDLES=15
+# brokers that rename an instrument:
+BTCUSD_BROKER_SYMBOL=BTCUSD.x
+```
+
+The legacy unprefixed names (`SCALP_THRESHOLD`, `ASSUMED_SPREAD_POINTS`, …)
+still work and apply to **XAUUSD only** — Bitcoin never inherits them.
+
+### Adding a third market
+
+Append one `MarketConfig` and call `register_market()`. No engine, tracker,
+report or Telegram change is required; `tests/test_markets.py` asserts this.
+
+---
+
 ## Project layout
 
 ```
@@ -169,11 +266,14 @@ xauusd_signal_bot/
 ├── .env.example
 ├── run.bat                  Windows launcher
 ├── data/                    created on first run
-│   ├── signals.csv          one row per signal, status updated in place
-│   ├── evaluations.csv      one row per evaluated candle (signal or not)
-│   ├── outcomes.csv         one row per closed signal
+│   ├── state.json           GLOBAL: run status, active market
 │   ├── system_log.txt       rotating log
-│   └── state.json           last processed candle, last signal
+│   ├── xauusd/              gold's data - never mixed with Bitcoin's
+│   │   ├── signals.csv      one row per signal, status updated in place
+│   │   ├── evaluations.csv  one row per evaluated candle (signal or not)
+│   │   ├── outcomes.csv     one row per closed signal
+│   │   └── state.json       gold's settings + last processed M1 candle
+│   └── btcusd/              same five files, Bitcoin's own
 ├── src/
 │   ├── market_data.py       MT5 access (READ-ONLY), validation, ticks, resampling
 │   ├── indicators.py        EMA/RSI/MACD/ATR/ADX/Stoch/BB/swings
@@ -186,8 +286,9 @@ xauusd_signal_bot/
 │   ├── volatility.py        ATR regime (0-5, direction-neutral)
 │   ├── price_action.py      candle confirmation (0-5)
 │   ├── regime.py            market-regime classifier
+│   ├── markets.py           MarketConfig per instrument (XAUUSD, BTCUSD)
 │   ├── timeframes.py        M1 / SCALPING constants
-│   ├── runtime_state.py     live-editable settings, persisted to state.json
+│   ├── runtime_state.py     global state + one MarketRuntime per market
 │   ├── telegram_control.py  inline-button control panel
 │   ├── scoring.py           weighted aggregation → 0-100
 │   ├── filters.py           thresholds and rejection rules
@@ -299,12 +400,13 @@ Send `/panel` (or `/start`) to your bot. Buttons are the interface.
 
 ```
 ━━━━━━━━━━━━━━━━━━
-⚡ XAUUSD SCALPER
+⚡ M1 SCALPER
 ━━━━━━━━━━━━━━━━━━
 
-Status: 🟢 RUNNING
-Mode: SCALPING
+Market: 🥇 XAUUSD
 Timeframe: M1
+Mode: SCALPING
+Status: 🟢 RUNNING
 Threshold: 68
 
 Signals today: 4
@@ -314,28 +416,61 @@ Paper Net R: -2.30
 Max hold: 15 min
 MT5: CONNECTED
 
-[▶️ START] [⏸ PAUSE]
+Also tracking: ₿ BTCUSD 1 open
+
+━━━━━━━━━━━━━━━━━━
+🔬 PAPER TEST ONLY - no orders are placed.
+
+[● 🥇 XAUUSD] [○ ₿ BTCUSD]
 [📊 CURRENT ANALYSIS]
 [📈 PERFORMANCE]
+[⏸ PAUSE]
 [⚙️ SETTINGS]
 [🔄 REFRESH]
 ```
 
-No mode buttons and no timeframe buttons — there is nothing to switch. Every
-press takes effect in the running process and is persisted to `data/state.json`.
+The market row is first, the selected market is marked `●`, and the active
+market is named on the panel, the analysis view, the settings menu and the
+performance header — so it is never ambiguous which market a button will act on.
+Every press takes effect in the running process and is persisted.
 
 | Control | Effect |
 |---|---|
-| START / PAUSE | PAUSE keeps MT5 connected and keeps tracking open scalps, but generates none. STOP lives in Settings so it cannot be hit by accident. |
-| 📊 CURRENT ANALYSIS | The latest evaluation on demand, from closed M1 candles only. Read-only: records nothing, cannot emit or suppress a signal. |
-| 📈 PERFORMANCE | From the CSVs, with BY SCORE / BY REGIME / BY SESSION / BY OUTCOME views. NET R leads. |
-| ⚙️ SETTINGS | Threshold, max holding period, cooldown, minimum R:R, session filter, near-signal alerts, STOP. |
+| 🥇 XAUUSD / ₿ BTCUSD | Selects which market generates signals. **A selection, not a reset** — see below. |
+| START / PAUSE | One toggle showing the action that is available. PAUSE keeps MT5 connected and keeps tracking open scalps on **both** markets, but generates none. STOP lives in Settings so it cannot be hit by accident. |
+| 📊 CURRENT ANALYSIS | The latest evaluation for the **selected** market, on demand, from closed M1 candles only. Read-only: records nothing, cannot emit or suppress a signal. |
+| 📈 PERFORMANCE | Per market by default, never merged. `[● 🥇 XAUUSD] [○ ₿ BTCUSD] [○ 📊 COMBINED]`, then BY SCORE / BY REGIME / BY HOUR / BY SESSION / BY OUTCOME. NET R leads. |
+| ⚙️ SETTINGS | Headed `⚙️ XAUUSD SETTINGS` or `⚙️ BTCUSD SETTINGS`. Threshold, max holding period, cooldown, minimum R:R, session filter, near-signal alerts, STOP. **Applies to the active market only.** |
+
+### Switching markets is safe
+
+Switching changes *which market is evaluated* and nothing else. It does not
+reset, clear or overwrite anything belonging to the market being left:
+
+* its `signals.csv`, `evaluations.csv`, `outcomes.csv` and `state.json` are
+  untouched;
+* its threshold, cooldown, holding time and session settings are untouched;
+* its processed-candle marker is untouched, so nothing is re-evaluated or
+  skipped when you switch back;
+* **its open paper trades keep being tracked, against its own candles**, on
+  every subsequent cycle. An open XAUUSD scalp still reaches its TP, its SL or
+  its timeout after you switch to BTCUSD, and vice versa.
+
+`tests/test_markets.py` asserts each of these, including a live-loop test that
+records the price range of every frame handed to each market's tracker and fails
+if one ever receives the other's.
+
+`COMBINED` performance is offered but opt-in and labelled: an R on gold and an R
+on Bitcoin share a unit but come from different cost and volatility regimes.
 
 **Safety.** Updates from any chat other than `TELEGRAM_CHAT_ID` are ignored.
 Only the settings in `Config.telegram_editable_settings` are reachable —
-credentials, the bot token, the symbol and all file paths have no handler and
-are never rendered into a message. On startup the poller discards updates
-queued while the engine was down, so a restart never replays stale presses.
+credentials, the bot token, broker symbols and all file paths have no handler
+and are never rendered into a message. On startup the poller discards updates
+queued while the engine was down, so a restart never replays stale presses (the
+active market *is* restored; the button press that set it is not replayed).
+No button on any panel can place, modify or close an order — there is no such
+code path in the project.
 
 ---
 
@@ -494,13 +629,32 @@ Plain files under `data/`, created automatically with headers, appended safely,
 UTF-8, and rewritten atomically (temp file + replace) so a crash cannot truncate
 them. No database.
 
-| File | Contents |
+**Every market gets its own directory.** No CSV ever holds rows from more than
+one market, and every row is self-identifying (`symbol`, `timeframe`,
+`timestamp`) so a file can still be checked, joined or merged deliberately:
+
+```
+data/
+├── state.json          GLOBAL - run status, active_market
+├── system_log.txt
+├── xauusd/  signals.csv  evaluations.csv  outcomes.csv  state.json
+└── btcusd/  signals.csv  evaluations.csv  outcomes.csv  state.json
+```
+
+Each `state.json` has exactly **one writer**. The global file is written only by
+`RuntimeState`; each market file is written only by that market's
+`MarketRuntime`, whose store the market's `SignalTracker` shares rather than
+opening a second handle. That single-writer rule is what stops two components
+clobbering each other's keys, and it is covered by a test.
+
+| File (per market) | Contents |
 |---|---|
-| `signals.csv` | One row per scalp; `status` updated in place. Carries the full geometry and cost at signal time: `spread_points`, `cost_pips`, `cost_r`, `sl_pips`, `tp1/2/3_pips`, `atr`, `rr1-3`, `net_rr1-3`, `expected_hold` |
+| `signals.csv` | One row per scalp; `status` updated in place. Carries `symbol`, `timeframe`, `timestamp`, direction, entry, TP1-3, SL, score, bullish/bearish score, threshold used, regime, session, and the full geometry and cost at signal time: `spread_points`, `estimated_slippage`, `cost_pips`, `cost_r`, `sl_pips`, `tp1/2/3_pips`, `atr`, `rr1-3`, `net_rr1-3`, `expected_hold` |
 | `evaluations.csv` | **Every** evaluated M1 candle: all nine sub-scores, regime, spread, decision (`BUY`/`SELL`/`NO_SIGNAL`/`NEAR_SIGNAL`), rejection reason, threshold used, near-signal flag, plus **41** raw `f_*` feature columns including the M1 microstructure block (`atr_pips`, `spread_pips`, `cost_pips`, `atr_to_cost`, `velocity_pips_per_min`, `acceleration`, `micro_range_pips_5/15`, `dist_to_high/low_5_pips`, `close_location`, `minute_of_hour`, `hour_of_day`) |
-| `outcomes.csv` | One row per closed scalp: result (incl. `TIMEOUT`), exit level, **`raw_r` and `net_r`**, `cost_r`, `spread_points`, `minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_price`/`mae_price`, `mfe_pips`/`mae_pips`, `timeout`, `ambiguous_bars` |
-| `system_log.txt` | Rotating log (5 MB × 3) |
-| `state.json` | `last_processed_candles` (the M1 marker), `last_signal_id`, `last_signal_time`, and a `runtime` section holding the live Telegram-controlled settings |
+| `outcomes.csv` | One row per closed scalp: `symbol`, result (incl. `TIMEOUT`), exit level, **`raw_r` and `net_r`**, `cost_r`, `spread_points`, `estimated_slippage`, `minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_price`/`mae_price`, `mfe_pips`/`mae_pips`, `timeout`, `ambiguous_bars`, holding time |
+| `<market>/state.json` | `last_processed_candles` (that market's M1 marker), `last_signal_id`, `last_signal_time`, and a `runtime` section holding that market's live Telegram-controlled settings |
+| `state.json` *(global)* | Run status (`RUNNING`/`PAUSED`/`STOPPED`), `active_market`, near-signal alert flag |
+| `system_log.txt` | Rotating log (5 MB × 3), shared |
 
 `signals.csv` is deliberately small (a handful of rows per day) so it can be held
 in memory and rewritten on status changes. `evaluations.csv` is the large one and
@@ -527,6 +681,12 @@ labelled outcome (`net_r`, `minutes_to_tp1`, `timeout`) are both already stored.
 
 V1 deliberately contains **no** machine learning: it is transparent and
 deterministic, and the same inputs always give the same outputs.
+
+Because each market's features and labels are stored separately but in an
+identical schema, either shape of future model is possible without migrating
+anything: **one model per market** (train on `data/btcusd/`) or **one shared
+model with the market as a feature** (concatenate both directories — every row
+already carries its `symbol`).
 
 ---
 
@@ -573,10 +733,17 @@ whether: `minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_r`/`mae_r`,
 Feed a CSV of **M1** candles; the M5 context is resampled from the same file.
 
 ```bash
-python backtest.py --data history/XAUUSD_M1.csv
-python backtest.py --data history/XAUUSD_M1.csv --spread 6      # raw/ECN account
+python backtest.py --data history/XAUUSD_M1.csv                   # default: XAUUSD
+python backtest.py --symbol BTCUSD --data history/BTCUSD_M1.csv
+python backtest.py --data history/XAUUSD_M1.csv --spread 6        # raw/ECN account
 python backtest.py --data history/XAUUSD_M1.csv --start 2024-01-01 --end 2024-01-31
 ```
+
+`--symbol` selects which `MarketConfig` is folded onto the engine — **the same
+engine runs both markets**. Output goes to that market's own directory
+(`data/xauusd/backtest_*.csv`, `data/btcusd/backtest_*.csv`), so two runs can
+never contaminate each other's results. The header of every run states the
+market, its cost model and, for BTCUSD, the research-parameters warning.
 
 Required columns: `time, open, high, low, close, tick_volume`
 (`date`/`datetime`/`timestamp` and `volume`/`vol` are accepted as aliases).
@@ -589,14 +756,18 @@ pessimistically — the backtest is the conservative one.
 Warm-up is about 1,000 M1 candles (the M5 context needs 150 closed candles).
 Expect roughly 50 bars/second; a day of M1 data is ~1,440 bars.
 
-`python make_synthetic_history.py` generates an M1 file for smoke-testing the
-plumbing. It is **not** real data.
+`python make_synthetic_history.py [--symbol BTCUSD]` generates an M1 file for
+smoke-testing the plumbing. It is **not** real data — and the BTCUSD profile in
+particular is a plausible-looking guess at crypto M1 behaviour, not a
+calibration. **No result computed on it is evidence of an edge on either
+market.**
 
 ## Walk-forward testing
 
 ```bash
-python walkforward.py --data history/XAUUSD_M5.csv
-python walkforward.py --data history/XAUUSD_M5.csv --split 0.5 0.25 0.25
+python walkforward.py --data history/XAUUSD_M1.csv
+python walkforward.py --symbol BTCUSD --data history/BTCUSD_M1.csv
+python walkforward.py --data history/XAUUSD_M1.csv --split 0.5 0.25 0.25
 ```
 
 Splits the history chronologically into IN_SAMPLE / VALIDATION / OUT_OF_SAMPLE
@@ -741,15 +912,42 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-216 tests covering indicator correctness and causality, no-repaint swings,
+262 tests covering indicator correctness and causality, no-repaint swings,
 score aggregation and weight renormalisation, the adaptive threshold, bull/bear
 separation, the spread and **net** R:R gates, the cost model, target geometry
-(ATR scaling, pip floors, cost floors, proportional lifting, ordering, exact
-rounded pricing), timeout behaviour, milestone timing and excursions,
-pessimistic and tick-resolved ambiguous candles, the full signal lifecycle,
-CSV creation/append/schema-change handling, `state.json` round-trip and
-corruption tolerance, Telegram formatting and every panel control, duplicate
+(ATR scaling, pip floors, percentage floors, cost floors, proportional lifting,
+ordering, exact rounded pricing), timeout behaviour, milestone timing and
+excursions, pessimistic and tick-resolved ambiguous candles, the full signal
+lifecycle, CSV creation/append/schema-change handling, `state.json` round-trip
+and corruption tolerance, Telegram formatting and every panel control, duplicate
 prevention, restart safety, and the backtester's no-lookahead guarantees.
+
+`tests/test_markets.py` (46 tests) covers the two-market behaviour specifically:
+
+* the registry, symbol normalisation, and adding a third market without an
+  engine change;
+* that XAUUSD's shipped parameters are still the single-market build's values;
+* that BTCUSD copies none of gold's absolute distances, and that its percentage
+  floors scale with price while gold's pip floors do not;
+* that the two markets produce different target distances and different costs
+  from the same ATR ladder;
+* that BTCUSD is never blocked by the session filter while its session label is
+  still recorded, and that gold's session filter still works;
+* **state isolation** — a threshold, cooldown, holding-time, R:R, session or
+  processed-candle change on one market provably does not touch the other, and
+  survives a restart per market;
+* **file isolation** — separate directories, disjoint signal ids, and a gold
+  signal that never appears in Bitcoin's files;
+* **cooldown isolation** — a gold signal does not put Bitcoin on cooldown;
+* **tracking isolation** — a live-loop test that records the price range of
+  every frame handed to each market's tracker and fails if one ever receives the
+  other's;
+* **switch safety** — switching markets three times leaves the other market's
+  full state, marker and open trades identical, and an open gold trade keeps
+  being tracked after switching to Bitcoin;
+* Telegram routing, per-market settings, threshold bounds on both markets,
+  per-market analysis, per-market (not merged) performance, and that no button
+  on any panel maps to an order.
 
 Runtime is about 100 seconds.
 
@@ -806,8 +1004,21 @@ judge on NET expectancy over a few hundred scalps.
 * **Backtests cannot use ticks**, so every ambiguous candle is scored as a stop.
   Live tracking replays ticks and will differ — **live and backtested outcomes
   are not directly comparable**.
-* **Slippage is an assumption, not a measurement.** The defaults (2+2 points)
-  are plausible for liquid hours and optimistic around news.
+* **Slippage is an assumption, not a measurement.** Gold's default (2+2 points)
+  is plausible for liquid hours and optimistic around news. **Bitcoin's
+  (200+200 points = $2/side) has not been measured at all** — it is an initial
+  research figure.
+* **BTCUSD has not been backtested on real data, or calibrated on any data.**
+  Its threshold, cooldown, holding window, spread and slippage are starting
+  points, not findings. Treat any BTCUSD number this system produces as a test
+  of the plumbing until you have re-derived them from your own venue.
+* **Only the selected market generates signals.** That is deliberate (it keeps
+  alert volume and MT5 load bounded), but it means the two markets are not
+  evaluated in parallel by default. `EVALUATE_ALL_MARKETS=true` lifts this for
+  research runs; open trades on *both* markets are always tracked regardless.
+* **R is not comparable across markets.** Gold R and Bitcoin R share a unit but
+  come from different cost and volatility regimes. The COMBINED performance view
+  exists, is opt-in, and says so on the panel.
 * **The cost model deducts cost once per trade**, not per partial. With three
   partials the true cost is somewhat higher, so NET R here is mildly optimistic.
 * **Tick fetching adds MT5 load.** The buffer is incremental (about a minute of

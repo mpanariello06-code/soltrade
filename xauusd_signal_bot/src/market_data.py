@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .markets import MARKET_ORDER, get_market
 from .timeframes import SIGNAL_TIMEFRAME
 from .utils import (
     BoundedCache,
@@ -322,10 +323,19 @@ class MarketData:
                 self.connected = False
                 return False
 
-            with _MT5_LOCK:
-                selected = mt5.symbol_select(self.config.symbol, True)
-            if not selected:
-                LOGGER.error("Symbol '%s' is unavailable on this account", self.config.symbol)
+            # Every configured market has to be selectable, not just the one
+            # currently active: an open paper trade on the other market keeps
+            # being tracked and therefore keeps needing its candles.
+            available = []
+            for market_symbol in MARKET_ORDER:
+                feed = self.feed_symbol(market_symbol)
+                with _MT5_LOCK:
+                    selected = mt5.symbol_select(feed, True)
+                if selected:
+                    available.append(feed)
+                else:
+                    LOGGER.error("Symbol '%s' is unavailable on this account", feed)
+            if not available:
                 with _MT5_LOCK:
                     mt5.shutdown()
                 self.connected = False
@@ -334,9 +344,9 @@ class MarketData:
             with _MT5_LOCK:
                 info = mt5.terminal_info()
             LOGGER.info(
-                "MT5 connected (terminal=%s, symbol=%s)",
+                "MT5 connected (terminal=%s, symbols=%s)",
                 getattr(info, "name", "unknown"),
-                self.config.symbol,
+                ", ".join(available),
             )
             self.connected = True
             self._reconnect_backoff = 5.0
@@ -382,6 +392,19 @@ class MarketData:
             LOGGER.info("MT5 connection closed")
 
     # -- data ------------------------------------------------------------- #
+    @staticmethod
+    def feed_symbol(symbol: str) -> str:
+        """Translate a canonical market symbol into the broker's own name.
+
+        Every internal record, file and menu uses the canonical symbol; only
+        the MT5 boundary sees ``XAUUSD.m`` or ``BTCUSD.x``.  An unknown symbol
+        is passed through untouched so nothing here can mask a typo.
+        """
+        try:
+            return get_market(symbol).feed_symbol()
+        except KeyError:
+            return symbol
+
     def get_candles(
         self,
         symbol: str,
@@ -412,7 +435,7 @@ class MarketData:
             # +1 because the forming candle is discarded below.
             with _MT5_LOCK:
                 rates = mt5.copy_rates_from_pos(
-                    symbol, _mt5_timeframe(timeframe), 0, int(count) + 1
+                    self.feed_symbol(symbol), _mt5_timeframe(timeframe), 0, int(count) + 1
                 )
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("copy_rates_from_pos failed for %s %s: %s", symbol, timeframe, exc)
@@ -451,7 +474,7 @@ class MarketData:
             return None
         try:
             with _MT5_LOCK:
-                tick = mt5.symbol_info_tick(symbol)
+                tick = mt5.symbol_info_tick(self.feed_symbol(symbol))
             if tick is None:
                 return None
             bid, ask = float(tick.bid), float(tick.ask)
@@ -467,14 +490,15 @@ class MarketData:
         if not self.ensure_connection():
             return float("nan")
         try:
+            feed = self.feed_symbol(symbol)
             with _MT5_LOCK:
-                info = mt5.symbol_info(symbol)
+                info = mt5.symbol_info(feed)
             if info is None:
                 return float("nan")
             if getattr(info, "spread", 0):
                 return float(info.spread)
             with _MT5_LOCK:
-                tick = mt5.symbol_info_tick(symbol)
+                tick = mt5.symbol_info_tick(feed)
             point = float(getattr(info, "point", 0.0) or 0.0)
             if tick is None or point <= 0:
                 return float("nan")
@@ -564,7 +588,7 @@ class MarketData:
         try:
             with _MT5_LOCK:
                 ticks = mt5.copy_ticks_range(
-                    symbol,
+                    self.feed_symbol(symbol),
                     fetch_from + timedelta(hours=offset),
                     now + timedelta(hours=offset),
                     mt5.COPY_TICKS_ALL,

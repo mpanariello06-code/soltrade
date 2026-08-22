@@ -106,7 +106,15 @@ def is_near_signal(best_score: float, threshold: Optional[float], config) -> boo
 # individual filters
 # --------------------------------------------------------------------------- #
 def check_session(data: FilterInput, config) -> Optional[str]:
-    """Reject candles outside the configured trading sessions."""
+    """Reject candles outside the configured trading sessions.
+
+    A 24/7 market (Bitcoin) never fails this check: there is no "outside
+    session" to be outside of.  The session *label* is still computed and
+    stored, because knowing which UTC block a setup came from is useful for
+    analysis even when it is not used to filter.
+    """
+    if getattr(config, "is_24h", False):
+        return None
     if not session_allowed(data.session, config.allowed_sessions):
         return f"session not allowed ({data.session})"
     return None

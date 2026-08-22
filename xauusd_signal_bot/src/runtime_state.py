@@ -1,23 +1,35 @@
 """Live-editable runtime settings, persisted across restarts.
 
 Everything the Telegram control panel can change lives here.  The engine itself
-is untouched: :func:`effective_config` folds the runtime settings into a *copy*
-of :class:`config.Config`, so every analysis engine keeps reading plain config
+is untouched: :func:`effective_config` folds the runtime settings onto a
+market's config view, so every analysis engine keeps reading plain config
 attributes exactly as before.
+
+MARKET ISOLATION
+----------------
+State is split in two, and the split is what guarantees that activity on one
+market cannot disturb another:
+
+``data/state.json``            global - active market, run state, alert prefs
+``data/<market>/state.json``   per-market - threshold, cooldown, holding period,
+                               last processed candle, last signal
+
+Each file has exactly one writer (its own :class:`JsonStateStore`), so a write
+for Bitcoin can never clobber a key belonging to gold.  Switching the active
+market changes which market *generates* signals; it does not touch any other
+market's stored state.
 
 CONCURRENCY
 -----------
 The Telegram poller runs on a background thread while the signal loop runs on
 the main thread.  Both reach this object, so every read and write goes through
-an ``RLock``.  ``state.json`` has a single owner - :class:`JsonStateStore` -
-which both the tracker and the runtime state share, so neither can clobber the
-other's keys.
+an ``RLock``.
 
 SAFETY
 ------
 Only the settings named in ``Config.telegram_editable_settings`` can be reached
-from chat.  Credentials, the bot token, the symbol and all file paths are not
-runtime settings at all and have no setter here (spec section 16).
+from chat.  Credentials, the bot token, the symbol list and all file paths are
+not runtime settings at all and have no setter here.
 """
 
 from __future__ import annotations
@@ -30,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .logger import get_logger
+from .markets import DEFAULT_MARKET, MARKET_ORDER, get_market, normalise_market
 from .timeframes import (
     MODE_SCALPING,
     RUN_STATES,
@@ -100,80 +113,282 @@ class JsonStateStore:
 
 
 @dataclass
-class RuntimeState:
-    """Mutable, persisted engine settings.
+class MarketRuntime:
+    """Live-editable settings for ONE market, persisted in its own file.
 
-    Instances are created through :meth:`load` so that the previous session's
-    mode, timeframe, threshold and run state are restored - which is what stops
-    a restart from silently reverting to defaults or re-emitting signals.
+    Nothing here is shared between markets: a threshold change on Bitcoin
+    cannot move gold's, and gold's processed-candle marker lives in gold's file.
     """
 
+    symbol: str
     config: Any
     store: JsonStateStore
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
-    status: str = STATUS_RUNNING
-    #: Explicit threshold set from Telegram; ``None`` means "use config".
     threshold_override: Optional[float] = None
     cooldown_candles: Optional[int] = None
     min_tp2_rr: Optional[float] = None
     max_holding_candles: Optional[int] = None
     allowed_sessions: Optional[Tuple[str, ...]] = None
-    near_signal_alerts: bool = False
 
-    # ------------------------------------------------------------------ #
+    # -- loading / persistence --------------------------------------------- #
     @classmethod
-    def load(cls, config, store: Optional[JsonStateStore] = None) -> "RuntimeState":
-        """Restore runtime settings from ``state.json``, falling back to config."""
-        store = store or JsonStateStore(config.state_file)
+    def load(cls, symbol: str, config, store: JsonStateStore) -> "MarketRuntime":
         saved = dict(store.get(RUNTIME_KEY) or {})
-
         sessions = saved.get("allowed_sessions")
-        state = cls(
+        return cls(
+            symbol=symbol,
             config=config,
             store=store,
-            status=str(saved.get("status", STATUS_RUNNING)).upper(),
             threshold_override=saved.get("threshold_override"),
             cooldown_candles=saved.get("cooldown_candles"),
             min_tp2_rr=saved.get("min_tp2_rr"),
             max_holding_candles=saved.get("max_holding_candles"),
             allowed_sessions=tuple(sessions) if sessions else None,
-            near_signal_alerts=bool(saved.get("near_signal_alerts", config.near_signal_alerts)),
+        )
+
+    def persist(self) -> None:
+        with self._lock:
+            self.store.update_section(
+                RUNTIME_KEY,
+                {
+                    "symbol": self.symbol,
+                    "threshold_override": self.threshold_override,
+                    "cooldown_candles": self.cooldown_candles,
+                    "min_tp2_rr": self.min_tp2_rr,
+                    "max_holding_candles": self.max_holding_candles,
+                    "allowed_sessions": (
+                        list(self.allowed_sessions) if self.allowed_sessions else None
+                    ),
+                },
+            )
+
+    # -- threshold ---------------------------------------------------------- #
+    def active_threshold(self) -> float:
+        with self._lock:
+            if self.threshold_override is not None:
+                return self.config.clamp_threshold(self.threshold_override)
+            return self.config.clamp_threshold(self.default_threshold())
+
+    def default_threshold(self) -> float:
+        return self.config.clamp_threshold(get_market(self.symbol).threshold)
+
+    def has_threshold_override(self) -> bool:
+        with self._lock:
+            return self.threshold_override is not None
+
+    def set_threshold(self, value: float) -> float:
+        clamped = self.config.clamp_threshold(value)
+        with self._lock:
+            self.threshold_override = clamped
+        self.persist()
+        LOGGER.info("[%s] threshold -> %.0f", self.symbol, clamped)
+        return clamped
+
+    def adjust_threshold(self, delta: float) -> float:
+        return self.set_threshold(self.active_threshold() + float(delta))
+
+    def reset_threshold(self) -> float:
+        with self._lock:
+            self.threshold_override = None
+        self.persist()
+        LOGGER.info("[%s] threshold reset to %.0f", self.symbol, self.active_threshold())
+        return self.active_threshold()
+
+    # -- other editable settings -------------------------------------------- #
+    def set_cooldown(self, candles: Optional[int]) -> Optional[int]:
+        with self._lock:
+            self.cooldown_candles = None if candles is None else max(0, int(candles))
+        self.persist()
+        return self.cooldown_candles
+
+    def set_min_rr(self, value: Optional[float]) -> Optional[float]:
+        with self._lock:
+            self.min_tp2_rr = None if value is None else max(0.0, float(value))
+        self.persist()
+        return self.min_tp2_rr
+
+    def set_max_holding(self, candles: Optional[int]) -> Optional[int]:
+        with self._lock:
+            self.max_holding_candles = None if candles is None else max(1, int(candles))
+        self.persist()
+        return self.max_holding_candles
+
+    def set_sessions(self, sessions: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
+        with self._lock:
+            self.allowed_sessions = tuple(s.upper() for s in sessions) if sessions else None
+        self.persist()
+        return self.allowed_sessions
+
+    # -- candle bookkeeping -------------------------------------------------- #
+    def last_processed_candle(self) -> Optional[datetime]:
+        """Last closed M1 candle already evaluated **on this market**."""
+        table = self.store.get("last_processed_candles") or {}
+        return parse_iso(str(table.get(SIGNAL_TIMEFRAME, "")))
+
+    def mark_candle_processed(self, when: str) -> None:
+        self.store.set_in_map("last_processed_candles", SIGNAL_TIMEFRAME, when)
+
+    def save_signal_marker(self, **values: Any) -> None:
+        self.store.update(**values)
+
+    # -- display -------------------------------------------------------------- #
+    def describe(self) -> Dict[str, Any]:
+        market = get_market(self.symbol)
+        with self._lock:
+            return {
+                "symbol": self.symbol,
+                "icon": market.icon,
+                "label": market.label(),
+                "threshold": self.active_threshold(),
+                "threshold_is_custom": self.threshold_override is not None,
+                "default_threshold": self.default_threshold(),
+                "cooldown_candles": (
+                    market.cooldown_candles if self.cooldown_candles is None
+                    else self.cooldown_candles
+                ),
+                "min_tp2_rr": (
+                    market.min_tp2_rr if self.min_tp2_rr is None else self.min_tp2_rr
+                ),
+                "max_holding_candles": (
+                    market.max_holding_candles if self.max_holding_candles is None
+                    else self.max_holding_candles
+                ),
+                "allowed_sessions": (
+                    market.default_sessions if self.allowed_sessions is None
+                    else self.allowed_sessions
+                ),
+                "is_24h": market.is_24h,
+                "cost_model": market.cost_model_name,
+                "pip_name": market.pip_name,
+            }
+
+
+@dataclass
+class RuntimeState:
+    """Global engine state plus one :class:`MarketRuntime` per market."""
+
+    config: Any
+    store: JsonStateStore
+    markets: Dict[str, MarketRuntime] = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    status: str = STATUS_RUNNING
+    active_market: str = DEFAULT_MARKET
+    near_signal_alerts: bool = False
+
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def load(cls, config, store: Optional[JsonStateStore] = None) -> "RuntimeState":
+        """Restore global and per-market settings from disk."""
+        store = store or JsonStateStore(config.global_state_file)
+        saved = dict(store.get(RUNTIME_KEY) or {})
+
+        state = cls(
+            config=config,
+            store=store,
+            status=str(saved.get("status", STATUS_RUNNING)).upper(),
+            active_market=normalise_market(saved.get("active_market"), DEFAULT_MARKET),
+            near_signal_alerts=bool(
+                saved.get("near_signal_alerts", config.near_signal_alerts)
+            ),
         )
         if state.status not in RUN_STATES:
             state.status = STATUS_RUNNING
-        state._migrate_last_processed()
+
+        for symbol in MARKET_ORDER:
+            view = config.for_market(symbol)
+            view.market_dir.mkdir(parents=True, exist_ok=True)
+            state.markets[symbol] = MarketRuntime.load(
+                symbol, config, JsonStateStore(view.state_file)
+            )
+
+        state._migrate_single_market_state()
         LOGGER.info(
-            "Runtime state: %s | %s %s | threshold=%.0f | max hold=%s candles",
-            state.status, MODE_SCALPING, SIGNAL_TIMEFRAME,
-            state.active_threshold(), state.describe()["max_holding_candles"],
+            "Runtime: %s | %s %s | active market %s | thresholds %s",
+            state.status, MODE_SCALPING, SIGNAL_TIMEFRAME, state.active_market,
+            {s: round(m.active_threshold()) for s, m in state.markets.items()},
         )
         return state
 
-    def _migrate_last_processed(self) -> None:
-        """Upgrade state written by the earlier multi-timeframe build."""
-        legacy = self.store.get("last_processed_candle")
-        per_timeframe = self.store.get("last_processed_candles")
-        if isinstance(legacy, str) and legacy and not per_timeframe:
-            self.store.update(last_processed_candles={SIGNAL_TIMEFRAME: legacy})
-            LOGGER.info("Migrated last_processed_candle to the M1 marker")
+    def _migrate_single_market_state(self) -> None:
+        """Adopt state written by the single-market (XAUUSD-only) build.
+
+        That build kept everything in ``data/state.json``; anything found there
+        belongs to gold, so it is copied into gold's own file rather than being
+        silently dropped or, worse, applied to Bitcoin.
+        """
+        legacy_runtime = dict(self.store.get(RUNTIME_KEY) or {})
+        legacy_candles = self.store.get("last_processed_candles")
+        if not legacy_candles:
+            # even older: one scalar marker, before the timeframe map existed
+            single = self.store.get("last_processed_candle")
+            legacy_candles = {SIGNAL_TIMEFRAME: single} if single else None
+        gold = self.markets.get(DEFAULT_MARKET)
+        if gold is None:
+            return
+
+        moved = False
+        if legacy_candles and not (gold.store.get("last_processed_candles") or {}):
+            gold.store.update(last_processed_candles=dict(legacy_candles))
+            moved = True
+        carried = {
+            key: legacy_runtime[key]
+            for key in ("threshold_override", "cooldown_candles", "min_tp2_rr",
+                        "max_holding_candles", "allowed_sessions")
+            if key in legacy_runtime and legacy_runtime[key] is not None
+        }
+        if carried and not gold.has_threshold_override():
+            for key, value in carried.items():
+                setattr(gold, key, tuple(value) if key == "allowed_sessions" else value)
+            gold.persist()
+            moved = True
+        if moved:
+            LOGGER.info("Migrated single-market state into %s", DEFAULT_MARKET)
 
     # ------------------------------------------------------------------ #
     def persist(self) -> None:
-        """Write the current settings back to ``state.json``."""
+        """Write the global settings back to ``data/state.json``."""
         with self._lock:
             self.store.update_section(
                 RUNTIME_KEY,
                 {
                     "status": self.status,
-                    "threshold_override": self.threshold_override,
-                    "cooldown_candles": self.cooldown_candles,
-                    "min_tp2_rr": self.min_tp2_rr,
-                    "max_holding_candles": self.max_holding_candles,
-                    "allowed_sessions": list(self.allowed_sessions) if self.allowed_sessions else None,
+                    "active_market": self.active_market,
                     "near_signal_alerts": self.near_signal_alerts,
                 },
             )
+
+    # -- markets ------------------------------------------------------------ #
+    def market(self, symbol: Optional[str] = None) -> MarketRuntime:
+        """The :class:`MarketRuntime` for ``symbol`` (default: the active one)."""
+        with self._lock:
+            key = normalise_market(symbol or self.active_market)
+        return self.markets[key]
+
+    @property
+    def active(self) -> MarketRuntime:
+        return self.market()
+
+    def set_active_market(self, symbol: str) -> str:
+        """Switch which market generates signals.
+
+        Purely a selection: no other market's state, data or open paper trades
+        are touched, and open positions on the market being left continue to be
+        tracked against their own candles.
+        """
+        with self._lock:
+            self.active_market = normalise_market(symbol, self.active_market)
+        self.persist()
+        LOGGER.info("Active market -> %s", self.active_market)
+        return self.active_market
+
+    def evaluation_markets(self) -> Tuple[str, ...]:
+        """Markets that should be *evaluated* this cycle."""
+        if getattr(self.config, "evaluate_all_markets", False):
+            return MARKET_ORDER
+        with self._lock:
+            return (self.active_market,)
 
     # -- run state ------------------------------------------------------ #
     @property
@@ -206,141 +421,60 @@ class RuntimeState:
     def stop(self) -> str:
         return self.set_status(STATUS_STOPPED)
 
-    # -- threshold -------------------------------------------------------- #
-    def active_threshold(self) -> float:
-        """Base threshold before the regime adjustment."""
-        with self._lock:
-            if self.threshold_override is not None:
-                return self.config.clamp_threshold(self.threshold_override)
-            return self.config.clamp_threshold(self.config.base_threshold)
-
-    def default_threshold(self) -> float:
-        """Configured default, ignoring any override."""
-        return self.config.clamp_threshold(self.config.base_threshold)
-
-    def has_threshold_override(self) -> bool:
-        with self._lock:
-            return self.threshold_override is not None
-
-    def set_threshold(self, value: float) -> float:
-        """Set an explicit threshold."""
-        clamped = self.config.clamp_threshold(value)
-        with self._lock:
-            self.threshold_override = clamped
-        self.persist()
-        LOGGER.info("Threshold -> %.0f", clamped)
-        return clamped
-
-    def adjust_threshold(self, delta: float) -> float:
-        """Nudge the threshold, respecting the configured limits."""
-        return self.set_threshold(self.active_threshold() + float(delta))
-
-    def reset_threshold(self) -> float:
-        """Drop the override and fall back to the configured default."""
-        with self._lock:
-            self.threshold_override = None
-        self.persist()
-        LOGGER.info("Threshold reset to default %.0f", self.active_threshold())
-        return self.active_threshold()
-
-    # -- other editable settings ------------------------------------------ #
-    def set_cooldown(self, candles: Optional[int]) -> Optional[int]:
-        with self._lock:
-            self.cooldown_candles = None if candles is None else max(0, int(candles))
-        self.persist()
-        return self.cooldown_candles
-
-    def set_min_rr(self, value: Optional[float]) -> Optional[float]:
-        with self._lock:
-            self.min_tp2_rr = None if value is None else max(0.0, float(value))
-        self.persist()
-        return self.min_tp2_rr
-
-    def set_sessions(self, sessions: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
-        with self._lock:
-            self.allowed_sessions = tuple(s.upper() for s in sessions) if sessions else None
-        self.persist()
-        return self.allowed_sessions
-
-    def set_max_holding(self, candles: Optional[int]) -> Optional[int]:
-        """Maximum holding period in M1 candles before a scalp times out."""
-        with self._lock:
-            self.max_holding_candles = None if candles is None else max(1, int(candles))
-        self.persist()
-        return self.max_holding_candles
-
     def set_near_signal_alerts(self, enabled: bool) -> bool:
         with self._lock:
             self.near_signal_alerts = bool(enabled)
         self.persist()
         return self.near_signal_alerts
 
-    # -- candle bookkeeping ------------------------------------------------ #
-    def last_processed_candle(self, timeframe: Optional[str] = None) -> Optional[datetime]:
-        """Last closed M1 candle already evaluated."""
-        timeframe = timeframe or SIGNAL_TIMEFRAME
-        table = self.store.get("last_processed_candles") or {}
-        return parse_iso(str(table.get(timeframe, "")))
-
-    def mark_candle_processed(self, timeframe: str, when: str) -> None:
-        """Record that the candle at ``when`` has been evaluated."""
-        self.store.set_in_map("last_processed_candles", timeframe, when)
-
-    # -- display ----------------------------------------------------------- #
-    def describe(self) -> Dict[str, Any]:
-        """Flat mapping used by the Telegram panel and the console dashboard."""
+    # -- display ------------------------------------------------------------ #
+    def describe(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """Flat mapping for the Telegram panel and the console dashboard."""
+        market_state = self.market(symbol).describe()
         with self._lock:
-            return {
-                "status": self.status,
-                "mode": MODE_SCALPING,
-                "signal_timeframe": SIGNAL_TIMEFRAME,
-                "context_timeframe": self.config.context_timeframe or "NONE",
-                "threshold": self.active_threshold(),
-                "threshold_is_custom": self.threshold_override is not None,
-                "cooldown_candles": (
-                    self.config.cooldown_candles if self.cooldown_candles is None
-                    else self.cooldown_candles
-                ),
-                "min_tp2_rr": (
-                    self.config.min_tp2_rr if self.min_tp2_rr is None else self.min_tp2_rr
-                ),
-                "max_holding_candles": (
-                    self.config.max_holding_candles if self.max_holding_candles is None
-                    else self.max_holding_candles
-                ),
-                "allowed_sessions": (
-                    self.config.allowed_sessions if self.allowed_sessions is None
-                    else self.allowed_sessions
-                ),
-                "near_signal_alerts": self.near_signal_alerts,
-            }
+            market_state.update(
+                {
+                    "status": self.status,
+                    "mode": MODE_SCALPING,
+                    "signal_timeframe": SIGNAL_TIMEFRAME,
+                    "active_market": self.active_market,
+                    "near_signal_alerts": self.near_signal_alerts,
+                }
+            )
+        return market_state
 
 
 # --------------------------------------------------------------------------- #
 # folding runtime settings into a config view
 # --------------------------------------------------------------------------- #
-def effective_config(config, runtime: Optional["RuntimeState"]):
-    """Fold the live Telegram-controlled settings into a copy of ``config``.
+def effective_config(config, runtime: Optional[RuntimeState], symbol: Optional[str] = None):
+    """Build the config view the engine runs on for one market.
 
-    This is the seam that keeps the analysis layer unchanged: every engine still
-    reads plain config attributes, but the values reflect whatever the panel
-    last set.  The copy is shallow - ``weights``, ``indicators`` and ``sessions``
+    Two layers are folded, in order:
+
+    1. the market's own parameters (:meth:`config.Config.for_market`)
+    2. whatever the Telegram panel has changed for that market
+
+    Every analysis engine keeps reading plain config attributes; only the values
+    differ.  The copy is shallow - ``weights``, ``indicators`` and ``sessions``
     are shared and never mutated here.
     """
     if runtime is None:
-        return config
+        return config.for_market(symbol) if symbol else config
 
-    describe = runtime.describe()
-    view = copy.copy(config)
+    market_runtime = runtime.market(symbol)
+    describe = market_runtime.describe()
+    view = config.for_market(market_runtime.symbol)
+
     view.base_threshold = describe["threshold"]
-    view.near_signal_alerts = describe["near_signal_alerts"]
     view.allowed_sessions = tuple(describe["allowed_sessions"])
     view.min_tp2_rr = float(describe["min_tp2_rr"])
     view.max_holding_candles = int(describe["max_holding_candles"])
+    view.near_signal_alerts = runtime.near_signal_alerts
 
     cooldown = int(describe["cooldown_candles"])
     view.cooldown_candles = cooldown
-    if runtime.cooldown_candles is not None:
+    if market_runtime.cooldown_candles is not None:
         # A user-set cooldown also scales the stricter same-direction cooldown,
         # otherwise raising one silently leaves the other stale.
         view.same_direction_cooldown_candles = cooldown * 2

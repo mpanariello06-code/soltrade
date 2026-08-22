@@ -50,6 +50,31 @@ DIRECTIONS = ("BUY", "SELL")
 MIN_TARGET_SPACING_PIPS = 0.3
 
 
+def target_floor(config, index: int, price: float) -> float:
+    """Smallest allowed distance for target ``index``, in price terms.
+
+    Two floors are combined and the larger wins:
+
+    * an absolute floor in the market's pip unit (``min_tp_pips``)
+    * a floor as a fraction of price (``min_tp_pct``)
+
+    Gold uses the first with the second at zero, so its behaviour is unchanged.
+    Bitcoin uses the second, because a fixed dollar floor would be far too tight
+    at $90,000 and far too loose at $20,000.
+    """
+    pip_floor = config.min_tp_pips[index] * config.pip_value
+    pct_floor = config.min_tp_pct[index] * float(price)
+    return max(pip_floor, pct_floor)
+
+
+def max_tp3_distance(config, price: float) -> float:
+    """Largest TP3 distance that still counts as a scalp, in price terms."""
+    pip_ceiling = config.max_tp3_pips * config.pip_value
+    pct_ceiling = config.max_tp3_pct * float(price)
+    candidates = [value for value in (pip_ceiling, pct_ceiling) if value > 0]
+    return max(candidates) if candidates else float("inf")
+
+
 @dataclass
 class Targets:
     """Entry, stop and the three take-profits, with raw and net reward."""
@@ -169,7 +194,7 @@ def _opposing_zones(df: pd.DataFrame, config, direction: str) -> List[float]:
 
 
 def compute_target_distances(
-    config, atr_value: float, cost_price: float
+    config, atr_value: float, cost_price: float, price: float = 0.0
 ) -> List[float]:
     """Distances for TP1/TP2/TP3, in price, before any structure truncation.
 
@@ -184,7 +209,7 @@ def compute_target_distances(
     """
     pip = config.pip_value
     baseline = [
-        max(multiple * atr_value, config.min_tp_pips[index] * pip)
+        max(multiple * atr_value, target_floor(config, index, price))
         for index, multiple in enumerate(config.tp_atr_multiples)
     ]
 
@@ -223,11 +248,11 @@ def compute_take_profits(
     pip = config.pip_value
     buffer_distance = config.tp_sr_buffer_atr * atr_value
     zones = _opposing_zones(df, config, direction)
-    distances = compute_target_distances(config, atr_value, cost_price)
+    distances = compute_target_distances(config, atr_value, cost_price, entry)
 
     sign = 1.0 if direction == "BUY" else -1.0
     floors = [config.min_tp1_cost_multiple * cost_price] + [
-        config.min_tp_pips[index] * pip for index in (1, 2)
+        target_floor(config, index, entry) for index in (1, 2)
     ]
 
     prices: List[float] = []
@@ -317,14 +342,18 @@ def build_targets(
     required = config.min_tp1_cost_multiple * cost_price
     if tp_distances[0] < required - 1e-9:
         return None, (
-            f"target too small vs costs (TP1 {config.pips(tp_distances[0]):.1f}p "
-            f"< {config.pips(required):.1f}p needed)"
+            f"target too small vs costs "
+            f"(TP1 {config.pips(tp_distances[0]):.1f}{config.pip_name} < "
+            f"{config.pips(required):.1f}{config.pip_name} needed)"
         )
 
     # A scalp that needs a large move is not a scalp.
-    tp3_pips = config.pips(tp_distances[2])
-    if tp3_pips > config.max_tp3_pips:
-        return None, f"TP3 {tp3_pips:.1f}p exceeds the {config.max_tp3_pips:.0f}p scalp range"
+    ceiling = max_tp3_distance(config, entry)
+    if tp_distances[2] > ceiling:
+        return None, (
+            f"TP3 {config.pips(tp_distances[2]):.1f}{config.pip_name} exceeds the "
+            f"{config.pips(ceiling):.1f}{config.pip_name} scalp range"
+        )
 
     rr = [safe_div(distance, risk) for distance in tp_distances]
     cost_r = safe_div(cost_price, risk)

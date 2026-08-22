@@ -42,7 +42,8 @@ def button_text(keyboard):
 # --------------------------------------------------------------------------- #
 def test_main_panel_matches_the_specified_layout(controller):
     text = controller.render_panel()
-    for expected in ("⚡ XAUUSD SCALPER", "Status:", "Mode: SCALPING", "Timeframe: M1",
+    for expected in ("⚡ M1 SCALPER", "Market: 🥇 XAUUSD", "Status:", "Mode: SCALPING",
+                     "Timeframe: M1",
                      "Threshold:", "Signals today:", "Open signals:", "Paper Net R:"):
         assert expected in text, expected
 
@@ -50,8 +51,10 @@ def test_main_panel_matches_the_specified_layout(controller):
 def test_main_keyboard_has_only_the_scalping_controls(controller):
     data = button_data(controller.main_keyboard())
     assert data == [
-        "run:start", "run:pause",
-        "view:analysis", "view:performance", "menu:settings", "panel:refresh",
+        "mkt:XAUUSD", "mkt:BTCUSD",
+        "view:analysis", "view:performance",
+        "run:pause",                     # single toggle: the engine is RUNNING
+        "menu:settings", "panel:refresh",
     ]
 
 
@@ -121,41 +124,44 @@ def test_start_pause_stop_change_the_run_state(controller, runtime):
 def test_threshold_menu_offers_the_documented_steps(controller):
     _text, keyboard, _toast = controller.handle_callback("menu:threshold")
     data = button_data(keyboard)
-    for expected in ("thr:-5", "thr:-1", "thr:1", "thr:5", "thr:reset", "nav:main"):
+    # BACK returns to SETTINGS, which is where the threshold menu is reached from.
+    for expected in ("thr:-5", "thr:-1", "thr:1", "thr:5", "thr:reset", "menu:settings"):
         assert expected in data, expected
 
 
 def test_threshold_buttons_adjust_and_report_the_new_value(controller, runtime):
-    base = runtime.active_threshold()
+    base = runtime.active.active_threshold()
     text, _keyboard, toast = controller.handle_callback("thr:5")
-    assert runtime.active_threshold() == base + 5
+    assert runtime.active.active_threshold() == base + 5
     assert f"{base + 5:.0f}" in toast
     assert f"Current threshold: {base + 5:.0f}" in text
 
     controller.handle_callback("thr:-1")
-    assert runtime.active_threshold() == base + 4
+    assert runtime.active.active_threshold() == base + 4
 
 
 def test_threshold_buttons_respect_the_limits(controller, runtime, isolated_config):
     for _ in range(30):
         controller.handle_callback("thr:5")
-    assert runtime.active_threshold() == isolated_config.max_threshold
+    assert runtime.active.active_threshold() == isolated_config.max_threshold
     for _ in range(40):
         controller.handle_callback("thr:-5")
-    assert runtime.active_threshold() == isolated_config.min_threshold
+    assert runtime.active.active_threshold() == isolated_config.min_threshold
 
 
 def test_threshold_reset_button_restores_the_default(controller, runtime, isolated_config):
     controller.handle_callback("thr:5")
     controller.handle_callback("thr:reset")
-    assert runtime.active_threshold() == isolated_config.base_threshold
-    assert not runtime.has_threshold_override()
+    assert runtime.active.active_threshold() == isolated_config.base_threshold
+    assert not runtime.active.has_threshold_override()
 
 
 def test_threshold_change_persists(isolated_config, controller):
     controller.handle_callback("thr:-5")
-    restored = RuntimeState.load(isolated_config, JsonStateStore(isolated_config.state_file))
-    assert restored.active_threshold() == isolated_config.base_threshold - 5
+    restored = RuntimeState.load(
+        isolated_config, JsonStateStore(isolated_config.global_state_file)
+    )
+    assert restored.active.active_threshold() == isolated_config.base_threshold - 5
 
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +250,7 @@ def test_credentials_are_never_rendered_into_a_message(isolated_config, runtime,
 
 def test_unknown_callback_falls_back_to_the_main_panel(controller):
     text, keyboard, _toast = controller.handle_callback("danger:rm-rf")
-    assert "XAUUSD SCALPER" in text
+    assert "M1 SCALPER" in text
     assert "panel:refresh" in button_data(keyboard)
 
 
@@ -279,7 +285,7 @@ def test_updates_from_the_configured_chat_are_applied(controller, runtime, notif
 def test_slash_command_summons_the_panel(controller, notifier):
     controller.process_update({"message": {"chat": {"id": 4242}, "text": "/panel"}})
     assert notifier.messages
-    assert "XAUUSD SCALPER" in notifier.messages[-1]["text"]
+    assert "M1 SCALPER" in notifier.messages[-1]["text"]
 
 
 def test_slash_command_from_another_chat_is_ignored(controller, notifier):
@@ -366,7 +372,8 @@ def test_performance_views_come_from_the_csv_data(isolated_config, runtime, noti
     assert "BY OUTCOME" in controller.render_performance("outcome")
 
     data = button_data(controller.performance_keyboard())
-    for expected in ("perf:score", "perf:regime", "perf:session", "perf:outcome"):
+    for expected in ("perfv:score", "perfv:regime", "perfv:session", "perfv:hour",
+                     "perfv:outcome"):
         assert expected in data
 
 
@@ -382,39 +389,50 @@ def test_a_failing_report_loader_does_not_break_the_panel(isolated_config, runti
 # duplicate prevention across timeframes and restarts
 # --------------------------------------------------------------------------- #
 def test_processed_candle_is_tracked_for_m1(isolated_config, runtime):
-    runtime.mark_candle_processed("M1", "2024-05-01T12:00:00+00:00")
-    assert runtime.last_processed_candle().hour == 12
-    assert runtime.last_processed_candle("M5") is None
+    runtime.active.mark_candle_processed("2024-05-01T12:00:00+00:00")
+    assert runtime.active.last_processed_candle().hour == 12
     stored = read_json(isolated_config.state_file)["last_processed_candles"]
-    assert set(stored) == {"M1"}
+    assert set(stored) == {"M1"}, "M1 is the only timeframe this build evaluates"
 
 
 def test_processed_candles_survive_a_restart(isolated_config, runtime):
-    runtime.mark_candle_processed("M1", "2024-05-01T12:00:00+00:00")
-    restored = RuntimeState.load(isolated_config, JsonStateStore(isolated_config.state_file))
-    assert restored.last_processed_candle("M1") is not None
+    runtime.active.mark_candle_processed("2024-05-01T12:00:00+00:00")
+    restored = RuntimeState.load(
+        isolated_config, JsonStateStore(isolated_config.global_state_file)
+    )
+    assert restored.active.last_processed_candle() is not None
 
 
 def test_legacy_single_candle_marker_is_migrated(isolated_config):
-    """State written by the pre-multi-timeframe version must still be honoured."""
-    store = JsonStateStore(isolated_config.state_file)
+    """State written by the single-market build must still be honoured.
+
+    That build kept one ``data/state.json``; everything in it was gold's, so it
+    is adopted into XAUUSD's own file rather than being dropped.
+    """
+    store = JsonStateStore(isolated_config.global_state_file)
     store.update(last_processed_candle="2024-05-01T12:00:00+00:00")
     runtime = RuntimeState.load(isolated_config, store)
-    assert runtime.last_processed_candle("M1") is not None
+    assert runtime.market("XAUUSD").last_processed_candle() is not None
+    assert runtime.market("BTCUSD").last_processed_candle() is None, (
+        "legacy gold state must never be applied to Bitcoin"
+    )
 
 
 def test_state_store_is_shared_without_clobbering(isolated_config):
     """The tracker and the runtime must not overwrite each other's keys."""
     from src.signal_tracker import SignalTracker
 
-    store = JsonStateStore(isolated_config.state_file)
-    runtime = RuntimeState.load(isolated_config, store)
-    tracker = SignalTracker(isolated_config, store=store)
+    runtime = RuntimeState.load(
+        isolated_config, JsonStateStore(isolated_config.global_state_file)
+    )
+    # One writer per file: the tracker shares the market's store rather than
+    # opening a second handle on the same path, which is what used to clobber.
+    tracker = SignalTracker(isolated_config, store=runtime.active.store)
     tracker.load()
 
     tracker.save_state(last_signal_id="sig-1")
-    runtime.set_threshold(77)
-    runtime.mark_candle_processed("M1", "2024-05-01T12:00:00+00:00")
+    runtime.active.set_threshold(77)
+    runtime.active.mark_candle_processed("2024-05-01T12:00:00+00:00")
 
     saved = read_json(isolated_config.state_file)
     assert saved["last_signal_id"] == "sig-1"

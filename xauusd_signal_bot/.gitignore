@@ -1,11 +1,12 @@
 # secrets - never commit
 .env
 
-# generated data
+# generated data - top level and every per-market subdirectory
 data/*.csv
 data/*.csv.bak-*
 data/*.txt
 data/*.json
+data/*/
 !data/.gitkeep
 
 # downloaded / exported price history

@@ -1,4 +1,8 @@
-"""Historical backtester for the XAUUSD M1 scalping engine.
+"""Historical backtester for the M1 scalping engine.
+
+Runs the SAME engine for every supported market.  ``--symbol`` selects which
+market configuration is folded onto the base config; results are written under
+that market's own data directory so XAUUSD and BTCUSD results never mix.
 
 Feeds M1 candles one at a time into the **same** SignalEngine that runs live,
 and tracks outcomes with the same PositionState.
@@ -36,6 +40,7 @@ A CSV of M1 candles with columns ``time, open, high, low, close, tick_volume``.
 Usage::
 
     python backtest.py --data history/XAUUSD_M1.csv
+    python backtest.py --symbol BTCUSD --data history/BTCUSD_M1.csv
     python backtest.py --data history/XAUUSD_M1.csv --spread 12
 """
 
@@ -56,6 +61,7 @@ from config import Config, load_config
 from performance import build_report, render_report
 from src.indicators import compute_indicators
 from src.logger import get_logger, setup_logging
+from src.markets import MARKET_ORDER, DEFAULT_MARKET, get_market
 from src.market_data import (
     MarketSnapshot,
     clean_candles,
@@ -371,12 +377,19 @@ def write_outputs(result: BacktestResult, out_dir: Path, prefix: str = "backtest
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point."""
-    config = load_config()
-    parser = argparse.ArgumentParser(description="XAUUSD M1 scalping backtester")
+    base_config = load_config()
+    parser = argparse.ArgumentParser(description="M1 scalping backtester")
+    parser.add_argument(
+        "--symbol", type=str, default=DEFAULT_MARKET, choices=list(MARKET_ORDER),
+        help="market to backtest (default: %(default)s)",
+    )
     parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument("--start", type=str, default=None, help="start date, e.g. 2024-01-01")
     parser.add_argument("--end", type=str, default=None, help="end date, e.g. 2024-06-30")
-    parser.add_argument("--out", type=Path, default=config.data_dir, help="output directory")
+    parser.add_argument(
+        "--out", type=Path, default=None,
+        help="output directory (default: the selected market's data directory)",
+    )
     parser.add_argument("--prefix", type=str, default="backtest", help="output filename prefix")
     parser.add_argument(
         "--spread", type=float, default=None,
@@ -387,6 +400,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="skip writing the per-candle evaluations file (it is large)",
     )
     args = parser.parse_args(argv)
+
+    # Fold the market configuration onto the base config.  Everything below -
+    # engine, targets, costs, thresholds, output paths - then belongs to this
+    # market alone, so two runs can never contaminate each other.
+    market = get_market(args.symbol)
+    config = base_config.for_market(market)
+    out_dir = args.out if args.out is not None else config.data_dir
 
     setup_logging(config.log_file, config.log_level)
     try:
@@ -404,14 +424,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     cost_pips = config.pips(config.round_trip_cost(backtester.spread_points))
     print(
-        f"\nMode: SCALPING | timeframe: M1 | context: {config.context_timeframe or '-'} | "
+        f"\nMarket: {market.icon} {market.display} | mode: SCALPING | timeframe: M1 | "
+        f"context: {config.context_timeframe or '-'} | "
         f"threshold: {config.base_threshold:.0f}"
+        f"\nCost model: {config.cost_model_name}"
         f"\nCosts charged: spread {backtester.spread_points:.0f} pts + slippage "
         f"{config.slippage_points_entry:.0f}+{config.slippage_points_exit:.0f} pts "
-        f"= {cost_pips:.1f} pips round trip"
+        f"= {cost_pips:.1f}{config.pip_name} round trip"
     )
+    if market.note:
+        print(f"NOTE: {market.note}")
 
-    write_outputs(result, args.out, args.prefix)
+    write_outputs(result, out_dir, args.prefix)
 
     print()
     print(f"Period evaluated : {result.start} -> {result.end}")
