@@ -79,6 +79,11 @@ class MarketConfig:
     #: short suffix used when printing distances ("1.8p", "12.0$")
     pip_name: str = "p"
 
+    #: Account-currency value of a one-point move on ONE lot, used only by the
+    #: demo execution layer for position sizing and P/L.  Broker-dependent and
+    #: an ASSUMPTION until checked against your own contract specification.
+    money_per_point_per_lot: float = 1.0
+
     # -- market hours -------------------------------------------------------- #
     #: True for a market that never closes.  The session *label* is still
     #: recorded for analysis; only the session *filter* is bypassed.
@@ -175,6 +180,8 @@ XAUUSD_CONFIG = MarketConfig(
     # decimal, so 10 points = 0.10.
     pip_value=0.10,
     pip_name="p",
+    # A standard gold lot is 100 oz, so a 0.01 price move is $1.00 per lot.
+    money_per_point_per_lot=1.0,
     is_24h=False,
     threshold=68.0,
     tp_atr_multiples=(0.45, 1.00, 1.70),
@@ -239,6 +246,9 @@ BTCUSD_CONFIG = MarketConfig(
     point_value=0.01,
     pip_value=1.0,            # one "pip" == one US dollar
     pip_name="$",
+    # A 1 BTC contract means a 0.01 price move is $0.01 per lot.  ASSUMED -
+    # crypto CFD contract sizes vary widely between brokers.  Check yours.
+    money_per_point_per_lot=0.01,
     is_24h=True,              # crypto never closes
     default_sessions=("ALL_SESSIONS",),
     threshold=68.0,           # INITIAL - starts equal to gold for comparability

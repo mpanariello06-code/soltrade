@@ -118,13 +118,34 @@ class TelegramController:
         toggle = (
             _button("⏸ PAUSE", "run:pause") if running else _button("▶️ START", "run:start")
         )
+        demo_on = self._demo_auto_on()
+        demo_label = "🟢 DEMO AUTO ON" if demo_on else "🔴 DEMO AUTO OFF"
+        # Turning it OFF is immediate; turning it ON asks for confirmation
+        # first, so execution can never be armed by a single stray tap.
+        demo_action = "demo:off" if demo_on else "demo:confirm"
+
         return [
             market_row,
             [_button("📊 CURRENT ANALYSIS", "view:analysis")],
             [_button("📈 PERFORMANCE", "view:performance")],
+            [_button("💼 OPEN TRADES", "view:trades")],
             [toggle],
+            [_button(demo_label, demo_action)],
             [_button("⚙️ SETTINGS", "menu:settings")],
             [_button("🔄 REFRESH", "panel:refresh")],
+        ]
+
+    @staticmethod
+    def demo_confirm_keyboard() -> List[List[Dict[str, str]]]:
+        """Explicit two-step confirmation before any order can be placed."""
+        return [
+            [_button("✅ ENABLE", "demo:on"), _button("❌ CANCEL", "nav:main")],
+        ]
+
+    def trades_keyboard(self) -> List[List[Dict[str, str]]]:
+        return [
+            [_button("🔄 REFRESH", "view:trades")],
+            [_button("⬅️ BACK", "nav:main")],
         ]
 
     def threshold_keyboard(self) -> List[List[Dict[str, str]]]:
@@ -167,6 +188,7 @@ class TelegramController:
         return [
             row,
             [_button(f"{combined_mark} 📊 COMBINED", "perf:COMBINED")],
+            [_button("🤖 DEMO EXECUTION", "perfv:execution")],
             [_button("BY SCORE", "perfv:score"), _button("BY REGIME", "perfv:regime")],
             [_button("BY HOUR", "perfv:hour"), _button("BY SESSION", "perfv:session")],
             [_button("BY OUTCOME", "perfv:outcome")],
@@ -206,6 +228,11 @@ class TelegramController:
             f"Open signals: {self._open_signals(symbol)}",
             f"Paper Net R: {net_r:+.2f}" if net_r is not None else "Paper Net R: -",
             "",
+            f"Execution: {self._execution_state()}",
+            f"Open Demo Trades: {self._demo_open(symbol)}",
+            f"Today's Demo Trades: {self._demo_today(symbol)}",
+            f"Today's Net P/L: {self._demo_net(symbol):+.2f}",
+            "",
             f"MT5: {self._connection_state()}",
         ]
         other = [s for s in MARKET_ORDER if s != symbol]
@@ -214,13 +241,60 @@ class TelegramController:
                 f"{get_market(o).icon} {o} {self._open_signals(o)} open" for o in other
             )
             lines += ["", f"Also tracking: {carried}"]
-        lines += ["", DIVIDER, "🔬 PAPER TEST ONLY - no orders are placed."]
+        footer = (
+            "🤖 DEMO AUTO - orders go to the DEMO account only."
+            if self._demo_auto_on() else
+            "🔬 SIGNAL ONLY - no orders are placed."
+        )
+        lines += ["", DIVIDER, footer]
         # Driven by the market's own note, not a symbol comparison: a hardcoded
         # name silently stops matching the moment a symbol is renamed.
         note = get_market(symbol).note
         if "INITIAL RESEARCH PARAMETERS" in note.upper():
             lines.append(f"{symbol} uses INITIAL RESEARCH PARAMETERS.")
         return "\n".join(lines)
+
+    def render_demo_confirm(self) -> str:
+        """The confirmation shown before DEMO AUTO can be switched on."""
+        return "\n".join([
+            DIVIDER,
+            "⚠️ ENABLE DEMO AUTO?",
+            DIVIDER,
+            "",
+            "This will automatically place orders on the",
+            "configured DEMO account.",
+            "",
+            "Before any order is sent the account is",
+            "re-checked and must report itself as DEMO.",
+            "A live or unverifiable account is refused.",
+            "",
+            "Signals keep being generated and recorded",
+            "either way.",
+            "",
+            DIVIDER,
+        ])
+
+    def render_open_trades(self) -> str:
+        """The 💼 OPEN TRADES panel, across every market."""
+        lines = self._call_engine("open_trade_lines", None, None)
+        header = [DIVIDER, "💼 OPEN DEMO TRADES", DIVIDER, ""]
+        if not lines:
+            return "\n".join(
+                header + [
+                    "No open demo trades.",
+                    "",
+                    f"Execution: {self._execution_state()}",
+                    DIVIDER,
+                ]
+            )
+        body = [str(line) for line in lines]
+        return "\n".join(
+            header + body + [
+                f"Execution: {self._execution_state()}",
+                DIVIDER,
+                "DEMO ACCOUNT - no real money.",
+            ]
+        )
 
     def render_threshold_panel(self) -> str:
         state = self.runtime.describe()
@@ -397,10 +471,22 @@ class TelegramController:
         report = self._report(scope)
         title = "📊 COMBINED" if scope == "COMBINED" else get_market(scope).label()
 
-        if report is None or (report.total_signals == 0 and report.total_evaluations == 0):
+        # The execution view reads executions.csv, not the signal report, so an
+        # empty signal history must not hide demo fills that DO exist.
+        if view != "execution" and (
+            report is None
+            or (report.total_signals == 0 and report.total_evaluations == 0)
+        ):
             return "\n".join(
                 [DIVIDER, f"📈 {title} PERFORMANCE", DIVIDER, "",
                  "No signals recorded yet.", DIVIDER]
+            )
+
+        if report is None:
+            # Only reachable for the execution view, which does not need it.
+            return "\n".join(
+                [DIVIDER, f"📈 {title} PERFORMANCE", DIVIDER, ""]
+                + self._execution_body(scope) + [DIVIDER]
             )
 
         overall = report.overall
@@ -420,6 +506,8 @@ class TelegramController:
             body = self._stats_table("BY REGIME", report.by_regime)
         elif view == "hour":
             body = self._stats_table("BY UTC HOUR", report.by_hour)
+        elif view == "execution":
+            body = self._execution_body(scope)
         elif view == "session":
             body = self._stats_table("BY SESSION", report.by_session)
             if scope != "COMBINED" and get_market(scope).is_24h:
@@ -461,6 +549,57 @@ class TelegramController:
                          "volatility regimes.  Per-market is the honest view."]
         return "\n".join(header + body + ["", DIVIDER, "Paper results only. Not advice."])
 
+    def _execution_body(self, scope: str) -> List[str]:
+        """DEMO EXECUTION view: what the fills actually did, beside the signals.
+
+        Signal results are NEVER replaced by execution results - both are shown,
+        because the number worth knowing is the gap between them.
+        """
+        from performance import analyse_executions, compare_signal_and_execution
+
+        symbols = list(MARKET_ORDER) if scope == "COMBINED" else [scope]
+        lines: List[str] = ["DEMO EXECUTION vs SIGNALS", ""]
+        for symbol in symbols:
+            try:
+                view = self.config.for_market(symbol)
+                stats = analyse_executions(view.executions_csv, symbol)
+                comparison = compare_signal_and_execution(self.config, symbol)
+            except Exception as exc:  # noqa: BLE001 - a report must not break the panel
+                LOGGER.exception("execution report for %s failed: %s", symbol, exc)
+                continue
+
+            lines.append(f"{get_market(symbol).label()}")
+            if stats.trades == 0:
+                lines += ["  No demo trades recorded yet.", ""]
+                continue
+            lines += [
+                f"  Demo trades: {stats.trades}",
+                f"  Wins / Losses: {stats.wins} / {stats.losses}",
+                f"  Timeouts: {stats.timeouts}",
+                f"  Win rate: {stats.win_rate:.1f}%",
+                f"  Avg R: {stats.average_r:+.3f}",
+                f"  Total R: {stats.total_r:+.2f}",
+                f"  Gross P/L: {stats.gross_profit:+.2f}",
+                f"  Net P/L: {stats.net_profit:+.2f}",
+                f"  Avg slippage: {stats.average_slippage_points:+.2f} pts",
+                f"  Avg spread: {stats.average_spread_points:.1f} pts",
+                f"  Avg hold: {stats.average_holding_seconds:.0f}s",
+                f"  Max drawdown: {stats.max_drawdown_r:.2f}R",
+                f"  TP1/TP2/TP3: {stats.tp1_rate:.0f}/{stats.tp2_rate:.0f}/"
+                f"{stats.tp3_rate:.0f}%   SL: {stats.sl_rate:.0f}%",
+                "",
+                f"  Signal avg R:    {comparison.signal_average_r:+.3f}"
+                f"  ({comparison.signal_trades} closed)",
+                f"  Execution avg R: {comparison.execution_average_r:+.3f}"
+                f"  ({comparison.execution_trades} filled)",
+            ]
+            if comparison.comparable:
+                lines.append(f"  Execution cost:  {comparison.degradation:+.3f}R per trade")
+            else:
+                lines.append("  Too few demo fills to compare meaningfully.")
+            lines.append("")
+        return lines
+
     # ------------------------------------------------------------------ #
     # callback routing
     # ------------------------------------------------------------------ #
@@ -484,7 +623,11 @@ class TelegramController:
                 return self._handle_menu(argument)
             if action == "set":
                 return self._handle_setting(argument)
+            if action == "demo":
+                return self._handle_demo(argument)
             if action == "view":
+                if argument == "trades":
+                    return self.render_open_trades(), self.trades_keyboard(), "Open trades"
                 if argument == "analysis":
                     return self.render_analysis(), self.back_keyboard(), "Analysing…"
                 if argument == "performance":
@@ -534,6 +677,40 @@ class TelegramController:
                 notify(previous, symbol)
         market = get_market(symbol)
         return self.render_panel(), self.main_keyboard(), f"Market: {market.label()}"
+
+    def _handle_demo(self, argument: str):
+        """The DEMO AUTO toggle: confirm, enable, disable.
+
+        Enabling is never implicit - ``demo:confirm`` only shows the warning,
+        and only an explicit ``demo:on`` asks the engine to arm execution.  The
+        engine re-verifies the account before reporting success, so a refusal
+        here is reported honestly rather than shown as ON.
+        """
+        if argument == "confirm":
+            return self.render_demo_confirm(), self.demo_confirm_keyboard(), "Confirm?"
+
+        wanted = argument == "on"
+        hook = getattr(self.engine, "set_demo_auto", None)
+        if not callable(hook):
+            return (
+                self.render_panel(), self.main_keyboard(),
+                "Demo execution is not available",
+            )
+        try:
+            enabled = bool(hook(wanted))
+        except Exception as exc:  # noqa: BLE001 - a failed toggle must not break the panel
+            LOGGER.exception("DEMO AUTO toggle failed: %s", exc)
+            return self.render_panel(), self.main_keyboard(), "Toggle failed"
+
+        if wanted and not enabled:
+            # Asked for ON and did not get it: say why rather than silently
+            # leaving the button showing OFF.
+            return (
+                self.render_panel(), self.main_keyboard(),
+                "DEMO AUTO refused - check the log",
+            )
+        toast = "🟢 DEMO AUTO ON" if enabled else "🔴 DEMO AUTO OFF"
+        return self.render_panel(), self.main_keyboard(), toast
 
     def _handle_run(self, argument: str):
         mapping = {
@@ -642,6 +819,32 @@ class TelegramController:
                 return default
         except Exception:  # noqa: BLE001
             return default
+
+    # -- demo execution hooks ------------------------------------------- #
+    def _execution_state(self) -> str:
+        state = self._call_engine("execution_state", None, "SIGNAL_ONLY")
+        return str(state or "SIGNAL_ONLY")
+
+    def _demo_auto_on(self) -> bool:
+        return self._execution_state() == "DEMO_AUTO"
+
+    def _demo_open(self, symbol: Optional[str] = None) -> int:
+        try:
+            return int(self._call_engine("demo_open_trades", symbol, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _demo_today(self, symbol: Optional[str] = None) -> int:
+        try:
+            return int(self._call_engine("demo_trades_today", symbol, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _demo_net(self, symbol: Optional[str] = None) -> float:
+        try:
+            return float(self._call_engine("demo_net_today", symbol, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _open_signals(self, symbol: Optional[str] = None) -> int:
         try:

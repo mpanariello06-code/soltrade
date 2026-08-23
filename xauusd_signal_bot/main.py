@@ -38,6 +38,9 @@ from src.signal_engine import EVALUATION_COLUMNS, SignalEngine
 from src.signal_tracker import SignalTracker, append_csv, ensure_csv
 from src.telegram_bot import TelegramNotifier
 from src.telegram_control import TelegramController
+from src.demo_broker import MT5DemoBroker
+from src.demo_execution import ExecutionManager
+from src.execution_config import DemoExecutionBlocked, load_execution_settings
 from src.markets import MARKET_ORDER, get_market
 from src.timeframes import MODE_SCALPING, SIGNAL_TIMEFRAME
 from src.utils import is_weekend, iso, now_utc, parse_iso
@@ -55,7 +58,10 @@ class MarketSlot:
     keeps the markets isolated.
     """
 
-    def __init__(self, symbol: str, config: Config, runtime, notifier) -> None:
+    def __init__(
+        self, symbol: str, config: Config, runtime, notifier,
+        execution_settings=None, broker=None,
+    ) -> None:
         self.symbol = symbol
         self.market = get_market(symbol)
         self.base_config = config
@@ -68,12 +74,27 @@ class MarketSlot:
         self.tracker = SignalTracker(view, notifier, store=self.market_runtime.store)
         self.tracker.load()
 
+        # The demo execution manager is per-market, exactly like the tracker,
+        # so a gold position and a Bitcoin position share no state or limits.
+        # It exists even in SIGNAL_ONLY mode: it is then simply never asked to
+        # execute anything, and still manages positions left open by a previous
+        # DEMO_AUTO session.
+        self.execution: Optional[ExecutionManager] = None
+        if execution_settings is not None and broker is not None:
+            self.execution = ExecutionManager(
+                view, execution_settings, broker, notifier,
+                store=self.market_runtime.store,
+            )
+
     def config_view(self) -> Config:
         """This market's config with its live Telegram settings folded in."""
         return effective_config(self.base_config, self.runtime, self.symbol)
 
     def has_open_signals(self) -> bool:
         return bool(self.tracker.active_signals())
+
+    def has_open_demo_trades(self) -> bool:
+        return bool(self.execution and self.execution.open_trades())
 
     def signals_today(self) -> int:
         today = now_utc().date()
@@ -100,11 +121,26 @@ class SignalRunner:
         self.market = MarketData(config)
         self.notifier = TelegramNotifier(config)
         self.engine = SignalEngine(config)
+
+        # Execution is opt-in and off by default.  The broker object is built
+        # unconditionally so positions from a previous DEMO_AUTO session are
+        # still reconciled and managed, but nothing connects or trades unless
+        # both EXECUTION_MODE and DEMO_TRADING_ENABLED say so.
+        self.execution_settings = load_execution_settings()
+        try:
+            self.execution_settings.validate()
+        except ValueError as exc:
+            LOGGER.error("Execution settings are invalid (%s) - execution disabled", exc)
+            self.execution_settings.demo_trading_enabled = False
+        self.broker = MT5DemoBroker(self.execution_settings)
         # Every market gets its own slot up front - tracker, runtime and CSV
         # files included - so a market keeps being tracked whether or not it is
         # the one currently selected in Telegram.
         self.slots: Dict[str, MarketSlot] = {
-            symbol: MarketSlot(symbol, config, self.runtime, self.notifier)
+            symbol: MarketSlot(
+                symbol, config, self.runtime, self.notifier,
+                execution_settings=self.execution_settings, broker=self.broker,
+            )
             for symbol in MARKET_ORDER
         }
         self.control = TelegramController(
@@ -132,7 +168,8 @@ class SignalRunner:
 
         mt5_ok = self.market.connect()
         telegram_ok = self.notifier.test_connection()
-        self._print_dashboard(mt5_ok, telegram_ok)
+        execution_ok = self.start_execution()
+        self._print_dashboard(mt5_ok, telegram_ok, execution_ok)
 
         if not mt5_ok:
             LOGGER.error("Cannot start without an MT5 data connection")
@@ -189,6 +226,124 @@ class SignalRunner:
         gate = slot.tracker.gate_state(snapshot.candle_time, SIGNAL_TIMEFRAME)
         return self.engine.evaluate(snapshot, gate, config=cfg)
 
+    # -- demo execution ----------------------------------------------------- #
+    def start_execution(self) -> bool:
+        """Connect the demo broker, verify the account and reconcile positions.
+
+        Returns True only when demo execution is fully armed.  Every failure
+        path leaves execution OFF rather than half-on: an unverified account, a
+        failed connection or a failed reconciliation all mean no orders.
+        """
+        settings = self.execution_settings
+        blocking = settings.blocking_reason()
+        if blocking:
+            LOGGER.info("Demo execution is off: %s", blocking)
+            return False
+
+        if not self.broker.connect():
+            LOGGER.error("Demo broker would not connect - execution stays off")
+            self.notifier.send_text(
+                "🚨 DEMO EXECUTION BLOCKED\n\n"
+                "Could not connect to the demo account.\n\nNo orders will be placed."
+            )
+            settings.demo_trading_enabled = False
+            return False
+
+        account = self.broker.account()
+        if not account.verified or not account.is_demo:
+            reason = (
+                "Account type could not be verified." if not account.verified
+                else f"The connected account is {account.trade_mode}, not DEMO."
+            )
+            LOGGER.error("DEMO EXECUTION BLOCKED: %s", reason)
+            self.notifier.send_text(
+                f"🚨 DEMO EXECUTION BLOCKED\n\n{reason}\n\n"
+                "Execution has been disabled. No order was placed."
+            )
+            # Belt and braces: the per-order guard would refuse anyway, but the
+            # switch is turned off so nothing even tries.
+            settings.demo_trading_enabled = False
+            self.broker.shutdown()
+            return False
+
+        LOGGER.info("Demo execution armed on %s", account.describe())
+
+        # Reconcile BEFORE any new signal can be executed, so a restart can
+        # never duplicate an order for a position that is already open.
+        for slot in self.slots.values():
+            if slot.execution and not slot.execution.reconcile():
+                LOGGER.error("[%s] reconciliation failed - execution halted", slot.symbol)
+                return False
+        return True
+
+    def execution_state(self) -> str:
+        """One-word execution status for the dashboard and Telegram panel."""
+        settings = self.execution_settings
+        if not settings.executes:
+            return "SIGNAL_ONLY"
+        if any(s.execution and s.execution.halted for s in self.slots.values()):
+            return "HALTED"
+        return "DEMO_AUTO"
+
+    def demo_trades_today(self, symbol: Optional[str] = None) -> int:
+        if symbol is None:
+            return sum(
+                s.execution.trades_today() for s in self.slots.values() if s.execution
+            )
+        slot = self._slot(symbol)
+        return slot.execution.trades_today() if slot.execution else 0
+
+    def demo_open_trades(self, symbol: Optional[str] = None) -> int:
+        if symbol is None:
+            return sum(
+                len(s.execution.open_trades()) for s in self.slots.values() if s.execution
+            )
+        slot = self._slot(symbol)
+        return len(slot.execution.open_trades()) if slot.execution else 0
+
+    def demo_net_today(self, symbol: Optional[str] = None) -> float:
+        if symbol is None:
+            return round(sum(
+                s.execution.realised_today() for s in self.slots.values() if s.execution
+            ), 2)
+        slot = self._slot(symbol)
+        return slot.execution.realised_today() if slot.execution else 0.0
+
+    def open_trade_lines(self, symbol: Optional[str] = None) -> List[str]:
+        """OPEN TRADES panel body, across every market or just one."""
+        slots = (
+            list(self.slots.values()) if symbol is None else [self._slot(symbol)]
+        )
+        lines: List[str] = []
+        for slot in slots:
+            if slot.execution:
+                lines.extend(slot.execution.describe_open())
+        return lines
+
+    def set_demo_auto(self, enabled: bool) -> bool:
+        """Turn DEMO AUTO on or off from Telegram.
+
+        Enabling re-runs the full arming sequence - connect, verify, reconcile -
+        so the toggle can never arm execution against an unverified account just
+        because it was verified earlier in the session.
+        """
+        settings = self.execution_settings
+        if not enabled:
+            settings.demo_trading_enabled = False
+            LOGGER.info("DEMO AUTO disabled from Telegram")
+            return False
+        settings.demo_trading_enabled = True
+        if not settings.mode.executes:
+            LOGGER.warning(
+                "DEMO AUTO requested but EXECUTION_MODE is %s", settings.mode.value
+            )
+            settings.demo_trading_enabled = False
+            return False
+        if not self.start_execution():
+            return False
+        LOGGER.info("DEMO AUTO enabled from Telegram")
+        return True
+
     def on_market_changed(self, previous: str, current: str) -> None:
         """Hook fired by the Telegram panel after the active market changes.
 
@@ -215,7 +370,9 @@ class SignalRunner:
         return analyse(view.signals_csv, view.outcomes_csv, view)
 
     # -- dashboard ---------------------------------------------------------- #
-    def _print_dashboard(self, mt5_ok: bool, telegram_ok: bool) -> None:
+    def _print_dashboard(
+        self, mt5_ok: bool, telegram_ok: bool, execution_ok: bool = False
+    ) -> None:
         """Print the startup console dashboard."""
         cfg = self.config
         state = self.runtime.describe()
@@ -226,6 +383,8 @@ class SignalRunner:
             "=" * BANNER_WIDTH,
             f"MT5:      {'CONNECTED' if mt5_ok else 'DISCONNECTED'}",
             f"Telegram: {'CONNECTED' if telegram_ok else 'DISABLED / UNAVAILABLE'}",
+            f"Execution: {self.execution_state()}"
+            + ("   (armed on a verified DEMO account)" if execution_ok else ""),
             "",
             f"Active market: {state['label']}",
             f"Mode:      {MODE_SCALPING}      Timeframe: {SIGNAL_TIMEFRAME}",
@@ -251,9 +410,21 @@ class SignalRunner:
                 f"signals today {slot.signals_today() if slot else 0}, "
                 f"open {len(slot.tracker.active_signals()) if slot else 0}",
             ]
+            if slot and slot.execution:
+                lines.append(
+                    f"   demo trades today {slot.execution.trades_today()}, "
+                    f"open {len(slot.execution.open_trades())}, "
+                    f"net {slot.execution.realised_today():+.2f}"
+                )
+        execution_note = (
+            "DEMO AUTO: orders are placed on the configured DEMO account only."
+            if execution_ok else
+            "SIGNAL ONLY - no orders are sent."
+        )
         lines += [
             "",
-            "PAPER TEST ONLY - no orders are ever sent.",
+            execution_note,
+            "This system has no live-trading mode.",
             *[
                 f"{symbol} parameters are INITIAL RESEARCH PARAMETERS."
                 for symbol in MARKET_ORDER
@@ -289,7 +460,9 @@ class SignalRunner:
         # a signal alive after the user switches away from its market.
         needed: List[str] = [
             symbol for symbol in MARKET_ORDER
-            if symbol in evaluating or self.slots[symbol].has_open_signals()
+            if symbol in evaluating
+            or self.slots[symbol].has_open_signals()
+            or self.slots[symbol].has_open_demo_trades()
         ]
         for symbol in needed:
             try:
@@ -313,7 +486,16 @@ class SignalRunner:
         has_new_candle = latest is not None and (
             last_processed is None or latest > last_processed
         )
-        if latest is not None and not has_new_candle and not slot.has_open_signals():
+        # An open DEMO position is managed on EVERY cycle, not only when a
+        # candle closes: a stop or a target can be reached mid-candle, and
+        # waiting a full minute to notice would misreport the exit.
+        self._manage_demo_trades(slot)
+
+        if (
+            latest is not None
+            and not has_new_candle
+            and not slot.has_open_signals()
+        ):
             return
 
         snapshot, reason = self.market.build_snapshot(cfg, use_cache=not has_new_candle)
@@ -353,7 +535,12 @@ class SignalRunner:
             slot.tracker.invalidate_opposite(
                 evaluation.signal.direction, candle_time, snapshot.close
             )
+            # Paper recording happens FIRST and unconditionally.  Execution is a
+            # downstream consumer: whether or not a demo order is placed, the
+            # signal's own outcome keeps being tracked, so signal performance
+            # and execution performance stay independently measurable.
             slot.tracker.record_signal(evaluation.signal)
+            self._execute_signal(slot, evaluation.signal)
         elif evaluation.near_signal:
             LOGGER.info(
                 "[%s] NEAR SIGNAL | best %.1f vs threshold %.1f | %s",
@@ -365,6 +552,42 @@ class SignalRunner:
 
         # 3. remember the candle so it is never processed twice - per market
         market_runtime.mark_candle_processed(iso(candle_time))
+
+    def _execute_signal(self, slot: MarketSlot, signal) -> None:
+        """Hand a recorded signal to the demo execution layer, if it is armed.
+
+        Never raises into the signal loop: a refused or failed demo order must
+        not stop the engine from evaluating the next candle.
+        """
+        if slot.execution is None or not self.execution_settings.executes:
+            return
+        try:
+            decision = slot.execution.execute_signal(signal)
+        except DemoExecutionBlocked as exc:
+            # The account is not a verified demo account.  Turn execution off
+            # for the whole process rather than letting the next signal retry.
+            LOGGER.error("[%s] %s", slot.symbol, exc)
+            self.execution_settings.demo_trading_enabled = False
+            return
+        except Exception as exc:  # noqa: BLE001 - execution must not kill the loop
+            LOGGER.exception("[%s] demo execution failed: %s", slot.symbol, exc)
+            return
+        if not decision.executed and decision.reason:
+            LOGGER.info("[%s] no demo order: %s", slot.symbol, decision.reason)
+
+    def _manage_demo_trades(self, slot: MarketSlot) -> None:
+        """Advance this market's open demo positions.
+
+        Runs for every market with an open position regardless of which one is
+        selected in Telegram and regardless of PAUSE, because a live position
+        must always reach its exit (spec sections 11, 12, 21).
+        """
+        if slot.execution is None or not slot.execution.open_trades():
+            return
+        try:
+            slot.execution.manage()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("[%s] demo trade management failed: %s", slot.symbol, exc)
 
     def _track_open_signals(self, slot: MarketSlot, cfg: Config, snapshot) -> None:
         """Advance this market's open scalps against this market's candles.

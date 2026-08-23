@@ -270,6 +270,7 @@ def isolate(config: Config, root: Path, symbol: Optional[str] = None) -> Config:
     config.signals_csv = config.market_dir / "signals.csv"
     config.evaluations_csv = config.market_dir / "evaluations.csv"
     config.outcomes_csv = config.market_dir / "outcomes.csv"
+    config.executions_csv = config.market_dir / "executions.csv"
     config.state_file = config.market_dir / "state.json"
     config.global_state_file = root / "state.json"
     config.log_file = root / "system_log.txt"

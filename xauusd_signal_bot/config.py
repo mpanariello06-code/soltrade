@@ -204,6 +204,11 @@ class Config:
     symbol: str = field(default_factory=lambda: _env_str("SYMBOL", "XAUUSDs"))
     market_key: str = "xauusds"
 
+    #: Account-currency value of a one-point move on one lot.  Used ONLY by the
+    #: demo execution layer to turn price moves into money; the signal engine
+    #: never sees it.  Market-specific, overwritten by :meth:`for_market`.
+    money_per_point_per_lot: float = 1.0
+
     #: The ONLY signal timeframe.  This is a dedicated M1 scalping system; the
     #: multi-timeframe selector was removed deliberately.
     signal_timeframe: str = "M1"
@@ -529,8 +534,8 @@ class Config:
     # Each market owns a directory so nothing can ever be mixed:
     #
     #     data/state.json              global runtime (active market, run state)
-    #     data/xauusds/{evaluations,signals,outcomes}.csv, state.json
-    #     data/btcusds/{evaluations,signals,outcomes}.csv, state.json
+    #     data/xauusds/{evaluations,signals,outcomes,executions}.csv, state.json
+    #     data/btcusds/{evaluations,signals,outcomes,executions}.csv, state.json
     #
     # The paths below point at the ACTIVE market and are rewritten by
     # :meth:`for_market`.
@@ -540,6 +545,10 @@ class Config:
     signals_csv: Path = DATA_DIR / "xauusds" / "signals.csv"
     evaluations_csv: Path = DATA_DIR / "xauusds" / "evaluations.csv"
     outcomes_csv: Path = DATA_DIR / "xauusds" / "outcomes.csv"
+    #: Demo EXECUTION records.  Deliberately a separate file from outcomes.csv:
+    #: paper results and demo-fill results must be comparable, which means
+    #: neither may overwrite the other (spec section 14).
+    executions_csv: Path = DATA_DIR / "xauusds" / "executions.csv"
     #: Per-market runtime state (threshold, cooldown, last processed candle).
     state_file: Path = DATA_DIR / "xauusds" / "state.json"
     #: Global runtime state (active market, run state, alert preferences).
@@ -666,6 +675,7 @@ class Config:
         view.point_value = market.point_value
         view.pip_value = market.pip_value
         view.pip_name = market.pip_name
+        view.money_per_point_per_lot = market.money_per_point_per_lot
         view.is_24h = market.is_24h
         view.context_timeframe = market.context_timeframe
         view.candles_signal = market.candles_signal
@@ -706,6 +716,7 @@ class Config:
         view.signals_csv = view.market_dir / "signals.csv"
         view.evaluations_csv = view.market_dir / "evaluations.csv"
         view.outcomes_csv = view.market_dir / "outcomes.csv"
+        view.executions_csv = view.market_dir / "executions.csv"
         view.state_file = view.market_dir / "state.json"
         return view
 

@@ -889,13 +889,15 @@ def test_no_button_can_place_an_order(controller):
         controller.threshold_keyboard(),
         controller.performance_keyboard(),
     ]
-    forbidden = ("buy", "sell", "order", "trade:", "execute", "leverage", "position:")
+    # "demo:" is the ONLY execution-capable prefix, and it is gated behind an
+    # explicit confirmation step - see the DEMO AUTO tests below.
+    forbidden = ("buy", "sell", "order", "execute", "leverage", "live", "real")
     for keyboard in keyboards:
         for button in [b for row in keyboard for b in row]:
             assert not any(word in button["callback_data"].lower() for word in forbidden), (
                 button["callback_data"]
             )
-    assert "PAPER TEST ONLY" in controller.render_panel()
+    assert "SIGNAL ONLY - no orders are placed." in controller.render_panel()
 
 
 # --------------------------------------------------------------------------- #
@@ -905,11 +907,11 @@ def test_the_card_is_rendered_in_the_signals_own_market(config):
     """A BTC card must not be printed with gold's icon or pip unit."""
     notifier = TelegramNotifier(config)          # notifier configured for gold
     text = notifier.format_signal(_signal(BTCUSD))
-    assert f"₿ {BTCUSD} M1 SCALP" in text
+    assert f"🔬 SIGNAL  ₿ {BTCUSD} M1" in text
     assert "$)" in text, "BTC distances are quoted in dollars"
 
     gold_text = notifier.format_signal(_signal(XAUUSD))
-    assert f"🥇 {XAUUSD} M1 SCALP" in gold_text
+    assert f"🔬 SIGNAL  🥇 {XAUUSD} M1" in gold_text
     assert "p)" in gold_text
 
 

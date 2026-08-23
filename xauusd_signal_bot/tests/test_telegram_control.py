@@ -53,8 +53,9 @@ def test_main_keyboard_has_only_the_scalping_controls(controller):
     data = button_data(controller.main_keyboard())
     assert data == [
         f"mkt:{XAUUSD}", f"mkt:{BTCUSD}",
-        "view:analysis", "view:performance",
+        "view:analysis", "view:performance", "view:trades",
         "run:pause",                     # single toggle: the engine is RUNNING
+        "demo:confirm",                  # OFF, so the button asks to confirm ON
         "menu:settings", "panel:refresh",
     ]
 
@@ -74,7 +75,7 @@ def test_no_mode_or_timeframe_buttons_remain(controller):
 
 
 def test_panel_carries_the_paper_disclaimer(controller):
-    assert "PAPER TEST ONLY" in controller.render_panel()
+    assert "SIGNAL ONLY - no orders are placed." in controller.render_panel()
 
 
 def test_panel_reports_open_signals_and_net_r(isolated_config, runtime, notifier):

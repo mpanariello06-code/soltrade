@@ -429,7 +429,7 @@ def test_telegram_is_disabled_without_credentials(config):
 
 def test_scalp_message_matches_the_specified_format(config):
     text = TelegramNotifier(config).format_signal(sample_signal("BUY"))
-    assert "🥇 XAUUSD M1 SCALP" in text, "the card is headed with the market's icon"
+    assert "🔬 SIGNAL  🥇 XAUUSD M1" in text, "the card names the market and says SIGNAL"
     assert "Direction: BUY" in text
     assert "Score: 71/100" in text
     assert "Entry: 2300.00" in text
@@ -438,7 +438,7 @@ def test_scalp_message_matches_the_specified_format(config):
     assert "Expected holding period:" in text and "SHORT" in text
     assert "Spread:" in text
     assert "Risk/Reward:" in text
-    assert "PAPER TEST ONLY" in text
+    assert "SIGNAL ONLY - no demo order was placed." in text
 
 
 def test_scalp_message_reports_reward_after_costs(config):

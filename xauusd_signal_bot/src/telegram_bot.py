@@ -178,7 +178,7 @@ class TelegramNotifier:
         return []
 
     # -- formatting --------------------------------------------------------- #
-    PAPER_DISCLAIMER = "🔬 PAPER TEST ONLY"
+    PAPER_DISCLAIMER = "🔬 SIGNAL ONLY - no demo order was placed."
 
     def _view(self, symbol: str):
         """Config folded onto ``symbol``'s market.
@@ -208,7 +208,7 @@ class TelegramNotifier:
         spread_price = signal.spread_points * view.point_value
         lines = [
             DIVIDER,
-            f"{self._icon(signal.symbol)} {signal.symbol} M1 SCALP",
+            f"🔬 SIGNAL  {self._icon(signal.symbol)} {signal.symbol} M1",
             DIVIDER,
             "",
             f"Direction: {signal.direction}",

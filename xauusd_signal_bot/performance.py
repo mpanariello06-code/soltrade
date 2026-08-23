@@ -508,6 +508,136 @@ def analyse(
     return report
 
 
+# --------------------------------------------------------------------------- #
+# signal results vs demo-execution results
+# --------------------------------------------------------------------------- #
+@dataclass
+class ExecutionStats:
+    """What a market's DEMO FILLS actually produced.
+
+    Deliberately a separate type from :class:`Stats`.  Paper results and demo
+    results are never merged and never overwrite one another: the whole point of
+    the execution layer is to measure the gap between them (spec section 14).
+    """
+
+    symbol: str = ""
+    trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    timeouts: int = 0
+    win_rate: float = 0.0
+    average_r: float = 0.0
+    total_r: float = 0.0
+    gross_profit: float = 0.0
+    net_profit: float = 0.0
+    average_slippage_points: float = 0.0
+    average_spread_points: float = 0.0
+    average_holding_seconds: float = 0.0
+    max_drawdown_r: float = 0.0
+    tp1_rate: float = 0.0
+    tp2_rate: float = 0.0
+    tp3_rate: float = 0.0
+    sl_rate: float = 0.0
+
+    def as_row(self) -> Dict[str, Any]:
+        return {
+            "group": self.symbol or "ALL",
+            "n": self.trades,
+            "win%": round(self.win_rate, 1),
+            "avgR": round(self.average_r, 3),
+            "totR": round(self.total_r, 2),
+            "netP/L": round(self.net_profit, 2),
+            "slipPts": round(self.average_slippage_points, 2),
+            "holdS": round(self.average_holding_seconds, 1),
+            "maxDD": round(self.max_drawdown_r, 2),
+        }
+
+
+def analyse_executions(executions_path: Path, symbol: str = "") -> ExecutionStats:
+    """Summarise one market's ``executions.csv``.
+
+    Empty or missing file yields an all-zero result rather than an error: a
+    market that has never executed is a normal state, not a problem.
+    """
+    frame = load_frame(executions_path)
+    stats = ExecutionStats(symbol=symbol)
+    if frame.empty:
+        return stats
+
+    def numbers(column: str) -> pd.Series:
+        return pd.to_numeric(frame.get(column), errors="coerce")
+
+    results = frame.get("result")
+    results = results.astype(str) if results is not None else pd.Series(dtype=str)
+    r_values = numbers("R_multiple").dropna()
+    net = numbers("net_profit").fillna(0.0)
+
+    stats.trades = int(len(frame))
+    stats.wins = int((net > 0).sum())
+    stats.losses = int((net < 0).sum())
+    stats.timeouts = int((results == "TIMEOUT").sum())
+    stats.win_rate = safe_div(stats.wins * 100.0, stats.trades, 0.0)
+    stats.average_r = float(r_values.mean()) if len(r_values) else 0.0
+    stats.total_r = float(r_values.sum()) if len(r_values) else 0.0
+    stats.gross_profit = float(numbers("gross_profit").fillna(0.0).sum())
+    stats.net_profit = float(net.sum())
+    stats.average_slippage_points = float(numbers("slippage_points").dropna().mean() or 0.0)
+    stats.average_spread_points = float(numbers("spread_at_entry").dropna().mean() or 0.0)
+    stats.average_holding_seconds = float(numbers("holding_seconds").dropna().mean() or 0.0)
+    stats.tp1_rate = safe_div(int(numbers("tp1_filled").fillna(0).sum()) * 100.0, stats.trades, 0.0)
+    stats.tp2_rate = safe_div(int(numbers("tp2_filled").fillna(0).sum()) * 100.0, stats.trades, 0.0)
+    stats.tp3_rate = safe_div(int(numbers("tp3_filled").fillna(0).sum()) * 100.0, stats.trades, 0.0)
+    stats.sl_rate = safe_div(int((results == "SL_HIT").sum()) * 100.0, stats.trades, 0.0)
+
+    if len(r_values):
+        equity = r_values.cumsum()
+        stats.max_drawdown_r = float((equity.cummax() - equity).max() or 0.0)
+    return stats
+
+
+@dataclass
+class ExecutionComparison:
+    """Signal expectancy beside demo expectancy, and the gap between them."""
+
+    symbol: str
+    signal_average_r: float = 0.0
+    signal_trades: int = 0
+    execution_average_r: float = 0.0
+    execution_trades: int = 0
+
+    @property
+    def degradation(self) -> float:
+        """How much R per trade is lost to execution.
+
+        Positive means the demo fills did WORSE than the paper signals, which is
+        the expected direction: spread, slippage and latency all cost something.
+        """
+        return round(self.signal_average_r - self.execution_average_r, 4)
+
+    @property
+    def comparable(self) -> bool:
+        """Whether the two sides have enough trades to be worth comparing.
+
+        A handful of demo fills against hundreds of paper signals is not a
+        measurement, and reporting a "degradation" from it would be misleading.
+        """
+        return self.signal_trades >= 1 and self.execution_trades >= 10
+
+
+def compare_signal_and_execution(config, symbol: str) -> ExecutionComparison:
+    """Build the signal-versus-execution comparison for one market."""
+    view = config.for_market(symbol)
+    signal_report = analyse(view.signals_csv, view.outcomes_csv, view)
+    execution = analyse_executions(view.executions_csv, symbol)
+    return ExecutionComparison(
+        symbol=symbol,
+        signal_average_r=round(signal_report.overall.average_net_r, 4),
+        signal_trades=signal_report.overall.closed,
+        execution_average_r=round(execution.average_r, 4),
+        execution_trades=execution.trades,
+    )
+
+
 def analyse_combined(config, symbols: Sequence[str]) -> Report:
     """Merge several markets into one clearly-labelled report.
 
