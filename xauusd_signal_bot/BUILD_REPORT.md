@@ -1,4 +1,219 @@
-# Build Report — Adding BTCUSD as a Second Market
+# Build Report — DEMO Auto-Execution Layer
+
+Fifth iteration of `xauusd_signal_bot`. **The project was not rebuilt, and no
+signal-generation logic changed.** A DEMO-only execution layer was added
+downstream of the existing engine so that the gap between paper expectancy and
+real fills can be measured.
+
+* **Tests:** 362 passing (280 before + 82 new execution tests), ~110 s
+* **Static analysis:** `pyflakes` clean across every module
+* **Live trading:** none, and none can be configured — see [§C2](#c2-there-is-no-live-mode)
+* **Default mode:** `SIGNAL_ONLY`. Execution is opt-in on two independent switches.
+
+---
+
+## C1. Architecture
+
+```
+Signal Engine → Signal → ExecutionManager → DEMO BROKER → Position
+                              │                               │
+                              └──── TP / SL / timeout ────────┘
+                                          │
+                              executions.csv + Telegram
+```
+
+Three new modules, none of which the signal path imports:
+
+| Module | Responsibility |
+|---|---|
+| `src/execution_config.py` | Modes, the demo-account guard, the risk model. Everything deciding *whether* an order may be sent. |
+| `src/demo_broker.py` | A `DemoBroker` port, the MT5 adapter, and a scripted fake. Transmits; decides nothing. |
+| `src/demo_execution.py` | The manager: gates, sizing, fills, the partial ladder, stop/timeout, reconciliation, `executions.csv`. |
+
+The split between the first and third is deliberate. A reviewer can read
+`execution_config.py` alone and satisfy themselves that the default is safe and
+that no live mode exists, without reading any trading code.
+
+`signal_engine.py` and every analysis engine are untouched and contain no
+reference to a broker, an order or the execution layer; a test asserts it.
+Execution consumes a *completed* signal and uses its symbol, direction, entry,
+SL, TP1–TP3, score, timeframe and timestamp verbatim.
+
+One `ExecutionManager` per market, created in `MarketSlot` beside the existing
+paper tracker, so gold and Bitcoin share the broker connection and nothing else.
+
+## C2. There is no live mode
+
+`ExecutionMode` has exactly two members. `assert_no_live_mode()` runs at import
+and in the suite, and raises if any member's name contains `LIVE`, `REAL` or
+`PROD`, or if the member count is not two. Adding `LIVE_AUTO` therefore breaks
+the build rather than quietly turning a research tool into a trading system.
+
+`parse_execution_mode()` maps anything unrecognised — including `LIVE_AUTO` —
+to `SIGNAL_ONLY` with a warning. There is no spelling of `EXECUTION_MODE` that
+enables real trading.
+
+## C3. Demo-only safety
+
+Execution requires **three** independent things, and any one missing means no
+orders are sent:
+
+1. `EXECUTION_MODE=DEMO_AUTO`
+2. `DEMO_TRADING_ENABLED=true`
+3. dedicated `DEMO_MT5_*` credentials
+
+The demo credentials are deliberately **not** the `MT5_*` data-feed ones.
+Reusing them would mean that re-pointing the data feed at a live account
+silently armed execution against it.
+
+Ten gates run in order before any transmission; the first failure aborts:
+
+| # | Gate |
+|---|---|
+| 1 | signal has an id and has not been processed before |
+| 2 | both switches + demo credentials |
+| 3 | **account positively verified as DEMO** |
+| 4 | broker symbol exists on the account |
+| 5 | a usable quote is available |
+| 6 | spread within the limit |
+| 7 | SL/TP coherent, correctly sided, not absurdly distant |
+| 8 | open-position, daily-trade and daily-loss limits |
+| 9 | position size resolves to a tradeable lot |
+| 10 | order accepted, and stops read back and verified |
+
+**The account gate has no optimistic branch.** `classify_account()` sets
+`is_demo=True` only for MT5 trade mode `0`. A live account, a *contest* account
+(mode 1), a missing account object and a failed `account_info()` call all yield
+`is_demo=False`, and all are refused with `DEMO_EXECUTION_BLOCKED` and a
+Telegram alert. The check runs before **every** order, never cached, because a
+terminal can be re-pointed mid-session and a stale "yes, demo" is the worst
+possible thing to cache. A test asserts that changing the account between two
+signals stops the second order.
+
+Refusals return a decision object rather than raising — a blocked trade is a
+normal, loggable outcome — except an unverified or live account, which raises so
+it can never be mistaken for a routine skip.
+
+## C4. Position sizing
+
+Never hard-coded. Derived from the **signal's own stop distance**, so a wider
+stop takes a smaller position and risk per trade stays comparable:
+
+```
+risk_amount = DEMO_ACCOUNT_BALANCE × DEMO_RISK_PER_TRADE
+lots        = risk_amount / (stop_points × money_per_point_per_lot)
+```
+
+Then **floored** onto the lot grid — never rounded up, which would risk more
+than configured, an error that is a large share of a micro-scalp — and clamped
+into `[MIN_DEMO_LOT, MAX_DEMO_LOT]` and under `MAX_ORDER_LOTS`. A size below the
+broker minimum is a rejection, not a minimum-size trade. `SizingResult` carries
+the requested size, approved size, stop distance, risk amount and the reason
+they differ, and it is logged on every decision.
+
+The balance used is **notional**, not the broker's. A demo balance is arbitrary,
+and letting it drive size makes runs incomparable.
+
+## C5. Entry, SL/TP and management
+
+* **A BUY lifts the ask, a SELL hits the bid.** The candle close is never used
+  as an execution price. `signal_entry`, `requested_price` and
+  `actual_fill_price` are three separate recorded fields, with signed slippage
+  derived from the last two.
+* **The signal's levels are used verbatim.** MT5 holds one TP per position, so
+  the broker holds TP3 as a hard target and the manager runs a configurable
+  partial ladder (default 33/33/34, not claimed optimal) for TP1 and TP2.
+* **Stops are read back after the fill**, not assumed from the request, and
+  attached if missing. An accepted order with no protection is the dangerous
+  case.
+* Positions are managed on **every poll**, not only on candle close, because a
+  stop can be reached mid-candle.
+* Where one observation could be read as either the stop or a target, **the stop
+  wins**. Anything else would flatter the result.
+* **Breakeven follows `MOVE_SL_TO_BREAKEVEN_AFTER_TP1`** rather than deciding
+  for itself — used if the strategy uses it, not introduced if it does not.
+* **Timeout reuses `MAX_HOLDING_CANDLES`.** No new timeout concept.
+
+One bug worth recording: the first implementation measured R against the
+*current* stop, so the breakeven move after TP1 set the denominator to zero and
+R vanished from every winning trade. `initial_risk` is now captured at entry and
+frozen; a test asserts R survives a breakeven move.
+
+## C6. Failure handling
+
+* **A signal is marked processed BEFORE the order is transmitted.** If the send
+  raises or the reply is lost, it is never blindly retried.
+* An **indeterminate** reply (exception, or `None` from `order_send`) is
+  distinguished from a rejection: the order may exist, so execution **halts**
+  and asks for reconciliation rather than retrying.
+* Rejections, invalid volume, invalid stops, unavailable symbol, missing quote
+  and partial fills are each logged with the broker's own reason and surfaced to
+  Telegram. A partial fill is recorded at the size actually filled.
+* Halting stops **new** orders only; open positions keep being managed.
+
+## C7. Restart recovery
+
+On start-up and after any reconnection, **before any new order**: connect,
+verify the account, read positions carrying our magic number, match them to
+stored trades, restore tracking. Three outcomes:
+
+* a stored trade whose position is **gone** closed while we were away — recorded
+  honestly, with `notes` saying the exit price was not observed, rather than
+  tracked forever;
+* a position we have **no record of** is adopted so it is still managed;
+* a **failure to read positions halts execution**, because opening new trades
+  against an unknown book is how duplicates happen.
+
+Processed signal ids persist in the market's `state.json`, so a restart cannot
+re-execute a live signal. The existing "do not replay old Telegram callbacks"
+fix is preserved and re-tested with a queued `demo:on` press.
+
+## C8. Logging and reporting
+
+`data/<market>/executions.csv`, one row carrying **signal, execution and outcome
+together** so a fill traces back to its signal.
+
+**Execution results never overwrite signal results.** `outcomes.csv` keeps being
+written for every signal whether or not it was executed — which is the entire
+point of the layer. `performance.py` gains `analyse_executions()` and
+`compare_signal_and_execution()`, and Telegram gains a `🤖 DEMO EXECUTION` view
+showing signal average R beside execution average R and the degradation between
+them. The comparison is suppressed below 10 demo fills, because a handful of
+trades against hundreds of paper signals is not a measurement.
+
+## C9. Telegram
+
+Panel gains `Execution:`, `Open Demo Trades:`, `Today's Demo Trades:` and
+`Today's Net P/L:`; the footer switches between `🔬 SIGNAL ONLY` and
+`🤖 DEMO AUTO`. New buttons: `💼 OPEN TRADES` and the `🔴/🟢 DEMO AUTO` toggle.
+
+**Enabling is never implicit.** The OFF button routes to `demo:confirm`, which
+only renders a warning; only an explicit `demo:on` asks the engine to arm, and
+the engine re-runs the whole connect/verify/reconcile sequence before reporting
+success. A refused enable reports why rather than showing ON.
+
+Signal cards now say `🔬 SIGNAL … no demo order was placed` in `SIGNAL_ONLY`,
+and executed trades get their own `🤖 DEMO TRADE OPENED` and
+`📊 DEMO TRADE CLOSED` messages carrying fill, slippage, gross, costs, net and R.
+
+## C10. Known limitations
+
+* **Demo fills are not live fills.** Demo servers typically fill better — less
+  requoting, less asymmetric slippage, no market impact. Demo results are an
+  *upper bound* on live execution.
+* **`money_per_point_per_lot` is an assumption** (gold $1.00, Bitcoin $0.01 per
+  point per lot). Contract sizes vary between brokers.
+* **`estimated_cost` is modelled, not billed**, and deducted once per trade
+  rather than per partial close, so net R is mildly optimistic on a full ladder.
+* A position closed while the bot was offline has an unobserved exit price.
+* Sizing uses a notional balance and does not track the demo account's equity.
+* The MT5 adapter itself is only exercised by the fake in tests — it cannot be
+  integration-tested on Linux, so its request shapes are unverified against a
+  live terminal.
+
+---
+
+# Build Report — Adding BTCUSD as a Second Market (previous iteration)
 
 Fourth iteration of `xauusd_signal_bot`. **The project was not rebuilt, and no
 separate BTC bot was created.** The existing M1 scalping engine was made

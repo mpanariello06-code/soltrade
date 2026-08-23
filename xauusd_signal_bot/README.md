@@ -24,10 +24,16 @@ CSV logging
 outcome tracking with timeout, milestone timing, RAW **and NET** R
 ```
 
-> **This system never places, modifies or closes a trade.**
-> MetaTrader 5 is used as a *read-only market-data feed*. No order-execution
-> function is imported or called anywhere. It is a paper-signal and research
-> tool.
+> **Default: this system never places a trade.**
+> In the default `SIGNAL_ONLY` mode, MetaTrader 5 is a *read-only market-data
+> feed* and no order function is called anywhere.
+>
+> An optional **`DEMO_AUTO`** mode executes signals on a **verified demo
+> account** so the gap between paper expectancy and real fills can be measured.
+> It is off by default, requires two independent switches plus dedicated demo
+> credentials, and re-verifies the account before every single order.
+> **There is no live-trading mode, and one cannot be enabled by configuration.**
+> See [Demo auto-execution](#demo-auto-execution).
 
 > **No profitability claim is made — and the measured results are negative.**
 > See [Honest assessment](#honest-assessment). Reading only the RAW numbers
@@ -45,28 +51,29 @@ selector and the RESEARCH/STANDARD/CONSERVATIVE modes were removed.
 
 1. [Quick start (Windows)](#quick-start-windows)
 2. [Markets](#markets)
-3. [Project layout](#project-layout)
-4. [What "scalping" means here](#what-scalping-means-here)
-5. [The cost model](#the-cost-model)
-6. [Targets](#targets)
-7. [Telegram control panel](#telegram-control-panel)
-8. [How the signal engine works](#how-the-signal-engine-works)
-9. [Scoring](#scoring)
-10. [Filtering](#filtering)
-11. [Near-signal diagnostic](#near-signal-diagnostic)
-12. [Telegram messages](#telegram-messages)
-13. [Where data is stored](#where-data-is-stored)
-14. [Outcome tracking, timeout and the R model](#outcome-tracking-timeout-and-the-r-model)
-15. [Backtesting](#backtesting)
-16. [Walk-forward testing](#walk-forward-testing)
-17. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
-18. [Calibration](#calibration)
-19. [Timezones](#timezones)
-20. [Anti-lookahead guarantees](#anti-lookahead-guarantees)
-21. [Tests](#tests)
-22. [Honest assessment](#honest-assessment)
-23. [Known limitations](#known-limitations)
-24. [Recommended next steps](#recommended-next-steps)
+3. [Demo auto-execution](#demo-auto-execution)
+4. [Project layout](#project-layout)
+5. [What "scalping" means here](#what-scalping-means-here)
+6. [The cost model](#the-cost-model)
+7. [Targets](#targets)
+8. [Telegram control panel](#telegram-control-panel)
+9. [How the signal engine works](#how-the-signal-engine-works)
+10. [Scoring](#scoring)
+11. [Filtering](#filtering)
+12. [Near-signal diagnostic](#near-signal-diagnostic)
+13. [Telegram messages](#telegram-messages)
+14. [Where data is stored](#where-data-is-stored)
+15. [Outcome tracking, timeout and the R model](#outcome-tracking-timeout-and-the-r-model)
+16. [Backtesting](#backtesting)
+17. [Walk-forward testing](#walk-forward-testing)
+18. [Paper testing and reading the results](#paper-testing-and-reading-the-results)
+19. [Calibration](#calibration)
+20. [Timezones](#timezones)
+21. [Anti-lookahead guarantees](#anti-lookahead-guarantees)
+22. [Tests](#tests)
+23. [Honest assessment](#honest-assessment)
+24. [Known limitations](#known-limitations)
+25. [Recommended next steps](#recommended-next-steps)
 
 ---
 
@@ -308,6 +315,232 @@ report or Telegram change is required; `tests/test_markets.py` asserts this.
 
 ---
 
+## Demo auto-execution
+
+**`DEMO_AUTO` is for testing only.** It exists to answer one question: *how much
+of the paper edge survives real fills?* It places orders on a demo account so
+spread, slippage and latency can be measured rather than assumed.
+
+```
+Signal Engine → Signal → Execution Manager → DEMO BROKER → Position
+                              │                               │
+                              └──── TP / SL / timeout ────────┘
+                                          │
+                              executions.csv + Telegram
+```
+
+The signal engine is **unchanged and independent**. It does not know execution
+exists: no broker function is imported or called anywhere in `signal_engine.py`
+or any analysis engine, and a test asserts it. Execution is a downstream
+consumer of a completed signal, using that signal's own symbol, direction,
+entry, SL, TP1–TP3, score, timeframe and timestamp verbatim. It never generates
+an entry of its own and never recalculates a level.
+
+### There is no live mode
+
+`ExecutionMode` has exactly two members, `SIGNAL_ONLY` and `DEMO_AUTO`.
+`assert_no_live_mode()` runs at import and in the test suite, and fails the
+build if a member whose name contains `LIVE`, `REAL` or `PROD` is ever added.
+No spelling of `EXECUTION_MODE` enables real trading — an unrecognised value,
+including a hopeful `LIVE_AUTO`, falls back to `SIGNAL_ONLY` with a warning.
+
+### Turning it on
+
+Three things are required, and any one missing means no orders:
+
+```dotenv
+EXECUTION_MODE=DEMO_AUTO      # switch 1
+DEMO_TRADING_ENABLED=true     # switch 2, independent
+
+DEMO_MT5_LOGIN=...            # dedicated demo credentials
+DEMO_MT5_PASSWORD=...
+DEMO_MT5_SERVER=...
+```
+
+The demo credentials are deliberately **not** the `MT5_*` data-feed ones.
+Keeping them separate means pointing the data feed at a live account cannot
+silently arm execution against it.
+
+Then enable it in Telegram, which requires an explicit confirmation:
+
+```
+[🔴 DEMO AUTO OFF]  →  ⚠️ ENABLE DEMO AUTO?  →  [✅ ENABLE] [❌ CANCEL]
+```
+
+### Safety checks
+
+Ten gates run in order before any order is transmitted; the first failure
+aborts and nothing is sent.
+
+| # | Gate | On failure |
+|---|---|---|
+| 1 | Signal has an id, and has not been executed before | skip silently |
+| 2 | Both mode switches and demo credentials present | skip, log |
+| 3 | **Account positively verified as DEMO** | `DEMO_EXECUTION_BLOCKED`, Telegram alert |
+| 4 | Broker symbol exists on the account | skip, Telegram alert |
+| 5 | A usable quote is available | skip, Telegram alert |
+| 6 | Spread within the limit | skip, Telegram alert |
+| 7 | SL/TP coherent and not absurdly distant | skip, Telegram alert |
+| 8 | Open-position, daily-trade and daily-loss limits | skip, Telegram alert |
+| 9 | Position size resolves to a tradeable lot | skip, Telegram alert with the arithmetic |
+| 10 | Broker accepts the order, and stops are read back | alert; attach stops if missing |
+
+**The account gate has no optimistic branch.** Only MT5 trade mode `0` counts as
+demo. A live account, a *contest* account, a missing account object and a failed
+`account_info()` call all produce `is_demo=False`, and all are refused. The check
+is repeated before **every** order, not cached at start-up, because a terminal
+can be re-pointed at a different account while the process runs.
+
+### Position sizing
+
+Lot size is never hard-coded. It is derived from the **signal's own stop
+distance**, so a wider stop takes a smaller position and risk per trade stays
+comparable across signals:
+
+```
+risk_amount = DEMO_ACCOUNT_BALANCE × DEMO_RISK_PER_TRADE
+lots        = risk_amount / (stop_distance_in_points × money_per_point_per_lot)
+```
+
+then floored onto the lot grid (never rounded up — rounding up would risk more
+than configured) and clamped into `[MIN_DEMO_LOT, MAX_DEMO_LOT]` and under
+`MAX_ORDER_LOTS`. A size below the broker minimum is a **rejection**, not a
+minimum-size trade. Every decision logs the requested size, the approved size,
+the stop distance and the risk amount.
+
+### Entry price, SL and TP
+
+A BUY lifts the **ask**; a SELL hits the **bid**. The candle close is never used
+as an execution price — at a three-pip target, half the spread is not a rounding
+error. Three prices are recorded separately for every trade:
+
+| Field | Meaning |
+|---|---|
+| `signal_entry` | what the engine said |
+| `requested_price` | the side of the book we asked for |
+| `actual_fill_price` | what the broker actually gave us |
+
+`slippage_points` is derived from the last two, signed so positive always means
+"worse for this trade".
+
+MT5 holds one TP per position, so **the broker holds TP3** as a hard target and
+the manager runs a partial ladder for TP1 and TP2. The fractions are
+configurable and are *not* claimed optimal:
+
+```dotenv
+TP1_CLOSE_FRACTION=0.33
+TP2_CLOSE_FRACTION=0.33
+TP3_CLOSE_FRACTION=0.34
+```
+
+After the fill the position is **read back** and its SL/TP verified; if either
+is missing it is attached, and a failure to attach raises a Telegram alert. An
+accepted order with no protection is the dangerous case.
+
+### Stop, breakeven and timeout
+
+Open positions are managed on **every poll**, not only when a candle closes — a
+stop can be reached mid-candle, and waiting a minute would misreport the exit.
+Where a single observation could be read as either the stop or a target, **the
+stop wins**; anything else would flatter the result.
+
+Breakeven **follows the existing strategy setting**
+(`MOVE_SL_TO_BREAKEVEN_AFTER_TP1`) rather than deciding for itself. If the
+strategy uses it, execution does; if it does not, execution does not introduce
+it. R is measured against the risk at the **actual fill, frozen at entry**, so
+moving the stop to breakeven cannot rewrite the denominator.
+
+Timeout reuses the scalper's existing `MAX_HOLDING_CANDLES` window — no new
+timeout concept is introduced. A position still open at the limit is closed and
+recorded as `TIMEOUT` with its real exit price.
+
+### Restart recovery
+
+On start-up and after any reconnection, **before any new order can be placed**:
+
+1. connect with the demo credentials;
+2. verify the account is demo;
+3. read the broker's open positions carrying our magic number;
+4. match them to locally recorded trades;
+5. restore tracking and continue SL/TP/timeout management.
+
+Three outcomes are handled explicitly: a stored trade whose position is **gone**
+closed while we were away and is recorded as such rather than tracked forever;
+a position we have **no record of** is adopted so it is still managed rather
+than abandoned; and a **failure to read positions at all halts execution**,
+because opening new trades against an unknown book is how duplicates happen.
+
+Processed signal ids are persisted, so a restart cannot re-execute a signal —
+and a signal is marked processed *before* the order is transmitted, so an order
+whose outcome is unknown is never blindly retried. An indeterminate reply halts
+execution and asks for reconciliation instead.
+
+### Execution logging
+
+Each market gets `data/<market>/executions.csv`, alongside its paper files. One
+row carries **signal, execution and outcome together**, so a fill can always be
+traced back to the signal that caused it:
+
+| Block | Fields |
+|---|---|
+| Signal | `signal_id`, `symbol`, `timeframe`, `direction`, `signal_timestamp`, `signal_entry`, `sl`, `tp1-3`, `signal_score`, `threshold`, `regime`, `session` |
+| Execution | `order_id`, `broker_ticket`, `broker_symbol`, `requested_price`, `actual_fill_price`, `spread_at_entry`, `slippage_points`, `position_size`, `execution_timestamp`, `account_login`, `account_type` |
+| Outcome | `result`, `exit_price`, `exit_timestamp`, `holding_seconds`, `gross_profit`, `estimated_cost`, `net_profit`, `R_multiple`, `tp1/2/3_filled` |
+
+### Signal results vs execution results
+
+**Execution results never overwrite signal results.** `outcomes.csv` keeps being
+written for every signal whether or not it was executed, so the two are always
+independently measurable — which is the entire point of the layer:
+
+```
+📈 PERFORMANCE → 🤖 DEMO EXECUTION
+
+  Signal avg R:    +0.320  (184 closed)
+  Execution avg R: +0.180  (46 filled)
+  Execution cost:  +0.140R per trade
+```
+
+The comparison is suppressed below 10 demo fills: a handful of trades against
+hundreds of paper signals is not a measurement.
+
+### Telegram controls
+
+| Control | Effect |
+|---|---|
+| `🔴/🟢 DEMO AUTO` | Toggles execution. **ON requires confirmation**; OFF is immediate. A refused enable reports why rather than showing ON. |
+| `💼 OPEN TRADES` | Every open demo position with entry, current price, SL, TP1–3, size and age, plus REFRESH. No manual close — closing is the manager's job. |
+| `🤖 DEMO EXECUTION` | The comparison above, per market. |
+
+The main panel gains `Execution:`, `Open Demo Trades:`, `Today's Demo Trades:`
+and `Today's Net P/L:`.
+
+**Switching market never disturbs a demo trade.** An open XAUUSDs position keeps
+being managed against its own quotes after switching to BTCUSDs, and vice versa —
+each market has its own manager, tickets, limits and `executions.csv`.
+
+### Limitations
+
+* **This is not a trading system**, and must not be repurposed as one. It has no
+  live mode, and adding one fails the build.
+* **Demo fills are not live fills.** Demo servers typically fill better than
+  live ones — less requoting, less asymmetric slippage, no real market impact.
+  Demo results are an *upper bound* on what live execution would give.
+* **`money_per_point_per_lot` is an assumption** (gold $1.00, Bitcoin $0.01 per
+  point per lot). Contract sizes vary between brokers — check yours before
+  trusting any P/L figure.
+* **`estimated_cost` is modelled, not billed.** It uses the market's own cost
+  assumptions so demo net R and paper net R are computed on the same basis; it
+  is not the broker's actual commission and swap.
+* Costs are deducted **once per trade**, not per partial close, so net R is
+  mildly optimistic when the full TP ladder fires.
+* A position closed **while the bot was offline** is recorded with its exit
+  price unobserved, and flagged in `notes`.
+* Sizing uses a **notional** balance, not the broker's, so runs stay comparable.
+  It does not track the demo account's real equity curve.
+
+---
+
 ## Project layout
 
 ```
@@ -327,9 +560,10 @@ xauusd_signal_bot/
 │   ├── xauusds/             gold's data - never mixed with Bitcoin's
 │   │   ├── signals.csv      one row per signal, status updated in place
 │   │   ├── evaluations.csv  one row per evaluated candle (signal or not)
-│   │   ├── outcomes.csv     one row per closed signal
-│   │   └── state.json       gold's settings + last processed M1 candle
-│   └── btcusds/             same five files, Bitcoin's own
+│   │   ├── outcomes.csv     one row per closed PAPER signal
+│   │   ├── executions.csv   one row per closed DEMO trade (opt-in mode)
+│   │   └── state.json       gold's settings, candle marker, open demo trades
+│   └── btcusds/             same six files, Bitcoin's own
 ├── src/
 │   ├── market_data.py       MT5 access (READ-ONLY), validation, ticks, resampling
 │   ├── indicators.py        EMA/RSI/MACD/ATR/ADX/Stoch/BB/swings
@@ -342,7 +576,10 @@ xauusd_signal_bot/
 │   ├── volatility.py        ATR regime (0-5, direction-neutral)
 │   ├── price_action.py      candle confirmation (0-5)
 │   ├── regime.py            market-regime classifier
-│   ├── markets.py           MarketConfig per instrument (XAUUSD, BTCUSD)
+│   ├── markets.py           MarketConfig per instrument (XAUUSDs, BTCUSDs)
+│   ├── execution_config.py  execution modes, demo gating, the risk model
+│   ├── demo_broker.py       DemoBroker port, MT5 adapter, scripted fake
+│   ├── demo_execution.py    DEMO execution manager (opt-in; no live mode)
 │   ├── timeframes.py        M1 / SCALPING constants
 │   ├── runtime_state.py     global state + one MarketRuntime per market
 │   ├── telegram_control.py  inline-button control panel
@@ -693,8 +930,8 @@ one market, and every row is self-identifying (`symbol`, `timeframe`,
 data/
 ├── state.json          GLOBAL - run status, active_market
 ├── system_log.txt
-├── xauusds/  signals.csv  evaluations.csv  outcomes.csv  state.json
-└── btcusds/  signals.csv  evaluations.csv  outcomes.csv  state.json
+├── xauusds/  signals.csv  evaluations.csv  outcomes.csv  executions.csv  state.json
+└── btcusds/  signals.csv  evaluations.csv  outcomes.csv  executions.csv  state.json
 ```
 
 Each `state.json` has exactly **one writer**. The global file is written only by
@@ -708,7 +945,8 @@ clobbering each other's keys, and it is covered by a test.
 | `signals.csv` | One row per scalp; `status` updated in place. Carries `symbol`, `timeframe`, `timestamp`, direction, entry, TP1-3, SL, score, bullish/bearish score, threshold used, regime, session, and the full geometry and cost at signal time: `spread_points`, `estimated_slippage`, `cost_pips`, `cost_r`, `sl_pips`, `tp1/2/3_pips`, `atr`, `rr1-3`, `net_rr1-3`, `expected_hold` |
 | `evaluations.csv` | **Every** evaluated M1 candle: all nine sub-scores, regime, spread, decision (`BUY`/`SELL`/`NO_SIGNAL`/`NEAR_SIGNAL`), rejection reason, threshold used, near-signal flag, plus **41** raw `f_*` feature columns including the M1 microstructure block (`atr_pips`, `spread_pips`, `cost_pips`, `atr_to_cost`, `velocity_pips_per_min`, `acceleration`, `micro_range_pips_5/15`, `dist_to_high/low_5_pips`, `close_location`, `minute_of_hour`, `hour_of_day`) |
 | `outcomes.csv` | One row per closed scalp: `symbol`, result (incl. `TIMEOUT`), exit level, **`raw_r` and `net_r`**, `cost_r`, `spread_points`, `estimated_slippage`, `minutes_to_tp1/2/3`, `minutes_to_sl`, `bars_to_*`, `mfe_price`/`mae_price`, `mfe_pips`/`mae_pips`, `timeout`, `ambiguous_bars`, holding time |
-| `<market>/state.json` | `last_processed_candles` (that market's M1 marker), `last_signal_id`, `last_signal_time`, and a `runtime` section holding that market's live Telegram-controlled settings |
+| `executions.csv` | One row per closed DEMO trade, carrying the signal, the execution and the outcome together. Written only in `DEMO_AUTO` mode; **never overwrites `outcomes.csv`** |
+| `<market>/state.json` | `last_processed_candles` (that market's M1 marker), `last_signal_id`, `last_signal_time`, a `runtime` section with that market's live Telegram settings, and an `execution` section with processed signal ids and open demo trades |
 | `state.json` *(global)* | Run status (`RUNNING`/`PAUSED`/`STOPPED`), `active_market`, near-signal alert flag |
 | `system_log.txt` | Rotating log (5 MB × 3), shared |
 
@@ -968,7 +1206,7 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-280 tests covering indicator correctness and causality, no-repaint swings,
+362 tests covering indicator correctness and causality, no-repaint swings,
 score aggregation and weight renormalisation, the adaptive threshold, bull/bear
 separation, the spread and **net** R:R gates, the cost model, target geometry
 (ATR scaling, pip floors, percentage floors, cost floors, proportional lifting,
@@ -1015,7 +1253,39 @@ prevention, restart safety, and the backtester's no-lookahead guarantees.
   per-market analysis, per-market (not merged) performance, and that no button
   on any panel maps to an order.
 
-Runtime is about 100 seconds.
+`tests/test_demo_execution.py` (82 tests) covers the execution layer, entirely
+against a scripted fake broker — **no test can reach a real account**:
+
+* that there are exactly two modes, neither live, that the default is
+  `SIGNAL_ONLY`, and that no spelling of `EXECUTION_MODE` enables trading;
+* that both switches AND dedicated demo credentials are required;
+* **that a live account raises `DEMO_EXECUTION_BLOCKED` and transmits no order
+  request at all** — asserted by inspecting the broker's sent list, not just a
+  return value (spec section 27);
+* that an unverifiable account, a contest account and a missing account object
+  are all refused the same way, and that the account is re-verified on every
+  order rather than cached;
+* symbol, quote, spread, level-coherence and distance validation;
+* every hard limit (open positions, trades per day, daily loss, lot ceiling),
+  and that hitting one still leaves open trades being managed;
+* position sizing: inverse to stop distance, clamped, floored not rounded, and
+  rejected rather than rounded up below the minimum lot;
+* that a BUY enters at the ask and a SELL at the bid, and that signal entry,
+  requested price and actual fill are three separate recorded numbers;
+* that the signal's own SL/TP are used verbatim and missing stops are attached;
+* the TP1/TP2/TP3 partial ladder, configurable fractions, stop-out, the
+  pessimistic stop-wins rule, and timeout on the existing holding window;
+* that breakeven follows the existing strategy setting in both directions, and
+  that R survives a breakeven move;
+* duplicate prevention within a session and **across a restart**;
+* restart recovery, closed-while-offline recording, orphan adoption, and that a
+  failed reconciliation halts execution;
+* order rejection, indeterminate replies (halt, never retry) and partial fills;
+* full XAUUSDs/BTCUSDs execution isolation;
+* the Telegram DEMO AUTO confirmation flow, OPEN TRADES panel and the
+  signal-vs-execution report.
+
+Runtime is about 110 seconds.
 
 ## Honest assessment
 
@@ -1129,7 +1399,16 @@ unmeasured.
 * **`assumed_spread_points` is a single number.** Real spreads vary by hour and
   widen precisely when volatility makes setups look attractive.
 * **Weekend gaps** can jump the stop; the model scores that as a clean stop-out.
-* Everything remains **paper only** — no order execution exists anywhere.
+* **`DEMO_AUTO` is for testing only, and demo fills are not live fills.** Demo
+  servers typically fill better than live ones — less requoting, less asymmetric
+  slippage, no market impact — so demo results are an *upper bound* on live
+  execution. There is no live mode, and adding one fails the build.
+* **`money_per_point_per_lot` is an assumption** (gold $1.00, Bitcoin $0.01 per
+  point per lot). Contract sizes vary between brokers; check yours before
+  trusting any demo P/L figure.
+* Demo `estimated_cost` is **modelled, not billed** — it reuses the market's own
+  cost assumptions so demo and paper R are computed on the same basis, and is
+  deducted once per trade rather than per partial close.
 
 ## Recommended next steps
 
