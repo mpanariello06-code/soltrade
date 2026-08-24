@@ -5,7 +5,7 @@ signal-generation logic changed.** A DEMO-only execution layer was added
 downstream of the existing engine so that the gap between paper expectancy and
 real fills can be measured.
 
-* **Tests:** 362 passing (280 before + 82 new execution tests), ~110 s
+* **Tests:** 377 passing (280 before + 97 new execution tests), ~110 s
 * **Static analysis:** `pyflakes` clean across every module
 * **Live trading:** none, and none can be configured — see [§C2](#c2-there-is-no-live-mode)
 * **Default mode:** `SIGNAL_ONLY`. Execution is opt-in on two independent switches.
@@ -195,6 +195,28 @@ success. A refused enable reports why rather than showing ON.
 Signal cards now say `🔬 SIGNAL … no demo order was placed` in `SIGNAL_ONLY`,
 and executed trades get their own `🤖 DEMO TRADE OPENED` and
 `📊 DEMO TRADE CLOSED` messages carrying fill, slippage, gross, costs, net and R.
+
+## C9a. Arming: deployment switches vs the runtime toggle
+
+`EXECUTION_MODE` and the `DEMO_MT5_*` credentials are **deployment-level**: they
+live in `.env`, are read once at start-up, and the Telegram button deliberately
+cannot rewrite them. `DEMO_TRADING_ENABLED` is the **runtime** switch that the
+button owns; its `.env` value is simply its starting position.
+
+Two defects in the first cut of this, both found by a user pressing the button:
+
+* **The refusal was uninformative.** Pressing DEMO AUTO on an unarmed
+  deployment logged "DEMO AUTO requested but EXECUTION_MODE is SIGNAL_ONLY" to
+  the console and showed "refused - check the log" in Telegram. The panel now
+  renders a `🔒 DEMO AUTO UNAVAILABLE` screen naming the exact `.env` lines to
+  add, the button itself reads `UNAVAILABLE` rather than inviting a press that
+  cannot succeed, and the main panel carries a `🔒 not configured` marker.
+* **Toggling off would have stranded the switch.** The first version of the
+  panel hook called `blocking_reason()`, which includes the runtime flag - so
+  turning DEMO AUTO *off* reported the deployment as unconfigured and there was
+  no way to turn it back on without editing `.env` and restarting.
+  `deployment_blocking_reason()` now covers only the fixed switches, and a
+  regression test toggles off and back on.
 
 ## C10. Known limitations
 

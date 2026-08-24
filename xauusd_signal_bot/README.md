@@ -361,11 +361,42 @@ The demo credentials are deliberately **not** the `MT5_*` data-feed ones.
 Keeping them separate means pointing the data feed at a live account cannot
 silently arm execution against it.
 
+**These live in `.env`, not in Telegram, on purpose.** They are deployment-level
+arming — set once by whoever configured the demo account — so a Telegram button
+cannot flip them. Restart after editing.
+
 Then enable it in Telegram, which requires an explicit confirmation:
 
 ```
 [🔴 DEMO AUTO OFF]  →  ⚠️ ENABLE DEMO AUTO?  →  [✅ ENABLE] [❌ CANCEL]
 ```
+
+The Telegram toggle is the **runtime** switch: it turns execution off and back
+on within a session, and never rewrites `EXECUTION_MODE`.
+
+### "DEMO AUTO doesn't turn on"
+
+If the button reads **`🔒 DEMO AUTO UNAVAILABLE`**, the deployment is not armed.
+Press it and the panel names exactly what is missing and which lines to add:
+
+```
+🔒 DEMO AUTO UNAVAILABLE
+
+Reason:
+EXECUTION_MODE is SIGNAL_ONLY, not DEMO_AUTO
+
+Demo execution is armed in .env, not from
+this panel, so it cannot be switched on by
+a stray tap. Add these lines and restart:
+
+  EXECUTION_MODE=DEMO_AUTO
+  DEMO_TRADING_ENABLED=true
+```
+
+The usual cause is copying `.env.example`, which ships `SIGNAL_ONLY` deliberately.
+Check the file exists at `xauusd_signal_bot/.env` — that exact path is where it
+is read from — and that the startup dashboard shows `Execution: SIGNAL_ONLY`
+without a `🔒 not configured` marker.
 
 ### Safety checks
 
@@ -1206,7 +1237,7 @@ structurally rather than by convention, and asserted by tests.
 python -m pytest tests/ -q
 ```
 
-362 tests covering indicator correctness and causality, no-repaint swings,
+377 tests covering indicator correctness and causality, no-repaint swings,
 score aggregation and weight renormalisation, the adaptive threshold, bull/bear
 separation, the spread and **net** R:R gates, the cost model, target geometry
 (ATR scaling, pip floors, percentage floors, cost floors, proportional lifting,
@@ -1253,7 +1284,7 @@ prevention, restart safety, and the backtester's no-lookahead guarantees.
   per-market analysis, per-market (not merged) performance, and that no button
   on any panel maps to an order.
 
-`tests/test_demo_execution.py` (82 tests) covers the execution layer, entirely
+`tests/test_demo_execution.py` (97 tests) covers the execution layer, entirely
 against a scripted fake broker — **no test can reach a real account**:
 
 * that there are exactly two modes, neither live, that the default is
@@ -1283,7 +1314,9 @@ against a scripted fake broker — **no test can reach a real account**:
 * order rejection, indeterminate replies (halt, never retry) and partial fills;
 * full XAUUSDs/BTCUSDs execution isolation;
 * the Telegram DEMO AUTO confirmation flow, OPEN TRADES panel and the
-  signal-vs-execution report.
+  signal-vs-execution report;
+* that an unarmed deployment says so on the button and names the `.env` lines
+  to add, and that toggling DEMO AUTO off leaves it switchable back on.
 
 Runtime is about 110 seconds.
 

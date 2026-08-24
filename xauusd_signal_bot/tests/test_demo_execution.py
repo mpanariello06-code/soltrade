@@ -152,7 +152,7 @@ def test_both_switches_are_required(monkeypatch):
     """Mode alone is not enough, and the flag alone is not enough."""
     mode_only = ExecutionSettings(mode=ExecutionMode.DEMO_AUTO)
     assert mode_only.executes is False
-    assert "DEMO_TRADING_ENABLED" in mode_only.blocking_reason()
+    assert mode_only.blocking_reason(), "mode alone must still block"
 
     flag_only = ExecutionSettings(demo_trading_enabled=True)
     assert flag_only.executes is False
@@ -162,6 +162,15 @@ def test_both_switches_are_required(monkeypatch):
     assert both.executes is True
     # ...but a dedicated demo account is still required before anything happens
     assert "demo account" in both.blocking_reason()
+
+    # Deployment problems are reported ahead of the runtime switch: fixing the
+    # file comes first, flipping the button second.
+    credentialled = ExecutionSettings(
+        mode=ExecutionMode.DEMO_AUTO, demo_trading_enabled=False,
+        demo_login=1, demo_password="x", demo_server="Demo",
+    )
+    assert credentialled.deployment_blocking_reason() == ""
+    assert "DEMO_TRADING_ENABLED" in credentialled.blocking_reason()
 
 
 def test_a_dedicated_demo_account_is_required(tmp_path):
@@ -921,6 +930,11 @@ class _StubEngine:
         self.toggles = []
         self.refuse = False
         self.open_lines = []
+        #: what execution_blocking_reason() reports; "" means fully configured
+        self.blocking_reason = ""
+
+    def execution_blocking_reason(self, symbol=None):
+        return self.blocking_reason
 
     def execution_state(self, symbol=None):
         return self.state
@@ -1023,15 +1037,68 @@ def test_turning_demo_auto_off_is_immediate(tmp_path):
     assert "DEMO AUTO OFF" in toast
 
 
+def test_an_unconfigured_deployment_says_so_on_the_button(tmp_path):
+    """The button must not invite a press that cannot possibly succeed."""
+    engine = _StubEngine()
+    engine.blocking_reason = "EXECUTION_MODE is SIGNAL_ONLY, not DEMO_AUTO"
+    controller = _controller(tmp_path, engine)
+
+    labels = [b["text"] for row in controller.main_keyboard() for b in row]
+    assert any("UNAVAILABLE" in label for label in labels)
+    assert "demo:why" in _buttons(controller.main_keyboard())
+    assert "demo:confirm" not in _buttons(controller.main_keyboard())
+    assert "not configured" in controller.render_panel()
+
+
+def test_the_unavailable_panel_names_the_env_lines_to_add(tmp_path):
+    """Spec-adjacent, but the real fix: say what to do, not 'check the log'."""
+    engine = _StubEngine()
+    engine.blocking_reason = "EXECUTION_MODE is SIGNAL_ONLY, not DEMO_AUTO"
+    controller = _controller(tmp_path, engine)
+
+    text, _keyboard, _toast = controller.handle_callback("demo:why")
+    assert "DEMO AUTO UNAVAILABLE" in text
+    assert "EXECUTION_MODE=DEMO_AUTO" in text
+    assert "DEMO_TRADING_ENABLED=true" in text
+    assert engine.toggles == [], "showing the reason must not arm anything"
+
+
+def test_the_unavailable_panel_names_the_missing_credentials(tmp_path):
+    engine = _StubEngine()
+    engine.blocking_reason = (
+        "no dedicated demo account configured "
+        "(missing DEMO_MT5_LOGIN, DEMO_MT5_PASSWORD, DEMO_MT5_SERVER)"
+    )
+    controller = _controller(tmp_path, engine)
+
+    text, _keyboard, _toast = controller.handle_callback("demo:why")
+    for expected in ("DEMO_MT5_LOGIN", "DEMO_MT5_PASSWORD", "DEMO_MT5_SERVER"):
+        assert expected in text, expected
+
+
+def test_confirming_on_an_unconfigured_deployment_explains_instead(tmp_path):
+    """Even a direct demo:confirm must not show a prompt that cannot work."""
+    engine = _StubEngine()
+    engine.blocking_reason = "EXECUTION_MODE is SIGNAL_ONLY, not DEMO_AUTO"
+    controller = _controller(tmp_path, engine)
+
+    text, keyboard, _toast = controller.handle_callback("demo:confirm")
+    assert "UNAVAILABLE" in text
+    assert "demo:on" not in _buttons(keyboard), "an unusable ENABLE button was offered"
+
+
 def test_a_refused_enable_is_reported_rather_than_shown_as_on(tmp_path):
     """If the engine cannot verify the account, the panel must not claim ON."""
     engine = _StubEngine()
     engine.refuse = True
     controller = _controller(tmp_path, engine)
 
-    _text, _keyboard, toast = controller.handle_callback("demo:on")
+    text, _keyboard, toast = controller.handle_callback("demo:on")
     assert "refused" in toast.lower()
     assert engine.state == "SIGNAL_ONLY"
+    # the panel must explain, not send the user to the console
+    assert "UNAVAILABLE" in text
+    assert "Reason:" in text
     assert "demo:confirm" in _buttons(controller.main_keyboard())
 
 
@@ -1263,3 +1330,123 @@ def test_the_runner_counts_demo_activity_per_market(tmp_path):
     assert runner.demo_trades_today(XAUUSD) == 1
     assert runner.demo_trades_today(BTCUSD) == 0
     assert runner.demo_open_trades() == 1, "the all-markets total is wrong"
+
+
+# --------------------------------------------------------------------------- #
+# arming from .env  (the "why doesn't the button work" path)
+# --------------------------------------------------------------------------- #
+def test_the_env_vars_actually_arm_execution(monkeypatch):
+    """The two switches in .env are what make the Telegram button usable."""
+    monkeypatch.setenv("EXECUTION_MODE", "DEMO_AUTO")
+    monkeypatch.setenv("DEMO_TRADING_ENABLED", "true")
+    monkeypatch.setenv("DEMO_MT5_LOGIN", "5000001")
+    monkeypatch.setenv("DEMO_MT5_PASSWORD", "demo-password")
+    monkeypatch.setenv("DEMO_MT5_SERVER", "Demo-Server")
+
+    settings = load_execution_settings()
+    assert settings.mode is ExecutionMode.DEMO_AUTO
+    assert settings.demo_trading_enabled is True
+    assert settings.has_demo_account is True
+    assert settings.blocking_reason() == "", "a fully configured .env still blocks"
+
+
+@pytest.mark.parametrize("missing", [
+    "EXECUTION_MODE", "DEMO_TRADING_ENABLED",
+    "DEMO_MT5_LOGIN", "DEMO_MT5_PASSWORD", "DEMO_MT5_SERVER",
+])
+def test_every_missing_env_var_blocks_with_a_named_reason(monkeypatch, missing):
+    """Whichever line is absent, the reason must name it."""
+    complete = {
+        "EXECUTION_MODE": "DEMO_AUTO",
+        "DEMO_TRADING_ENABLED": "true",
+        "DEMO_MT5_LOGIN": "5000001",
+        "DEMO_MT5_PASSWORD": "demo-password",
+        "DEMO_MT5_SERVER": "Demo-Server",
+    }
+    for name, value in complete.items():
+        if name == missing:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    settings = load_execution_settings()
+    reason = settings.blocking_reason()
+    assert reason, f"{missing} was absent but nothing blocked"
+    assert missing in reason or missing.replace("DEMO_MT5_", "") in reason.upper()
+
+
+def test_the_runner_reports_why_execution_is_blocked(tmp_path, monkeypatch):
+    """The engine hook the Telegram panel reads."""
+    monkeypatch.delenv("EXECUTION_MODE", raising=False)
+    monkeypatch.delenv("DEMO_TRADING_ENABLED", raising=False)
+
+    runner, _config = _runner(tmp_path)
+    reason = runner.execution_blocking_reason()
+
+    assert "EXECUTION_MODE" in reason
+    assert runner.set_demo_auto(True) is False
+    assert runner.execution_settings.demo_trading_enabled is False, (
+        "a refused toggle left the flag set"
+    )
+
+
+def test_the_toggle_never_rewrites_the_deployment_switch(tmp_path):
+    """EXECUTION_MODE is armed in .env, not from a Telegram button."""
+    runner, _config = _runner(tmp_path)
+    assert runner.execution_settings.mode is ExecutionMode.SIGNAL_ONLY
+
+    runner.set_demo_auto(True)
+    assert runner.execution_settings.mode is ExecutionMode.SIGNAL_ONLY, (
+        "the Telegram toggle rewrote EXECUTION_MODE"
+    )
+
+
+def test_the_toggle_works_once_the_deployment_is_armed(tmp_path):
+    broker = FakeDemoBroker(quotes={get_market(XAUUSD).feed_symbol(): GOLD_QUOTE})
+    settings = armed_settings()
+    settings.demo_trading_enabled = False        # as if never toggled on yet
+    runner, _config = _runner(tmp_path, broker=broker, settings=settings)
+
+    assert runner.execution_blocking_reason() == ""
+    assert runner.set_demo_auto(True) is True
+    assert runner.execution_state() == "DEMO_AUTO"
+
+    runner._execute_signal(runner.slot(XAUUSD), gold_signal())
+    assert len(broker.sent) == 1
+
+
+def test_demo_auto_can_be_turned_off_and_back_on(tmp_path):
+    """Regression: toggling off must not report the deployment as unconfigured.
+
+    The runtime switch and the deployment switches are different things.  If
+    turning DEMO AUTO off made the panel show 🔒 UNAVAILABLE, there would be no
+    way to turn it back on without editing .env and restarting.
+    """
+    broker = FakeDemoBroker(quotes={get_market(XAUUSD).feed_symbol(): GOLD_QUOTE})
+    runner, _config = _runner(tmp_path, broker=broker, settings=armed_settings())
+    assert runner.execution_state() == "DEMO_AUTO"
+
+    assert runner.set_demo_auto(False) is False
+    assert runner.execution_state() == "SIGNAL_ONLY"
+    assert runner.execution_blocking_reason() == "", (
+        "turning the toggle off reported the deployment as unconfigured"
+    )
+
+    assert runner.set_demo_auto(True) is True
+    assert runner.execution_state() == "DEMO_AUTO"
+
+    runner._execute_signal(runner.slot(XAUUSD), gold_signal())
+    assert len(broker.sent) == 1, "execution did not resume after toggling back on"
+
+
+def test_the_button_offers_confirm_after_being_toggled_off(tmp_path):
+    """The panel side of the same regression."""
+    engine = _StubEngine("DEMO_AUTO")
+    controller = _controller(tmp_path, engine)
+
+    controller.handle_callback("demo:off")
+    labels = [b["text"] for row in controller.main_keyboard() for b in row]
+
+    assert any("DEMO AUTO OFF" in label for label in labels)
+    assert not any("UNAVAILABLE" in label for label in labels)
+    assert "demo:confirm" in _buttons(controller.main_keyboard())

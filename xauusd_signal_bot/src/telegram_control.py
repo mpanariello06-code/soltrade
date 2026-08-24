@@ -119,10 +119,16 @@ class TelegramController:
             _button("⏸ PAUSE", "run:pause") if running else _button("▶️ START", "run:start")
         )
         demo_on = self._demo_auto_on()
-        demo_label = "🟢 DEMO AUTO ON" if demo_on else "🔴 DEMO AUTO OFF"
-        # Turning it OFF is immediate; turning it ON asks for confirmation
-        # first, so execution can never be armed by a single stray tap.
-        demo_action = "demo:off" if demo_on else "demo:confirm"
+        if demo_on:
+            demo_label, demo_action = "🟢 DEMO AUTO ON", "demo:off"
+        elif self._demo_available():
+            # Turning it OFF is immediate; turning it ON asks for confirmation
+            # first, so execution can never be armed by a single stray tap.
+            demo_label, demo_action = "🔴 DEMO AUTO OFF", "demo:confirm"
+        else:
+            # Not configured for execution at all.  Say so on the button rather
+            # than inviting a press that cannot succeed.
+            demo_label, demo_action = "🔒 DEMO AUTO UNAVAILABLE", "demo:why"
 
         return [
             market_row,
@@ -228,7 +234,8 @@ class TelegramController:
             f"Open signals: {self._open_signals(symbol)}",
             f"Paper Net R: {net_r:+.2f}" if net_r is not None else "Paper Net R: -",
             "",
-            f"Execution: {self._execution_state()}",
+            f"Execution: {self._execution_state()}"
+            + ("" if self._demo_available() else "  🔒 not configured"),
             f"Open Demo Trades: {self._demo_open(symbol)}",
             f"Today's Demo Trades: {self._demo_today(symbol)}",
             f"Today's Net P/L: {self._demo_net(symbol):+.2f}",
@@ -273,6 +280,52 @@ class TelegramController:
             "",
             DIVIDER,
         ])
+
+    def render_demo_unavailable(self, reason: str) -> str:
+        """Explain why DEMO AUTO cannot be armed, and what to do about it.
+
+        The two switches live in ``.env`` on purpose - they are deployment-level
+        arming, not a runtime preference - so the fix is a file edit plus a
+        restart, and this says so instead of leaving the user guessing.
+        """
+        lines = [
+            DIVIDER,
+            "🔒 DEMO AUTO UNAVAILABLE",
+            DIVIDER,
+            "",
+            "Reason:",
+            reason,
+            "",
+        ]
+        if "EXECUTION_MODE" in reason or "DEMO_TRADING_ENABLED" in reason:
+            lines += [
+                "Demo execution is armed in .env, not from",
+                "this panel, so it cannot be switched on by",
+                "a stray tap. Add these lines and restart:",
+                "",
+                "  EXECUTION_MODE=DEMO_AUTO",
+                "  DEMO_TRADING_ENABLED=true",
+                "",
+            ]
+        if "demo account" in reason:
+            lines += [
+                "A dedicated demo login is also required.",
+                "It is deliberately NOT the MT5_* data-feed",
+                "login, so pointing the feed at a live",
+                "account cannot arm execution:",
+                "",
+                "  DEMO_MT5_LOGIN=...",
+                "  DEMO_MT5_PASSWORD=...",
+                "  DEMO_MT5_SERVER=...",
+                "",
+            ]
+        lines += [
+            "Signals keep being generated and recorded",
+            "in the meantime - nothing is lost.",
+            "",
+            DIVIDER,
+        ]
+        return "\n".join(lines)
 
     def render_open_trades(self) -> str:
         """The 💼 OPEN TRADES panel, across every market."""
@@ -686,7 +739,10 @@ class TelegramController:
         engine re-verifies the account before reporting success, so a refusal
         here is reported honestly rather than shown as ON.
         """
-        if argument == "confirm":
+        if argument in ("confirm", "why"):
+            blocked = self._demo_blocking_reason()
+            if blocked:
+                return self.render_demo_unavailable(blocked), self.back_keyboard(), "Not configured"
             return self.render_demo_confirm(), self.demo_confirm_keyboard(), "Confirm?"
 
         wanted = argument == "on"
@@ -703,11 +759,14 @@ class TelegramController:
             return self.render_panel(), self.main_keyboard(), "Toggle failed"
 
         if wanted and not enabled:
-            # Asked for ON and did not get it: say why rather than silently
-            # leaving the button showing OFF.
+            # Asked for ON and did not get it.  Show exactly what is missing on
+            # the panel - sending someone to the console to find out why a
+            # button did nothing is not an answer.
+            blocked = self._demo_blocking_reason() or "the demo account could not be verified"
             return (
-                self.render_panel(), self.main_keyboard(),
-                "DEMO AUTO refused - check the log",
+                self.render_demo_unavailable(blocked),
+                self.back_keyboard(),
+                "DEMO AUTO refused",
             )
         toast = "🟢 DEMO AUTO ON" if enabled else "🔴 DEMO AUTO OFF"
         return self.render_panel(), self.main_keyboard(), toast
@@ -827,6 +886,15 @@ class TelegramController:
 
     def _demo_auto_on(self) -> bool:
         return self._execution_state() == "DEMO_AUTO"
+
+    def _demo_blocking_reason(self) -> str:
+        """Why DEMO AUTO cannot be armed, phrased for a person, or ``""``."""
+        reason = self._call_engine("execution_blocking_reason", None, "")
+        return str(reason or "")
+
+    def _demo_available(self) -> bool:
+        """True when pressing ENABLE could actually arm execution."""
+        return not self._demo_blocking_reason()
 
     def _demo_open(self, symbol: Optional[str] = None) -> int:
         try:

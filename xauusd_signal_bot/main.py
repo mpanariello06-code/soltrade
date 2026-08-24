@@ -320,22 +320,60 @@ class SignalRunner:
                 lines.extend(slot.execution.describe_open())
         return lines
 
+    def execution_blocking_reason(self, symbol: Optional[str] = None) -> str:
+        """Why demo execution cannot be armed right now, or ``""``.
+
+        Surfaced in Telegram so a refused toggle explains itself on the panel.
+        Sending the user to the console to find out why a button did nothing is
+        not an acceptable answer.
+        """
+        settings = self.execution_settings
+        # Deployment-level only: turning DEMO AUTO off from Telegram must not
+        # make the panel report the deployment as unconfigured, or there would
+        # be no way to turn it back on.
+        reason = settings.deployment_blocking_reason()
+        if reason:
+            return reason
+        halted = [
+            slot for slot in self.slots.values()
+            if slot.execution and slot.execution.halted
+        ]
+        if halted:
+            return f"execution halted: {halted[0].execution.halt_reason}"
+        return ""
+
     def set_demo_auto(self, enabled: bool) -> bool:
         """Turn DEMO AUTO on or off from Telegram.
 
         Enabling re-runs the full arming sequence - connect, verify, reconcile -
         so the toggle can never arm execution against an unverified account just
         because it was verified earlier in the session.
+
+        ``EXECUTION_MODE`` is deliberately NOT changed here.  It is the
+        deployment-level arming switch, set once in ``.env`` by whoever
+        configured the demo account; a Telegram button that could flip it would
+        make that switch meaningless.  When it is not set, this refuses and the
+        panel says exactly which line is missing.
         """
         settings = self.execution_settings
         if not enabled:
             settings.demo_trading_enabled = False
             LOGGER.info("DEMO AUTO disabled from Telegram")
             return False
-        settings.demo_trading_enabled = True
+
         if not settings.mode.executes:
             LOGGER.warning(
-                "DEMO AUTO requested but EXECUTION_MODE is %s", settings.mode.value
+                "DEMO AUTO requested but EXECUTION_MODE is %s. "
+                "Set EXECUTION_MODE=DEMO_AUTO in .env and restart.",
+                settings.mode.value,
+            )
+            return False
+
+        settings.demo_trading_enabled = True
+        if not settings.has_demo_account:
+            LOGGER.warning(
+                "DEMO AUTO requested but no demo account is configured: %s",
+                settings.blocking_reason(),
             )
             settings.demo_trading_enabled = False
             return False

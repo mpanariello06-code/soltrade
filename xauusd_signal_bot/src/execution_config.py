@@ -387,16 +387,33 @@ class ExecutionSettings:
         """True when a dedicated demo account is configured."""
         return bool(self.demo_login and self.demo_password and self.demo_server)
 
-    def blocking_reason(self) -> str:
-        """Why execution is off, or ``""`` when it is armed.
+    def deployment_blocking_reason(self) -> str:
+        """Why this deployment CANNOT execute at all, or ``""``.
 
-        Used for both the Telegram panel and the pre-order guard, so what the
-        user is told matches exactly what the code checks.
+        Only the parts that are fixed at start-up: the mode and the demo
+        credentials, both of which live in ``.env``.  Deliberately ignores
+        ``demo_trading_enabled``, which is the RUNTIME switch the Telegram
+        button owns - otherwise turning DEMO AUTO off would make the panel
+        report the deployment as unconfigured and there would be no way back on.
         """
         if not self.mode.executes:
             return f"EXECUTION_MODE is {self.mode.value}, not {ExecutionMode.DEMO_AUTO.value}"
+        return self._account_blocking_reason()
+
+    def blocking_reason(self) -> str:
+        """Why execution is off right now, or ``""`` when it is armed.
+
+        Deployment reasons plus the runtime switch.  Used by the pre-order
+        guard, so what blocks an order and what the panel reports agree.
+        """
+        deployment = self.deployment_blocking_reason()
+        if deployment:
+            return deployment
         if not self.demo_trading_enabled:
             return "DEMO_TRADING_ENABLED is false"
+        return ""
+
+    def _account_blocking_reason(self) -> str:
         if not self.has_demo_account:
             missing = [
                 name for name, value in (
