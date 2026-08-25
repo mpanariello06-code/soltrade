@@ -4,6 +4,19 @@ Runs the SAME engine for every supported market.  ``--symbol`` selects which
 market configuration is folded onto the base config; results are written under
 that market's own data directory so XAUUSD and BTCUSD results never mix.
 
+STRATEGY MODES
+--------------
+``--strategy`` chooses who decides:
+
+``RULE_ONLY``     the existing scalping engine (default, unchanged)
+``PPO_BACKTEST``  a trained PPO policy over the same candles
+``PPO_SHADOW``    BOTH, over the same candles, reported side by side
+
+The comparison is only meaningful because all three pay the **same** costs: the
+PPO environment charges ``config.round_trip_cost()``, the very function the rule
+backtester uses.  PPO is never given better fills than the engine it is being
+compared against.
+
 Feeds M1 candles one at a time into the **same** SignalEngine that runs live,
 and tracks outcomes with the same PositionState.
 
@@ -384,6 +397,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help=f"market to backtest: {', '.join(MARKET_ORDER)} "
              f"(default: %(default)s; older spellings are accepted)",
     )
+    parser.add_argument(
+        "--strategy", type=str, default="RULE_ONLY",
+        choices=["RULE_ONLY", "PPO_BACKTEST", "PPO_SHADOW"],
+        help="who decides: the rule engine, a PPO model, or both compared "
+             "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="PPO model version (default: the latest registered for the market)",
+    )
     parser.add_argument("--data", type=Path, required=True, help="M1 history CSV")
     parser.add_argument("--start", type=str, default=None, help="start date, e.g. 2024-01-01")
     parser.add_argument("--end", type=str, default=None, help="end date, e.g. 2024-06-30")
@@ -446,8 +469,108 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = build_report(result.signals_frame(), result.outcomes_frame(), config)
     if report.total_signals == 0:
         print("\nNo signals were generated for this period and configuration.")
-        return 0
-    print(render_report(report))
+    else:
+        print(render_report(report))
+
+    if args.strategy != "RULE_ONLY":
+        return _run_ppo(args, config, history, report)
+    return 0
+
+
+def _rule_summary(report) -> dict:
+    """The rule engine's result in the SAME shape PPO reports, so they compare.
+
+    Both sides must be described with one vocabulary or the comparison is an
+    exercise in translating between two, which is where mistakes live.
+    """
+    if report is None or report.total_signals == 0:
+        return {"label": "RULE_ONLY", "trades": 0, "net_r": 0.0,
+                "average_net_r": 0.0, "win_rate": 0.0, "profit_factor": 0.0,
+                "max_drawdown_r": 0.0, "average_holding": 0.0}
+    overall = report.overall
+    return {
+        "label": "RULE_ONLY",
+        "trades": overall.closed,
+        "net_r": overall.total_net_r,
+        "average_net_r": overall.average_net_r,
+        "win_rate": overall.net_win_rate,
+        "profit_factor": overall.net_profit_factor,
+        "max_drawdown_r": overall.max_drawdown_r,
+        "average_holding": overall.average_duration_min,
+    }
+
+
+def _run_ppo(args, config, history, rule_report) -> int:
+    """Run a PPO policy over the SAME candles and report it beside the engine."""
+    try:
+        from ai.environment.scalping_env import EnvConfig
+        from ai.evaluation.report import compare, render_summary, write_report
+        from ai.features.feature_pipeline import build_dataset
+        from ai.model_registry import ModelRegistry
+        from ai.ppo.evaluate_ppo import evaluate_checkpoint
+    except ImportError as exc:
+        print(f"\nERROR: the PPO stack is not installed ({exc}).\n"
+              "  pip install gymnasium stable-baselines3 torch\n"
+              "The rule-based backtest above is unaffected.", file=sys.stderr)
+        return 2
+
+    root = Path(__file__).resolve().parent / "models"
+    registry = ModelRegistry(root)
+    record = (
+        registry.get(args.symbol, args.model) if args.model
+        else registry.latest(args.symbol)
+    )
+    if record is None:
+        print(f"\nNo PPO model is registered for {args.symbol}. Train one first:\n"
+              f"  python scripts/train_ppo.py --symbol {args.symbol} ...",
+              file=sys.stderr)
+        return 2
+
+    print()
+    print(f"PPO model: {record.version} ({record.status})")
+
+    frame, spec = build_dataset(history)
+    if frame.empty:
+        print("Not enough history to build features after the warm-up.",
+              file=sys.stderr)
+        return 2
+
+    # The SAME cost model the rule backtester just used.  If --spread was given
+    # it applies to both sides, so neither gets a friendlier market.
+    env_config = EnvConfig.from_market_config(config)
+    if args.spread is not None:
+        env_config.assumed_spread_points = float(args.spread)
+        env_config.use_data_spread = False
+
+    try:
+        summary = evaluate_checkpoint(
+            Path(record.path), frame, env_config, label=f"PPO {record.version}"
+        )
+    except FileNotFoundError as exc:
+        print(f"\nCould not load the model: {exc}", file=sys.stderr)
+        return 2
+
+    trades = summary.pop("trades_frame", None)
+    print()
+    print(render_summary(summary, f"PPO BACKTEST - {args.symbol} {record.version}"))
+
+    output = Path(__file__).resolve().parent / "reports" / "ppo" / args.symbol / "backtest"
+    written = write_report(
+        trades, output, label=f"PPO {record.version}",
+        extra={"model_version": record.version, "symbol": args.symbol,
+               "candles": summary.get("candles", 0)},
+    )
+    print()
+    print(f"Report written to: {output}")
+    print("  " + ", ".join(sorted(p.name for p in written.values())))
+
+    if args.strategy == "PPO_SHADOW":
+        print()
+        print("SAME CANDLES, SAME COST MODEL:")
+        print(compare([_rule_summary(rule_report), summary]))
+        print()
+        print("Both sides pay identical costs. A difference here is strategy,")
+        print("not a friendlier simulation.")
     return 0
 
 

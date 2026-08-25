@@ -86,6 +86,16 @@ These are simulated results only.
 `📈 PPO PERFORMANCE` shows PPO **beside** the rule engine — never summed.
 `🧠 PPO MODEL` shows the version, status and what it was trained on.
 
+### Compare PPO against your rule engine
+
+```bash
+python backtest.py --symbol XAUUSD --strategy PPO_SHADOW \
+    --data history/XAUUSD_M1.csv --no-evaluations
+```
+
+Both run over the same candles paying the same costs, printed side by side.
+This is the number that matters — not PPO's result alone.
+
 ### Files
 
 | What | Where |
@@ -95,6 +105,7 @@ These are simulated results only.
 | Rule paper results | `data/<market>/outcomes.csv` |
 | Real demo fills | `data/<market>/executions.csv` |
 | Walk-forward | `reports/ppo/<SYMBOL>/walk_forward/` |
+| Backtest report | `reports/ppo/<SYMBOL>/backtest/` (performance, equity, trades, drawdown, by_regime) |
 | Model registry | `models/model_registry.json` |
 
 **Those first four are separate books and are never merged.** That comparison is

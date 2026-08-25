@@ -15,11 +15,14 @@ the default.
 | `ai/features/mtf_features.py` | M5/M15 context merged on bucket CLOSE time |
 | `ai/features/feature_pipeline.py` | `FeatureSpec` contract, dataset build, chronological splits |
 | `ai/environment/scalping_env.py` | Gymnasium bracket environment |
-| `ai/ppo/train.py` | PPO training, checkpoints, evaluation |
+| `ai/ppo/train.py` | PPO training loop and checkpointing |
+| `ai/ppo/evaluate_ppo.py` | Re-measure a model without retraining |
+| `ai/ppo/checkpoints.py` | Checkpoint inspection, resume, archive, verify |
 | `ai/ppo/inference.py` | Fail-safe serving |
 | `ai/evaluation/walk_forward.py` | Sliding folds, non-overlapping tests |
 | `ai/evaluation/holdout.py` | Sealed holdout with an audit trail |
 | `ai/evaluation/metrics.py` | NET-first metrics, equity, regime breakdown |
+| `ai/evaluation/report.py` | The `reports/ppo/` artefact set, one writer |
 | `ai/model_registry.py` | Versioning, lifecycle, promotion gates |
 | `ai/shadow.py` | Decision recorder and trade simulator |
 | `ai/strategy_mode.py` | `RULE_ONLY` / `PPO_SHADOW` / `PPO_DEMO` |
@@ -30,8 +33,8 @@ the default.
 (the single seam), and seven scripts: `download_mt5_history`, `build_dataset`,
 `train_ppo`, `walk_forward`, `final_holdout_eval`, `retrain_ppo`, `_common`.
 
-**Tests** — 110 new across `test_ai_features.py` (13), `test_ai_environment.py`
-(23), `test_ai_ppo.py` (45), `test_ai_integration.py` (29).
+**Tests** — 130 new across `test_ai_features.py` (13), `test_ai_environment.py`
+(23), `test_ai_ppo.py` (58), `test_ai_integration.py` (36).
 
 **Docs** — `AI_RL_MIGRATION_PLAN.md`, `AI_RL_DESIGN.md`, `PPO_USER_GUIDE.md`,
 `README_AI.md`, this report.
@@ -41,6 +44,7 @@ the default.
 | File | Change |
 |---|---|
 | `main.py` | PPO bridge, `_observe_ppo` hook, three Telegram hooks |
+| `backtest.py` | `--strategy RULE_ONLY\|PPO_BACKTEST\|PPO_SHADOW`, `--model` |
 | `src/telegram_control.py` | 🤖 PPO submenu and four renderers |
 | `tests/test_telegram_control.py` | one keyboard-layout assertion |
 | `requirements.txt`, `.gitignore` | optional deps, RL artefacts |
@@ -56,7 +60,7 @@ the default.
 
 ## TEST RESULTS
 
-**487 passed** (377 existing + 110 new), ~135 s. `pyflakes` clean.
+**507 passed** (377 existing + 130 new), ~135 s. `pyflakes` clean.
 Zero regressions.
 
 Coverage of note: the future-append leakage test; MTF bucket visibility;
@@ -139,6 +143,23 @@ same pessimism and the same costs. **No broker connection exists in this mode.**
 `PPO_DEMO` + `EXECUTION_MODE=DEMO_AUTO` + `DEMO_TRADING_ENABLED` + a verified
 demo account. PPO produces a `Signal` that enters `demo_execution.py` at exactly
 the point a rule signal does — **no privileged route, no skipped gate**.
+
+## BACKTESTING  (spec section 31)
+
+`backtest.py --strategy` selects `RULE_ONLY` (default, unchanged),
+`PPO_BACKTEST` (PPO alone) or `PPO_SHADOW` (both over the same candles, printed
+side by side). `EnvConfig.from_market_config()` copies the live bot's own
+spread, slippage, commission, holding window and target geometry, and `--spread`
+applies to both sides — **PPO is never given better fills than the engine it is
+compared against**, and a test asserts the cost figures agree.
+
+## REPORTS  (spec sections 32, 33)
+
+`ai/evaluation/report.py` is the single writer for `reports/ppo/`:
+`performance.csv` (+ `.json`), `equity.csv`, `trades.csv`, `drawdown.csv`
+(depth *and* consecutive underwater trades), `walk_forward.csv`, and
+`by_regime.csv` — session and volatility breakdown, because a blended number
+hides an agent that works in exactly one regime.
 
 ## TELEGRAM
 

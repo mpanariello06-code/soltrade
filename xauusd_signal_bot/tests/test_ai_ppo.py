@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -579,3 +581,179 @@ def test_training_is_reproducible_from_a_seed(tmp_path):
     first, second = run("a"), run("b")
     assert first.validation_metrics.get("net_r") == second.validation_metrics.get("net_r")
     assert first.validation_metrics.get("trades") == second.validation_metrics.get("trades")
+
+
+# --------------------------------------------------------------------------- #
+# checkpoints  (spec section 19)
+# --------------------------------------------------------------------------- #
+def _fake_checkpoint(directory, names=("best_model", "latest", "final_model"),
+                     spec=True, fingerprint="abc123"):
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (directory / f"{name}.zip").write_bytes(b"weights")
+    if spec:
+        FeatureSpec(columns=["f_a", "f_b"]).save(directory / "feature_spec.json")
+        if fingerprint == "override":
+            (directory / "feature_spec.json").write_text(
+                json.dumps({"columns": ["f_z"], "clip": 10.0}), encoding="utf-8"
+            )
+    return directory
+
+
+def test_a_complete_checkpoint_is_usable(tmp_path):
+    from ai.ppo.checkpoints import inspect
+
+    info = inspect(_fake_checkpoint(tmp_path / "ppo_v001"))
+    assert info.usable is True
+    assert set(info.available) == {"best_model", "latest", "final_model"}
+    assert info.has_feature_spec is True
+
+
+def test_weights_without_a_feature_spec_are_not_usable(tmp_path):
+    """The model would still answer confidently, from the wrong columns."""
+    from ai.ppo.checkpoints import inspect
+
+    info = inspect(_fake_checkpoint(tmp_path / "ppo_v002", spec=False))
+    assert info.usable is False
+
+
+def test_a_missing_directory_reports_cleanly(tmp_path):
+    from ai.ppo.checkpoints import inspect
+
+    info = inspect(tmp_path / "nope")
+    assert info.usable is False and info.available == []
+
+
+def test_resume_uses_latest_not_best(tmp_path):
+    """Resuming from `best` would discard whatever trained after it."""
+    from ai.ppo.checkpoints import resume_from
+
+    directory = _fake_checkpoint(tmp_path / "ppo_v003")
+    assert resume_from(directory).name == "latest.zip"
+
+
+def test_verify_catches_a_feature_fingerprint_mismatch(tmp_path):
+    """Caught here it is a config problem; caught at inference it is silent."""
+    from ai.ppo.checkpoints import verify
+
+    directory = _fake_checkpoint(tmp_path / "ppo_v004")
+    real = FeatureSpec(columns=["f_a", "f_b"]).fingerprint()
+
+    assert verify(directory, expected_fingerprint=real)["ok"] is True
+    bad = verify(directory, expected_fingerprint="totally-different")
+    assert bad["ok"] is False
+    assert any("fingerprint" in p for p in bad["problems"])
+
+
+def test_archiving_moves_a_checkpoint_rather_than_deleting_it(tmp_path):
+    """A model that produced a published number must stay reproducible."""
+    from ai.ppo.checkpoints import archive
+
+    directory = _fake_checkpoint(tmp_path / "ppo_v005")
+    moved = archive(directory, reason="superseded")
+
+    assert not directory.exists()
+    assert moved.exists() and (moved / "best_model.zip").exists()
+    assert (moved / "ARCHIVED.txt").exists()
+
+
+def test_checkpoints_are_listed_per_market(tmp_path):
+    from ai.ppo.checkpoints import list_checkpoints
+
+    _fake_checkpoint(tmp_path / "ppo" / "XAUUSDs" / "ppo_v001")
+    _fake_checkpoint(tmp_path / "ppo" / "XAUUSDs" / "ppo_v002")
+    _fake_checkpoint(tmp_path / "ppo" / "BTCUSDs" / "ppo_v001")
+
+    assert len(list_checkpoints(tmp_path, "XAUUSDs")) == 2
+    assert len(list_checkpoints(tmp_path, "BTCUSDs")) == 1
+    assert list_checkpoints(tmp_path, "ETHUSD") == []
+
+
+# --------------------------------------------------------------------------- #
+# reports  (spec sections 32, 33)
+# --------------------------------------------------------------------------- #
+def _trade_log():
+    return pd.DataFrame({
+        "entry_time": pd.date_range("2024-01-01 08:00", periods=6, freq="1h",
+                                    tz="UTC").astype(str),
+        "exit_time": pd.date_range("2024-01-01 08:05", periods=6, freq="1h",
+                                   tz="UTC").astype(str),
+        "net_r": [1.0, -1.0, 0.5, -0.5, 2.0, -0.2],
+        "gross_r": [1.5, -0.6, 0.9, -0.1, 2.4, 0.2],
+        "cost_r": [0.5, 0.4, 0.4, 0.4, 0.4, 0.4],
+        "holding_candles": [3, 5, 2, 8, 4, 6],
+        "result": ["TP3_HIT", "SL_HIT", "TP2_HIT", "TIMEOUT", "TP3_HIT", "SL_HIT"],
+        "tp_hits": [3, 0, 2, 1, 3, 0],
+        "spread_points": [20] * 6,
+        "initial_risk": [0.2, 0.3, 0.2, 0.4, 0.2, 0.3],
+    })
+
+
+def test_the_report_writes_every_specified_artefact(tmp_path):
+    from ai.evaluation.report import REPORT_FILES, write_report
+
+    written = write_report(_trade_log(), tmp_path, label="test")
+    for name in REPORT_FILES:
+        assert (tmp_path / name).exists(), name
+    assert (tmp_path / "by_regime.csv").exists(), "spec section 33"
+    assert (tmp_path / "performance.json").exists()
+    assert set(written) >= {"performance", "equity", "trades", "drawdown", "walk_forward"}
+
+
+def test_an_empty_trade_log_still_produces_a_report(tmp_path):
+    """"The agent took no trades" is a result; a missing report is not."""
+    from ai.evaluation.report import REPORT_FILES, write_report
+
+    write_report(pd.DataFrame(), tmp_path, label="nothing")
+    for name in REPORT_FILES:
+        assert (tmp_path / name).exists(), name
+    assert pd.read_csv(tmp_path / "performance.csv").iloc[0]["trades"] == 0
+
+
+def test_the_drawdown_series_tracks_depth_and_length():
+    from ai.evaluation.report import drawdown_series
+
+    trades = pd.DataFrame({"net_r": [1.0, -0.5, -0.5, -0.5, 2.0],
+                           "exit_time": list("abcde")})
+    frame = drawdown_series(trades)
+
+    assert list(frame["equity_r"]) == [1.0, 0.5, 0.0, -0.5, 1.5]
+    assert frame["drawdown_r"].max() == 1.5
+    # three consecutive trades below the peak, then a new high resets it
+    assert list(frame["underwater_trades"]) == [0, 1, 2, 3, 0]
+
+
+def test_regime_analysis_splits_by_session_and_volatility():
+    """A single blended number hides an agent that works in one regime only."""
+    from ai.evaluation.metrics import by_regime
+
+    frame = by_regime(_trade_log())
+    labels = set(frame["label"])
+    assert any(label.startswith("session:") for label in labels)
+    assert any(label.startswith("volatility:") for label in labels)
+
+
+def test_the_comparison_table_puts_both_strategies_on_one_scale():
+    from ai.evaluation.report import compare
+
+    text = compare([
+        {"label": "RULE_ONLY", "trades": 3, "net_r": -1.19, "average_net_r": -0.397,
+         "win_rate": 33.3, "profit_factor": 0.37, "max_drawdown_r": 1.9,
+         "average_holding": 4.0},
+        {"label": "PPO ppo_v001", "trades": 0, "net_r": 0.0, "average_net_r": 0.0,
+         "win_rate": 0.0, "profit_factor": 0.0, "max_drawdown_r": 0.0,
+         "average_holding": 0.0},
+    ])
+    assert "RULE_ONLY" in text and "PPO ppo_v001" in text
+    assert "netR" in text and "maxDD" in text
+
+
+def test_the_summary_leads_with_net_and_shows_the_cost_share():
+    from ai.evaluation.metrics import summarise_trades
+    from ai.evaluation.report import render_summary
+
+    text = render_summary(summarise_trades(_trade_log(), "x"))
+    assert "AFTER COSTS (the numbers that matter)" in text
+    assert "BEFORE COSTS (reference only)" in text
+    assert "Cost share" in text
+    assert text.index("AFTER COSTS") < text.index("BEFORE COSTS"), "NET must lead"

@@ -374,3 +374,113 @@ def test_the_ppo_panel_survives_an_engine_with_no_ppo_at_all(tmp_path):
     text, _keyboard, _toast = controller.handle_callback("ppo:status")
     assert "PPO STATUS" in text
     assert "No PPO model is loaded" in text
+
+
+# --------------------------------------------------------------------------- #
+# backtest strategy modes  (spec section 31)
+# --------------------------------------------------------------------------- #
+def test_the_backtester_offers_all_three_strategy_modes():
+    import backtest
+
+    parser_source = backtest.main.__doc__ or ""
+    # the flag itself is what matters; parse it out of the CLI
+    import argparse
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), pytest.raises(SystemExit):
+        backtest.main(["--help"])
+    text = buffer.getvalue()
+    for mode in ("RULE_ONLY", "PPO_BACKTEST", "PPO_SHADOW"):
+        assert mode in text, mode
+    assert "--model" in text
+    assert parser_source is not None
+    assert argparse is not None
+
+
+def test_an_invalid_strategy_is_rejected():
+    import backtest
+
+    with pytest.raises(SystemExit):
+        backtest.main(["--strategy", "LIVE_AUTO", "--data", "nope.csv"])
+
+
+def test_ppo_and_the_rule_engine_are_summarised_in_one_vocabulary():
+    """Two vocabularies for one comparison is where mistakes live."""
+    from ai.evaluation.metrics import summarise_trades
+    from backtest import _rule_summary
+
+    class _Stats:
+        closed, total_net_r, average_net_r = 10, 2.5, 0.25
+        net_win_rate, net_profit_factor = 60.0, 1.4
+        max_drawdown_r, average_duration_min = 3.0, 5.0
+
+    class _Report:
+        total_signals, overall = 10, _Stats()
+
+    rule = _rule_summary(_Report())
+    ppo = summarise_trades(pd.DataFrame({
+        "net_r": [1.0], "gross_r": [1.4], "cost_r": [0.4],
+        "holding_candles": [3], "result": ["TP3_HIT"], "tp_hits": [3],
+        "spread_points": [20],
+    }), label="PPO")
+
+    for key in ("label", "trades", "net_r", "average_net_r", "win_rate",
+                "profit_factor", "max_drawdown_r", "average_holding"):
+        assert key in rule, key
+        assert key in ppo, key
+
+
+def test_an_empty_rule_report_summarises_as_zero_not_as_an_error():
+    from backtest import _rule_summary
+
+    class _Report:
+        total_signals = 0
+        overall = None
+
+    summary = _rule_summary(_Report())
+    assert summary["trades"] == 0 and summary["net_r"] == 0.0
+    assert _rule_summary(None)["trades"] == 0
+
+
+def test_ppo_is_charged_the_same_costs_as_the_rule_engine():
+    """PPO must never get a friendlier simulation than what it is compared to."""
+    from ai.environment.scalping_env import EnvConfig
+
+    config = Config().for_market("XAUUSDs")
+    env = EnvConfig.from_market_config(config)
+
+    assert env.assumed_spread_points == config.assumed_spread_points
+    assert env.slippage_points_entry == config.slippage_points_entry
+    assert env.slippage_points_exit == config.slippage_points_exit
+    assert env.commission_points_per_side == config.commission_points_per_side
+    assert env.point_value == config.point_value
+    # and the round-trip figures agree
+    assert env.cost_points(config.assumed_spread_points) == pytest.approx(
+        config.round_trip_cost(None) / config.point_value
+    )
+
+
+def test_ppo_inherits_the_engines_holding_window_and_geometry():
+    from ai.environment.scalping_env import EnvConfig
+
+    config = Config().for_market("XAUUSDs")
+    env = EnvConfig.from_market_config(config)
+
+    assert env.max_holding_candles == config.max_holding_candles
+    assert env.sl_atr == config.sl_atr_multiplier
+    assert tuple(env.tp_atr) == tuple(config.tp_atr_multiples)
+    assert env.move_sl_to_breakeven_after_tp1 == config.move_sl_to_breakeven_after_tp1
+
+
+def test_each_market_gives_the_environment_its_own_costs():
+    from ai.environment.scalping_env import EnvConfig
+
+    gold = EnvConfig.from_market_config(Config().for_market("XAUUSDs"))
+    btc = EnvConfig.from_market_config(Config().for_market("BTCUSDs"))
+
+    assert gold.assumed_spread_points != btc.assumed_spread_points
+    assert gold.cost_points(gold.assumed_spread_points) != btc.cost_points(
+        btc.assumed_spread_points
+    )

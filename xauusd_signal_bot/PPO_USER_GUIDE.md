@@ -228,6 +228,36 @@ does not make the strategy work; it makes the measurement stop being true.
 
 ---
 
+## 13. Compare PPO against your rule engine
+
+The comparison the whole exercise is for — both over the **same candles** with
+the **same cost model**:
+
+```bash
+python backtest.py --symbol XAUUSD --strategy PPO_SHADOW \
+    --data history/XAUUSD_M1.csv --no-evaluations
+```
+
+```
+SAME CANDLES, SAME COST MODEL:
+strategy            trades      netR     avgR    win%      PF    maxDD   hold
+-----------------------------------------------------------------------------
+RULE_ONLY                3     -1.19   -0.397    33.3    0.37     1.90    4.0
+PPO ppo_v001             0      0.00    0.000     0.0    0.00     0.00    0.0
+```
+
+`--strategy PPO_BACKTEST` runs PPO alone. `--model ppo_v002` picks a version.
+
+**PPO is never given better fills**: the environment charges
+`config.round_trip_cost()`, the same function the rule backtester uses, and
+`--spread` applies to both sides. A difference in that table is strategy, not a
+friendlier simulation.
+
+Writes `reports/ppo/<SYMBOL>/backtest/`: `performance.csv`, `equity.csv`,
+`trades.csv`, `drawdown.csv`, `walk_forward.csv`, `by_regime.csv`.
+
+---
+
 ## BTCUSD
 
 Every command takes `--symbol BTCUSD`. Separate data, separate models, separate
