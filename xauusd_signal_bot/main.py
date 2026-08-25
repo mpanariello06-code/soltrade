@@ -42,6 +42,7 @@ from src.demo_broker import MT5DemoBroker
 from src.demo_execution import ExecutionManager
 from src.execution_config import DemoExecutionBlocked, load_execution_settings
 from src.markets import MARKET_ORDER, get_market
+from src.ppo_bridge import PPOBridge
 from src.timeframes import MODE_SCALPING, SIGNAL_TIMEFRAME
 from src.utils import is_weekend, iso, now_utc, parse_iso
 
@@ -133,6 +134,13 @@ class SignalRunner:
             LOGGER.error("Execution settings are invalid (%s) - execution disabled", exc)
             self.execution_settings.demo_trading_enabled = False
         self.broker = MT5DemoBroker(self.execution_settings)
+
+        # The PPO layer is entirely optional and defaults to RULE_ONLY.  The
+        # bridge owns every import of ai/, so a missing torch, a missing model
+        # or a broken checkpoint degrades to the rule engine rather than to a
+        # crash.  main.py never imports ai/ directly, which is what keeps the
+        # dependency arrow one-way.
+        self.ppo = PPOBridge(config)
         # Every market gets its own slot up front - tracker, runtime and CSV
         # files included - so a market keeps being tracked whether or not it is
         # the one currently selected in Telegram.
@@ -382,6 +390,17 @@ class SignalRunner:
         LOGGER.info("DEMO AUTO enabled from Telegram")
         return True
 
+    # -- PPO hooks (read by the Telegram panel) ----------------------------- #
+    def strategy_mode(self, symbol: Optional[str] = None) -> str:
+        return self.ppo.mode_name()
+
+    def set_strategy_mode(self, mode: str) -> str:
+        """Switch RULE_ONLY / PPO_SHADOW / PPO_DEMO.  Returns what took effect."""
+        return self.ppo.set_mode(mode)
+
+    def ppo_state(self, symbol: Optional[str] = None) -> Dict[str, object]:
+        return self.ppo.state(self.runtime.market(symbol).symbol)
+
     def on_market_changed(self, previous: str, current: str) -> None:
         """Hook fired by the Telegram panel after the active market changes.
 
@@ -588,7 +607,13 @@ class SignalRunner:
             if self.runtime.near_signal_alerts:
                 self.notifier.send_near_signal(evaluation)
 
-        # 3. remember the candle so it is never processed twice - per market
+        # 3. PPO observes EVERY evaluated candle, signal or not.  Knowing when
+        #    the agent declined is as informative as knowing when it acted, and
+        #    a recorder that only sees signal candles cannot be compared with
+        #    one that sees all of them.
+        self._observe_ppo(slot, cfg, snapshot, evaluation)
+
+        # 4. remember the candle so it is never processed twice - per market
         market_runtime.mark_candle_processed(iso(candle_time))
 
     def _execute_signal(self, slot: MarketSlot, signal) -> None:
@@ -612,6 +637,28 @@ class SignalRunner:
             return
         if not decision.executed and decision.reason:
             LOGGER.info("[%s] no demo order: %s", slot.symbol, decision.reason)
+
+    def _observe_ppo(self, slot: MarketSlot, cfg: Config, snapshot, evaluation) -> None:
+        """Let PPO see this candle.  Never raises into the signal loop.
+
+        In RULE_ONLY this is a no-op.  In PPO_SHADOW it records and simulates.
+        In PPO_DEMO the bridge may return a signal, which is then executed
+        through the SAME path and the same ten gates a rule signal uses -
+        PPO gets no privileged route to the broker.
+        """
+        if not self.ppo.active:
+            return
+        try:
+            ppo_signal = self.ppo.observe(
+                slot.symbol, cfg, snapshot, evaluation.signal if evaluation else None
+            )
+        except Exception as exc:  # noqa: BLE001 - PPO must never stop the scalper
+            LOGGER.exception("[%s] PPO observation failed: %s", slot.symbol, exc)
+            return
+        if ppo_signal is not None:
+            LOGGER.info("[%s] PPO signal %s - routing through the standard gates",
+                        slot.symbol, ppo_signal.direction)
+            self._execute_signal(slot, ppo_signal)
 
     def _manage_demo_trades(self, slot: MarketSlot) -> None:
         """Advance this market's open demo positions.

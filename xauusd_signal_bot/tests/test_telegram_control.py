@@ -54,6 +54,7 @@ def test_main_keyboard_has_only_the_scalping_controls(controller):
     assert data == [
         f"mkt:{XAUUSD}", f"mkt:{BTCUSD}",
         "view:analysis", "view:performance", "view:trades",
+        "ppo:status",                    # the 🤖 PPO submenu
         "run:pause",                     # single toggle: the engine is RUNNING
         "demo:confirm",                  # OFF, so the button asks to confirm ON
         "menu:settings", "panel:refresh",

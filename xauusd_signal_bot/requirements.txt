@@ -12,3 +12,12 @@ python-dotenv>=1.0
 
 # testing
 pytest>=7.4
+
+# --- PPO reinforcement learning (OPTIONAL) ----------------------------------
+# The rule-based scalper does not need any of these and runs without them.
+# Install only if you intend to train or run PPO:
+#   pip install gymnasium stable-baselines3 torch
+#
+# gymnasium>=0.29
+# stable-baselines3>=2.3
+# torch>=2.2

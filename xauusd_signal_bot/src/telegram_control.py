@@ -135,6 +135,7 @@ class TelegramController:
             [_button("📊 CURRENT ANALYSIS", "view:analysis")],
             [_button("📈 PERFORMANCE", "view:performance")],
             [_button("💼 OPEN TRADES", "view:trades")],
+            [_button("🤖 PPO", "ppo:status")],
             [toggle],
             [_button(demo_label, demo_action)],
             [_button("⚙️ SETTINGS", "menu:settings")],
@@ -147,6 +148,31 @@ class TelegramController:
         return [
             [_button("✅ ENABLE", "demo:on"), _button("❌ CANCEL", "nav:main")],
         ]
+
+    def ppo_keyboard(self) -> List[List[Dict[str, str]]]:
+        """The 🤖 PPO submenu.
+
+        SHADOW and DEMO are separate buttons rather than one toggle: promoting a
+        model from watching to trading is not the kind of thing a single tap
+        should be able to do by accident.
+        """
+        mode = self._ppo_mode()
+        mark = lambda name: "●" if mode == name else "○"  # noqa: E731
+        return [
+            [_button("📊 PPO STATUS", "ppo:status")],
+            [_button(f"{mark('RULE_ONLY')} RULE ONLY", "ppo:rule"),
+             _button(f"{mark('PPO_SHADOW')} SHADOW", "ppo:shadow")],
+            [_button(f"{mark('PPO_DEMO')} PPO DEMO", "ppo:demo_confirm")],
+            [_button("📈 PPO PERFORMANCE", "ppo:performance")],
+            [_button("🧠 PPO MODEL", "ppo:model")],
+            [_button("⏸ PPO PAUSE", "ppo:rule")],
+            [_button("⬅️ BACK", "nav:main")],
+        ]
+
+    @staticmethod
+    def ppo_demo_confirm_keyboard() -> List[List[Dict[str, str]]]:
+        return [[_button("✅ ENABLE PPO DEMO", "ppo:demo"),
+                 _button("❌ CANCEL", "ppo:status")]]
 
     def trades_keyboard(self) -> List[List[Dict[str, str]]]:
         return [
@@ -326,6 +352,123 @@ class TelegramController:
             DIVIDER,
         ]
         return "\n".join(lines)
+
+    def render_ppo_status(self) -> str:
+        """🤖 PPO STATUS: mode, model, latest action and simulated results."""
+        symbol = self.runtime.active_market
+        state = self._ppo_state(symbol)
+        mode = state.get("mode", self._ppo_mode())
+        lines = [
+            DIVIDER, "🤖 PPO STATUS", DIVIDER, "",
+            f"Symbol: {symbol}",
+            f"Timeframe: {SIGNAL_TIMEFRAME}",
+            f"Mode: {mode}",
+            f"Model: {state.get('model_version') or 'none loaded'}",
+        ]
+        if not state.get("loaded", False):
+            lines += [
+                "",
+                "No PPO model is loaded.",
+                "The rule engine is deciding, as normal.",
+                "",
+                "Train one with scripts/train_ppo.py, or check",
+                "models/model_registry.json for its status.",
+                DIVIDER,
+            ]
+            return "\n".join(lines)
+
+        probabilities = state.get("probabilities") or {}
+        lines += [
+            "",
+            f"Latest action: {state.get('last_action', '-')}",
+            f"BUY probability:  {100 * probabilities.get('BUY', 0.0):.0f}%",
+            f"SELL probability: {100 * probabilities.get('SELL', 0.0):.0f}%",
+            f"HOLD probability: {100 * probabilities.get('HOLD', 0.0):.0f}%",
+            "",
+            f"PPO paper trades: {state.get('trades', 0)}",
+            f"NET R: {state.get('net_r', 0.0):+.2f}R",
+            f"Win rate: {state.get('win_rate', 0.0):.1f}%",
+        ]
+        failures = int(state.get("failures", 0) or 0)
+        if failures:
+            # Surfaced rather than buried: a model that fails often is
+            # silently holding, and silent holding looks like a working model.
+            lines += ["", f"⚠️ Inference failures: {failures} "
+                      f"({state.get('failure_rate', 0.0):.1f}%) - these HELD."]
+        if mode != "PPO_DEMO":
+            lines += ["", "PPO is NOT placing orders.",
+                      "These are simulated results only."]
+        lines += [DIVIDER]
+        return "\n".join(lines)
+
+    def render_ppo_performance(self) -> str:
+        """PPO's simulated results, beside the rule engine's - never merged."""
+        symbol = self.runtime.active_market
+        state = self._ppo_state(symbol)
+        rule_r = self._paper_net_r(symbol)
+        lines = [
+            DIVIDER, "📈 PPO PERFORMANCE", DIVIDER, "",
+            f"{get_market(symbol).label()}  ({state.get('model_version') or 'no model'})",
+            "",
+            "PPO (SIMULATED):",
+            f"  Trades: {state.get('trades', 0)}",
+            f"  NET R: {state.get('net_r', 0.0):+.2f}R",
+            f"  Avg NET R: {state.get('average_net_r', 0.0):+.3f}R",
+            f"  Win rate: {state.get('win_rate', 0.0):.1f}%",
+            f"  Profit factor: {state.get('profit_factor', 0.0)}",
+            f"  Max drawdown: {state.get('max_drawdown_r', 0.0):.2f}R",
+            f"  Avg holding: {state.get('average_holding', 0.0):.1f} candles",
+            "",
+            "RULE ENGINE (paper):",
+            f"  NET R: {rule_r:+.2f}R" if rule_r is not None else "  NET R: -",
+            "",
+            "These are three separate books - PPO simulated,",
+            "rule paper and real demo fills are never summed.",
+            DIVIDER,
+        ]
+        return "\n".join(lines)
+
+    def render_ppo_model(self) -> str:
+        """What the loaded model is, and what it was trained on."""
+        symbol = self.runtime.active_market
+        state = self._ppo_state(symbol)
+        if not state.get("loaded", False):
+            return "\n".join([DIVIDER, "🧠 PPO MODEL", DIVIDER, "",
+                              "No model loaded.", DIVIDER])
+        return "\n".join([
+            DIVIDER, "🧠 PPO MODEL", DIVIDER, "",
+            f"Version: {state.get('model_version', '-')}",
+            f"Symbol: {symbol}",
+            f"Status: {state.get('model_status', 'UNKNOWN')}",
+            f"Features: {state.get('features', 0)}",
+            f"Fingerprint: {state.get('fingerprint', '-')}",
+            "",
+            f"Trained: {state.get('train_period', '-')}",
+            f"Validated: {state.get('validation_period', '-')}",
+            f"Tested: {state.get('test_period', '-')}",
+            "",
+            f"Decisions this session: {state.get('decisions', 0)}",
+            f"Inference failures: {state.get('failures', 0)}",
+            DIVIDER,
+        ])
+
+    def render_ppo_demo_confirm(self) -> str:
+        return "\n".join([
+            DIVIDER, "⚠️ ENABLE PPO DEMO?", DIVIDER, "",
+            "This lets the PPO model decide which trades",
+            "are sent to the configured DEMO account.",
+            "",
+            "It does NOT bypass any safety check: every",
+            "PPO signal passes the same account, symbol,",
+            "spread, level, limit and sizing gates a rule",
+            "signal does.",
+            "",
+            "Demo execution must also be armed separately.",
+            "",
+            "Only do this after enough shadow testing to",
+            "know how the model behaves.",
+            "", DIVIDER,
+        ])
 
     def render_open_trades(self) -> str:
         """The 💼 OPEN TRADES panel, across every market."""
@@ -676,6 +819,8 @@ class TelegramController:
                 return self._handle_menu(argument)
             if action == "set":
                 return self._handle_setting(argument)
+            if action == "ppo":
+                return self._handle_ppo(argument)
             if action == "demo":
                 return self._handle_demo(argument)
             if action == "view":
@@ -730,6 +875,41 @@ class TelegramController:
                 notify(previous, symbol)
         market = get_market(symbol)
         return self.render_panel(), self.main_keyboard(), f"Market: {market.label()}"
+
+    def _handle_ppo(self, argument: str):
+        """Route the 🤖 PPO submenu.
+
+        Mode changes go through the engine, which owns loading and unloading and
+        is the only thing that can refuse.  A refusal is reported rather than
+        shown as success.
+        """
+        if argument == "status":
+            return self.render_ppo_status(), self.ppo_keyboard(), "PPO"
+        if argument == "performance":
+            return self.render_ppo_performance(), self.ppo_keyboard(), "PPO performance"
+        if argument == "model":
+            return self.render_ppo_model(), self.ppo_keyboard(), "PPO model"
+        if argument == "demo_confirm":
+            return (self.render_ppo_demo_confirm(),
+                    self.ppo_demo_confirm_keyboard(), "Confirm?")
+
+        wanted = {"rule": "RULE_ONLY", "shadow": "PPO_SHADOW", "demo": "PPO_DEMO"}.get(argument)
+        if wanted is None:
+            return self.render_ppo_status(), self.ppo_keyboard(), ""
+
+        hook = getattr(self.engine, "set_strategy_mode", None)
+        if not callable(hook):
+            return self.render_ppo_status(), self.ppo_keyboard(), "PPO is not available"
+        try:
+            applied = str(hook(wanted))
+        except Exception as exc:  # noqa: BLE001 - a failed switch must not break the panel
+            LOGGER.exception("PPO mode switch failed: %s", exc)
+            return self.render_ppo_status(), self.ppo_keyboard(), "Switch failed"
+
+        toast = f"PPO: {applied}"
+        if applied != wanted:
+            toast = f"Refused - still {applied}"
+        return self.render_ppo_status(), self.ppo_keyboard(), toast
 
     def _handle_demo(self, argument: str):
         """The DEMO AUTO toggle: confirm, enable, disable.
@@ -913,6 +1093,14 @@ class TelegramController:
             return float(self._call_engine("demo_net_today", symbol, 0.0) or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    # -- PPO hooks --------------------------------------------------------- #
+    def _ppo_mode(self) -> str:
+        return str(self._call_engine("strategy_mode", None, "RULE_ONLY") or "RULE_ONLY")
+
+    def _ppo_state(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        state = self._call_engine("ppo_state", symbol, None)
+        return dict(state) if isinstance(state, dict) else {}
 
     def _open_signals(self, symbol: Optional[str] = None) -> int:
         try:

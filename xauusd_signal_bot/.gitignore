@@ -12,6 +12,16 @@ data/*/
 # downloaded / exported price history
 history/*.csv
 
+# RL artefacts: raw MT5 history, built datasets, trained models and reports.
+# The model REGISTRY is tracked so model provenance survives; the weights and
+# the multi-GB raw candles are not.
+data/raw/
+data/processed/
+data/ai/
+models/ppo/
+reports/
+!models/model_registry.json
+
 # python
 __pycache__/
 *.py[cod]
